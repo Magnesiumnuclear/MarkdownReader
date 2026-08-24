@@ -94,6 +94,7 @@ class CustomTitleBar(QWidget):
     openRequested = pyqtSignal()
     backRequested = pyqtSignal()
     findRequested = pyqtSignal()
+    settingsRequested = pyqtSignal()
     themeToggleRequested = pyqtSignal()
     pinToggled = pyqtSignal(bool)
     minimizeRequested = pyqtSignal()
@@ -123,6 +124,7 @@ class CustomTitleBar(QWidget):
         self.back_button = IconButton("back", "回到上一篇 (Alt+左方向鍵)", self, size=tool_size)
         self.open_button = IconButton("open", "開啟檔案 (Ctrl+O)", self, size=tool_size)
         self.find_button = IconButton("search", "搜尋 (Ctrl+F)", self, size=tool_size)
+        self.settings_button = IconButton("settings", "設定 (Ctrl+,)", self, size=tool_size)
         self.theme_button = IconButton("theme_dark", "切換主題 (Ctrl+D)", self, size=tool_size)
         self.pin_button = IconButton(
             "pin_off", "釘選在最上層 (Ctrl+P)", self, checked_icon="pin_on", size=tool_size
@@ -141,6 +143,7 @@ class CustomTitleBar(QWidget):
         layout.addWidget(self.back_button)
         layout.addWidget(self.open_button)
         layout.addWidget(self.find_button)
+        layout.addWidget(self.settings_button)
         layout.addWidget(self.theme_button)
         layout.addWidget(self.pin_button)
         layout.addSpacing(6)
@@ -151,6 +154,7 @@ class CustomTitleBar(QWidget):
         self.back_button.clicked.connect(self.backRequested)
         self.open_button.clicked.connect(self.openRequested)
         self.find_button.clicked.connect(self.findRequested)
+        self.settings_button.clicked.connect(self.settingsRequested)
         self.theme_button.clicked.connect(self.themeToggleRequested)
         self.pin_button.toggled.connect(self.pinToggled)
         self.minimize_button.clicked.connect(self.minimizeRequested)
@@ -164,6 +168,7 @@ class CustomTitleBar(QWidget):
             self.back_button,
             self.open_button,
             self.find_button,
+            self.settings_button,
             self.theme_button,
             self.pin_button,
             self.minimize_button,

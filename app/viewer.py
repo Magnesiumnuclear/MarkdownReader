@@ -41,13 +41,15 @@ from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
 
-from . import config, document, icons, qt_html, styles, win32
+from . import config, document, icons, qt_html, styles, theme as theme_utils, win32
 from .find_bar import FindBar
+from .settings_panel import SettingsPanel
 from .title_bar import CustomTitleBar
 
 # 依邊緣組合決定游標形狀
@@ -243,17 +245,41 @@ class MarkdownViewer(QWidget):
         self.setAcceptDrops(True)
 
         self._settings = QSettings(config.ORG_NAME, config.APP_NAME)
-        self._theme = str(self._settings.value(config.KEY_THEME, config.DEFAULT_THEME))
-        if self._theme not in styles.PALETTES:
-            self._theme = config.DEFAULT_THEME
+
+        # 主題模式預設為 system：首次啟動就會採用 Windows 目前的深淺色設定，
+        # 之後系統切換時也會即時跟著變，直到使用者手動鎖定淺色或深色。
+        self._theme_mode = str(
+            self._settings.value(config.KEY_THEME_MODE, config.DEFAULT_THEME_MODE)
+        )
+        if self._theme_mode not in {mode for mode, _label in config.THEME_MODES}:
+            self._theme_mode = config.DEFAULT_THEME_MODE
+        self._theme = theme_utils.resolve(self._theme_mode)
+
         self._font_point_size = int(
             self._settings.value(config.KEY_FONT_SIZE, config.BASE_FONT_POINT_SIZE)
         )
+        self._line_height = str(
+            self._settings.value(config.KEY_LINE_HEIGHT, config.DEFAULT_LINE_HEIGHT)
+        )
+        if self._line_height not in {key for key, _l, _p in config.LINE_HEIGHT_OPTIONS}:
+            self._line_height = config.DEFAULT_LINE_HEIGHT
+        self._content_width = int(
+            self._settings.value(config.KEY_CONTENT_WIDTH, config.DEFAULT_CONTENT_WIDTH)
+        )
+        if self._content_width not in {w for w, _label in config.CONTENT_WIDTH_OPTIONS}:
+            self._content_width = config.DEFAULT_CONTENT_WIDTH
+
         self._always_on_top = self._settings.value(
             config.KEY_ALWAYS_ON_TOP, False, type=bool
         )
         self._status_visible = self._settings.value(
             config.KEY_STATUS_VISIBLE, True, type=bool
+        )
+        self._auto_reload = self._settings.value(
+            config.KEY_AUTO_RELOAD, config.DEFAULT_AUTO_RELOAD, type=bool
+        )
+        self._confirm_links = self._settings.value(
+            config.KEY_CONFIRM_LINKS, config.DEFAULT_CONFIRM_LINKS, type=bool
         )
 
         self._path: str | None = None
@@ -285,6 +311,10 @@ class MarkdownViewer(QWidget):
         self._restore_window_state()
         self.title_bar.set_pinned(self._always_on_top)
         self.status_bar.setVisible(self._status_visible)
+        self._sync_settings_panel()
+
+        # 「跟隨系統」需要在 Windows 切換深淺色時即時反應
+        theme_utils.connect_system_changes(self._on_system_theme_changed)
 
         if path:
             self.open_path(path, push_history=False)
@@ -309,6 +339,9 @@ class MarkdownViewer(QWidget):
         self.browser = MarkdownBrowser(self.root_frame)
         self.find_bar = FindBar(self.root_frame)
         self.find_bar.attach(self.browser)
+        # 設定面板是覆蓋層，不放進版面，改由 _position_settings_panel 手動定位，
+        # 這樣它才能整片蓋住標題列以下的區域（含搜尋列與狀態列）
+        self.settings_panel = SettingsPanel(self.root_frame)
 
         self.status_bar = QFrame(self.root_frame)
         self.status_bar.setObjectName("statusBar")
@@ -327,6 +360,7 @@ class MarkdownViewer(QWidget):
         self.title_bar.openRequested.connect(self.open_dialog)
         self.title_bar.backRequested.connect(self.go_back)
         self.title_bar.findRequested.connect(self.show_find)
+        self.title_bar.settingsRequested.connect(self.toggle_settings)
         self.title_bar.themeToggleRequested.connect(self.toggle_theme)
         self.title_bar.pinToggled.connect(self.set_always_on_top)
         self.title_bar.minimizeRequested.connect(self.showMinimized)
@@ -334,12 +368,24 @@ class MarkdownViewer(QWidget):
         self.title_bar.closeRequested.connect(self.close)
         self.browser.anchorClicked.connect(self._on_anchor_clicked)
 
+        self.settings_panel.themeModeChanged.connect(self.set_theme_mode)
+        self.settings_panel.lineHeightChanged.connect(self.set_line_height)
+        self.settings_panel.contentWidthChanged.connect(self.set_content_width)
+        self.settings_panel.autoReloadChanged.connect(self.set_auto_reload)
+        self.settings_panel.alwaysOnTopChanged.connect(self.set_always_on_top)
+        self.settings_panel.statusBarChanged.connect(self.set_status_bar_visible)
+        self.settings_panel.confirmLinksChanged.connect(self.set_confirm_links)
+        self.settings_panel.resetRequested.connect(self.reset_settings)
+        self.settings_panel.font_minus.clicked.connect(self.zoom_out)
+        self.settings_panel.font_plus.clicked.connect(self.zoom_in)
+
     def _create_shortcuts(self) -> None:
         bindings = (
             ("Ctrl+O", self.open_dialog),
             ("Ctrl+R", self.reload),
             ("F5", self.reload),
             ("Ctrl+F", self.show_find),
+            ("Ctrl+,", self.toggle_settings),
             ("Ctrl+D", self.toggle_theme),
             ("Ctrl+P", self.toggle_always_on_top),
             ("Ctrl+=", self.zoom_in),
@@ -366,11 +412,170 @@ class MarkdownViewer(QWidget):
         self.browser.set_theme(theme)
         self.title_bar.apply_theme(theme)
         self.find_bar.apply_theme(theme)
-        self._settings.setValue(config.KEY_THEME, theme)
+        self.settings_panel.apply_theme(theme)
         self._render()
 
+    def set_theme_mode(self, mode: str) -> None:
+        """設定主題模式："light" / "dark" / "system"。"""
+        if mode not in {name for name, _label in config.THEME_MODES}:
+            return
+        self._theme_mode = mode
+        self._settings.setValue(config.KEY_THEME_MODE, mode)
+        self.apply_theme(theme_utils.resolve(mode))
+        self._sync_settings_panel()
+
     def toggle_theme(self) -> None:
-        self.apply_theme(styles.other_theme(self._theme))
+        """標題列的切換鈕：直接切到另一個配色，並把模式鎖定成該配色。
+
+        想回到自動跟隨，就到設定列選「跟隨系統」。
+        """
+        self.set_theme_mode(styles.other_theme(self._theme))
+
+    def _on_system_theme_changed(self, _scheme=None) -> None:
+        """Windows 切換深淺色時觸發；只有模式為 system 才跟著變。
+
+        參數是 Qt 傳來的 ColorScheme，這裡用不到，但必須收下——直接連接
+        bound method（而非 lambda）才能讓 Qt 在視窗銷毀時自動斷開連線。
+        """
+        if self._theme_mode != "system":
+            return
+        resolved = theme_utils.resolve("system")
+        if resolved != self._theme:
+            self.apply_theme(resolved)
+
+    # -- 閱讀版面 ------------------------------------------------------------
+    def set_line_height(self, key: str) -> None:
+        if key not in {name for name, _l, _p in config.LINE_HEIGHT_OPTIONS}:
+            return
+        self._line_height = key
+        self._settings.setValue(config.KEY_LINE_HEIGHT, key)
+        self._render()
+        self._sync_settings_panel()
+
+    def set_content_width(self, width: int) -> None:
+        if width not in {value for value, _label in config.CONTENT_WIDTH_OPTIONS}:
+            return
+        self._content_width = int(width)
+        self._settings.setValue(config.KEY_CONTENT_WIDTH, self._content_width)
+        self._apply_content_width()
+        self._sync_settings_panel()
+
+    def _line_height_percent(self) -> int:
+        for key, _label, percent in config.LINE_HEIGHT_OPTIONS:
+            if key == self._line_height:
+                return percent
+        return 160
+
+    def _apply_content_width(self) -> None:
+        """限制文字欄寬度並置中。
+
+        QTextDocument 不支援 max-width，而 setDocumentMargin 只能四邊同時設定
+        （上下也會跟著變超大）。root frame 的 frameFormat 可以分別指定四邊，
+        因此用左右邊距把文字欄夾成固定寬度，效果等同置中的閱讀欄。
+        """
+        doc = self.browser.document()
+        frame = doc.rootFrame()
+        fmt = frame.frameFormat()
+        margin = styles.DOCUMENT_MARGIN
+        viewport = self.browser.viewport().width()
+
+        if self._content_width and viewport > self._content_width + 2 * margin:
+            side = (viewport - self._content_width) / 2
+        else:
+            side = margin
+
+        fmt.setLeftMargin(side)
+        fmt.setRightMargin(side)
+        fmt.setTopMargin(margin)
+        fmt.setBottomMargin(margin)
+        frame.setFrameFormat(fmt)
+
+    # -- 行為開關 ------------------------------------------------------------
+    def set_auto_reload(self, enabled: bool) -> None:
+        self._auto_reload = bool(enabled)
+        self._settings.setValue(config.KEY_AUTO_RELOAD, self._auto_reload)
+        if self._auto_reload:
+            if self._path:
+                self._watch_file(self._path)
+        else:
+            self._unwatch_all()
+        self._sync_settings_panel()
+
+    def set_status_bar_visible(self, visible: bool) -> None:
+        self._status_visible = bool(visible)
+        self.status_bar.setVisible(self._status_visible)
+        self._settings.setValue(config.KEY_STATUS_VISIBLE, self._status_visible)
+        self._sync_settings_panel()
+
+    def set_confirm_links(self, enabled: bool) -> None:
+        self._confirm_links = bool(enabled)
+        self._settings.setValue(config.KEY_CONFIRM_LINKS, self._confirm_links)
+        self._sync_settings_panel()
+
+    # -- 設定列 --------------------------------------------------------------
+    def toggle_settings(self) -> None:
+        if self.settings_panel.isVisible():
+            self.settings_panel.deactivate()
+            return
+        if self.find_bar.isVisible():
+            self.find_bar.deactivate()
+        self._position_settings_panel()
+        self.settings_panel.activate()
+
+    def _position_settings_panel(self) -> None:
+        """讓面板剛好覆蓋標題列以下的整個視窗內部。
+
+        位置直接從標題列的實際矩形推算，不寫死邊框寬度——外框線與版面內距
+        會疊加（實測起點是 2px 而不是 1px），寫死很容易差一列蓋到標題列。
+        """
+        bar = self.title_bar.geometry()
+        inset = bar.left()
+        top = bar.bottom() + 1
+        frame = self.root_frame
+        self.settings_panel.setGeometry(
+            inset,
+            top,
+            max(0, bar.width()),
+            max(0, frame.height() - top - inset),
+        )
+
+    def _sync_settings_panel(self) -> None:
+        self.settings_panel.sync(
+            theme_mode=self._theme_mode,
+            font_point_size=self._font_point_size,
+            line_height=self._line_height,
+            content_width=self._content_width,
+            auto_reload=self._auto_reload,
+            always_on_top=self._always_on_top,
+            status_bar=self._status_visible,
+            confirm_links=self._confirm_links,
+        )
+
+    def reset_settings(self) -> None:
+        """把所有可調設定恢復成預設值。"""
+        self._font_point_size = config.BASE_FONT_POINT_SIZE
+        self._line_height = config.DEFAULT_LINE_HEIGHT
+        self._content_width = config.DEFAULT_CONTENT_WIDTH
+        self._auto_reload = config.DEFAULT_AUTO_RELOAD
+        self._confirm_links = config.DEFAULT_CONFIRM_LINKS
+        self._status_visible = True
+        self.status_bar.setVisible(True)
+        self.set_always_on_top(False)
+
+        for key, value in (
+            (config.KEY_FONT_SIZE, self._font_point_size),
+            (config.KEY_LINE_HEIGHT, self._line_height),
+            (config.KEY_CONTENT_WIDTH, self._content_width),
+            (config.KEY_AUTO_RELOAD, self._auto_reload),
+            (config.KEY_CONFIRM_LINKS, self._confirm_links),
+            (config.KEY_STATUS_VISIBLE, self._status_visible),
+        ):
+            self._settings.setValue(key, value)
+
+        if self._path:
+            self._watch_file(self._path)
+        self.set_theme_mode(config.DEFAULT_THEME_MODE)
+        self.status_label.setText("已恢復預設設定")
 
     # -- 開檔與渲染 ----------------------------------------------------------
     def open_dialog(self) -> None:
@@ -432,7 +637,9 @@ class MarkdownViewer(QWidget):
         # 樣式表必須在 setHtml 之前套用，否則不會生效；字級改變時也要重算，
         # 因為 h6 的字級只能用絕對單位指定（詳見 styles.py 的說明）。
         self.browser.document().setDefaultStyleSheet(
-            styles.build_doc_css(self._theme, self._font_point_size)
+            styles.build_doc_css(
+                self._theme, self._font_point_size, self._line_height_percent()
+            )
         )
 
         if self._error is not None:
@@ -449,6 +656,8 @@ class MarkdownViewer(QWidget):
         self._last_render_width = self.browser.viewport().width()
 
         self.browser.setHtml(html)
+        # setHtml 會重建文件，root frame 的邊距必須重設
+        self._apply_content_width()
         if preserve_scroll and ratio > 0:
             QTimer.singleShot(0, lambda: self._apply_scroll_ratio(ratio))
 
@@ -497,9 +706,7 @@ class MarkdownViewer(QWidget):
         self.status_label.setText("　·　".join(parts))
 
     def toggle_status_bar(self) -> None:
-        self._status_visible = not self._status_visible
-        self.status_bar.setVisible(self._status_visible)
-        self._settings.setValue(config.KEY_STATUS_VISIBLE, self._status_visible)
+        self.set_status_bar_visible(not self._status_visible)
 
     # -- 檔案監看 ------------------------------------------------------------
     @staticmethod
@@ -510,16 +717,21 @@ class MarkdownViewer(QWidget):
         except OSError:
             return None
 
+    def _unwatch_all(self) -> None:
+        for watched in self._watcher.files():
+            self._watcher.removePath(watched)
+        for watched in self._watcher.directories():
+            self._watcher.removePath(watched)
+
     def _watch_file(self, path: str) -> None:
         """同時監看檔案與其所在目錄。
 
         許多編輯器採「寫暫存檔再改名覆蓋」的原子存檔，原檔會短暫消失導致
         watcher 掉路徑，因此目錄事件是必要的補償來源。
         """
-        for watched in self._watcher.files():
-            self._watcher.removePath(watched)
-        for watched in self._watcher.directories():
-            self._watcher.removePath(watched)
+        self._unwatch_all()
+        if not self._auto_reload:
+            return
         if os.path.isfile(path):
             self._watcher.addPath(path)
         folder = os.path.dirname(path)
@@ -570,7 +782,7 @@ class MarkdownViewer(QWidget):
         """所有外部連結一律交給系統預設瀏覽器，閱讀區內絕不載入網頁。"""
         scheme = url.scheme().lower()
         if scheme in ("http", "https", "ftp", "ftps", "mailto"):
-            QDesktopServices.openUrl(url)
+            self._open_external(url)
             return
 
         # 純 #錨點：在本文件內捲動
@@ -595,6 +807,25 @@ class MarkdownViewer(QWidget):
             self.status_label.setText(f"找不到連結目標：{local_path}")
             return
 
+        self._open_external(url)
+
+    def _open_external(self, url: QUrl) -> None:
+        """交給系統預設瀏覽器開啟；設定為「連結詢問」時先確認。"""
+        if self._confirm_links:
+            target = url.toString()
+            display = target if len(target) <= 90 else target[:87] + "..."
+            answer = QMessageBox.question(
+                self,
+                "開啟外部連結",
+                f"""要用預設瀏覽器開啟這個連結嗎？
+
+{display}""",
+                QMessageBox.StandardButton.Open | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Open,
+            )
+            if answer != QMessageBox.StandardButton.Open:
+                self.status_label.setText(f"已取消開啟連結：{target}")
+                return
         QDesktopServices.openUrl(url)
 
     # -- 視窗控制 ------------------------------------------------------------
@@ -609,15 +840,20 @@ class MarkdownViewer(QWidget):
         self._settings.setValue(config.KEY_ALWAYS_ON_TOP, self._always_on_top)
         self.title_bar.set_pinned(self._always_on_top)
         win32.set_topmost(int(self.winId()), self._always_on_top)
+        self._sync_settings_panel()
 
     def toggle_always_on_top(self) -> None:
         self.set_always_on_top(not self._always_on_top)
 
     def show_find(self) -> None:
+        if self.settings_panel.isVisible():
+            self.settings_panel.deactivate()
         self.find_bar.activate()
 
     def _on_escape(self) -> None:
-        if self.find_bar.isVisible():
+        if self.settings_panel.isVisible():
+            self.settings_panel.deactivate()
+        elif self.find_bar.isVisible():
             self.find_bar.deactivate()
         else:
             self.close()
@@ -630,6 +866,7 @@ class MarkdownViewer(QWidget):
         self._font_point_size = size
         self._settings.setValue(config.KEY_FONT_SIZE, size)
         self._render()
+        self._sync_settings_panel()
 
     def zoom_in(self) -> None:
         self._set_font_point_size(self._font_point_size + 1)
@@ -689,6 +926,7 @@ class MarkdownViewer(QWidget):
             win32.set_topmost(int(self.winId()), True)
         self._resizer.refresh_targets()
         self._resizer.update_margin()
+        self._position_settings_panel()
 
     def changeEvent(self, event) -> None:  # noqa: N802
         if event.type() == QEvent.Type.WindowStateChange:
@@ -700,6 +938,9 @@ class MarkdownViewer(QWidget):
         # Qt 會保留圖片的原始高度、卻把圖畫成縮小後的尺寸，導致下方留下空白，
         # 因此圖片是在載入時就等比縮到可視寬度。視窗寬度改變後必須重繪，
         # 讓縮放依新寬度重新計算（setHtml 會清掉舊的資源快取）。
+        # 限制內文寬度時，左右邊距是依可視寬度算出來的，必須立即重算
+        self._apply_content_width()
+        self._position_settings_panel()
         if self._has_scalable_images:
             self._resize_timer.start(180)
 
@@ -718,8 +959,12 @@ class MarkdownViewer(QWidget):
         self._settings.setValue(config.KEY_MAXIMIZED, self.isMaximized())
         if not self.isMaximized():
             self._settings.setValue(config.KEY_GEOMETRY, self.saveGeometry())
-        self._settings.setValue(config.KEY_THEME, self._theme)
+        self._settings.setValue(config.KEY_THEME_MODE, self._theme_mode)
         self._settings.setValue(config.KEY_FONT_SIZE, self._font_point_size)
+        self._settings.setValue(config.KEY_LINE_HEIGHT, self._line_height)
+        self._settings.setValue(config.KEY_CONTENT_WIDTH, self._content_width)
         self._settings.setValue(config.KEY_ALWAYS_ON_TOP, self._always_on_top)
+        self._settings.setValue(config.KEY_AUTO_RELOAD, self._auto_reload)
+        self._settings.setValue(config.KEY_CONFIRM_LINKS, self._confirm_links)
         self._settings.sync()
         super().closeEvent(event)

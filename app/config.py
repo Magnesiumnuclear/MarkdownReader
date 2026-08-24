@@ -46,12 +46,45 @@ READ_RETRY_DELAY_S = 0.05    # 每次重試間隔（秒）
 # 超過此大小的檔案會在頁首提示排版可能較慢
 LARGE_FILE_BYTES = 5 * 1024 * 1024
 
+# --- 閱讀版面選項 -----------------------------------------------------------
+# 行高（百分比）。Qt 的 line-height 用 % 才會隨字級等比縮放。
+LINE_HEIGHT_OPTIONS = (
+    ("compact", "緊湊", 142),
+    ("normal", "標準", 160),
+    ("relaxed", "寬鬆", 188),
+)
+DEFAULT_LINE_HEIGHT = "normal"
+
+# 內文最大寬度（像素），0 代表不限制。
+# QTextDocument 不支援 max-width，實作方式是調整 root frame 的左右邊距，
+# 讓文字欄固定寬度並置中（詳見 viewer._apply_content_width）。
+CONTENT_WIDTH_OPTIONS = (
+    (720, "窄"),
+    (900, "中"),
+    (0, "不限"),
+)
+DEFAULT_CONTENT_WIDTH = 900
+
+# 主題模式：system 會跟著 Windows 的深淺色設定即時變動
+THEME_MODES = (
+    ("light", "淺色"),
+    ("dark", "深色"),
+    ("system", "跟隨系統"),
+)
+DEFAULT_THEME_MODE = "system"
+
 # --- QSettings 鍵名 ---------------------------------------------------------
 KEY_GEOMETRY = "window/geometry"
 KEY_MAXIMIZED = "window/maximized"
-KEY_THEME = "view/theme"
+KEY_THEME_MODE = "view/themeMode"
 KEY_FONT_SIZE = "view/fontPointSize"
+KEY_LINE_HEIGHT = "view/lineHeight"
+KEY_CONTENT_WIDTH = "view/contentWidth"
 KEY_ALWAYS_ON_TOP = "window/alwaysOnTop"
 KEY_STATUS_VISIBLE = "view/statusBarVisible"
+KEY_AUTO_RELOAD = "behavior/autoReload"
+KEY_CONFIRM_LINKS = "behavior/confirmExternalLinks"
 
-DEFAULT_THEME = "light"
+DEFAULT_THEME = "light"          # 系統偵測失敗時的保底值
+DEFAULT_AUTO_RELOAD = True
+DEFAULT_CONFIRM_LINKS = False

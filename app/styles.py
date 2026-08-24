@@ -234,6 +234,127 @@ QToolButton#closeBtn:pressed { background-color: $close_pressed_bg; }
     padding: 0px 6px;
 }
 
+/* ---------- 設定面板（覆蓋標題列以下的整個視窗）---------- */
+#settingsPanel {
+    background-color: $window_bg;
+    border: none;
+}
+#settingsHeader {
+    background-color: $surface;
+    border: none;
+    border-bottom: 1px solid $border;
+}
+#settingsTitle {
+    color: $text;
+    font-family: $font_ui;
+    font-size: 15px;
+    font-weight: bold;
+    background: transparent;
+}
+#settingsScroll, #settingsContent {
+    background: transparent;
+    border: none;
+}
+#settingsSection {
+    color: $text_muted;
+    font-family: $font_ui;
+    font-size: 11px;
+    font-weight: bold;
+    background: transparent;
+}
+#settingsSectionLine {
+    background-color: $border;
+    border: none;
+}
+#settingsRowLabel {
+    color: $text;
+    font-family: $font_ui;
+    font-size: 12px;
+    background: transparent;
+}
+#settingsHint {
+    color: $text_muted;
+    font-family: $font_ui;
+    font-size: 11px;
+    background: transparent;
+}
+#settingsValue {
+    color: $text;
+    font-family: $font_ui;
+    font-size: 12px;
+    background: transparent;
+}
+
+/* 分段選擇與開關（同一套外觀：未選為描邊、選中為強調色實心） */
+QToolButton#segBtn {
+    background-color: $window_bg;
+    color: $text;
+    font-family: $font_ui;
+    font-size: 12px;
+    border: 1px solid $border;
+    border-radius: 5px;
+    padding: 5px 14px;
+    margin: 0px 2px 0px 0px;
+}
+QToolButton#segBtn:hover {
+    background-color: $hover_bg;
+}
+QToolButton#segBtn:checked {
+    background-color: $accent;
+    color: $icon_on_accent;
+    border: 1px solid $accent;
+}
+
+/* 字級加減 */
+QToolButton#stepBtn {
+    background-color: $window_bg;
+    border: 1px solid $border;
+    border-radius: 5px;
+    padding: 0px;
+    margin: 0px 2px 0px 0px;
+}
+QToolButton#stepBtn:hover   { background-color: $hover_bg; }
+QToolButton#stepBtn:pressed { background-color: $pressed_bg; }
+
+/* 恢復預設值 */
+QToolButton#resetBtn {
+    background-color: $window_bg;
+    color: $text;
+    font-family: $font_ui;
+    font-size: 12px;
+    border: 1px solid $border;
+    border-radius: 5px;
+    padding: 6px 16px;
+}
+QToolButton#resetBtn:hover   { background-color: $hover_bg; }
+QToolButton#resetBtn:pressed { background-color: $pressed_bg; }
+
+#settingsScroll QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 0px;
+    border: none;
+}
+#settingsScroll QScrollBar::handle:vertical {
+    background-color: $scrollbar;
+    border-radius: 3px;
+    min-height: 36px;
+    margin: 2px;
+}
+#settingsScroll QScrollBar::handle:vertical:hover {
+    background-color: $scrollbar_hover;
+}
+#settingsScroll QScrollBar::add-line:vertical,
+#settingsScroll QScrollBar::sub-line:vertical {
+    height: 0px;
+    background: transparent;
+    border: none;
+}
+#settingsScroll QScrollBar::add-page:vertical,
+#settingsScroll QScrollBar::sub-page:vertical {
+    background: transparent;
+}
+
 /* ---------- 狀態列 ---------- */
 #statusBar {
     background-color: $surface;
@@ -295,7 +416,7 @@ body {
     background-color: $window_bg;
     font-family: $font_ui;
     font-size: 100%;
-    line-height: 160%;
+    line-height: $line_height%;
 }
 p { margin-top: 0.35em; margin-bottom: 0.85em; }
 a { color: $accent; text-decoration: none; }
@@ -426,12 +547,18 @@ td.warncell {
 )
 
 
-def build_doc_css(theme: str, base_point_size: float = 11.0) -> str:
+def build_doc_css(
+    theme: str,
+    base_point_size: float = 11.0,
+    line_height: int = 160,
+) -> str:
     """產生 QTextDocument 用的 Markdown 樣式表。
 
     base_point_size 是閱讀區目前的基準字級（pt）。之所以需要它，是因為 h6 的
     字級只能用絕對單位指定（見樣式表中的說明），必須隨縮放一起重算。
+    line_height 是內文行高百分比，由設定列控制。
     """
     values = _values(theme)
     values["h6_size"] = f"{max(1.0, base_point_size * 0.72):.1f}pt"
+    values["line_height"] = str(int(line_height))
     return _DOC_CSS.substitute(values)

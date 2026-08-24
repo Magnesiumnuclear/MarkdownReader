@@ -21,6 +21,7 @@ from datetime import datetime
 # 導致「原始碼執行時圖示正常、打包後全部空白」。這裡顯式匯入以確保被收錄。
 import PyQt6.QtSvg  # noqa: F401
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from app import config, icons, resources, win32
@@ -91,6 +92,10 @@ def main() -> int:
     app.setWindowIcon(icons.app_icon())
 
     viewer = MarkdownViewer(_target_path(sys.argv))
+    # 讓 Qt 在視窗關閉時就地銷毀它。否則視窗會活到直譯器結束後才被拆除，
+    # 那時 QApplication 可能已經先一步消失，Qt 內部就會踩到已釋放的記憶體
+    # （實測會有約六成機率在結束時發生存取違規）。
+    viewer.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
     viewer.show()
     return app.exec()
 
