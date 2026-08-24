@@ -146,11 +146,43 @@ py -3.13 -m PyInstaller --noconfirm --clean --onefile --windowed --noupx --name 
 
 ### onefile 還是 onedir？
 
-| | 單一 exe（`--onefile`） | 資料夾版（`--onedir`） |
-|---|---|---|
-| 散布 | 一個檔案，最方便 | 一整個資料夾 |
-| 冷啟動 | 約 1～2 秒（每次都要解壓到暫存目錄） | 低於 0.5 秒 |
-| 建議 | 給別人、放隨身碟 | **設成 `.md` 預設開啟程式**（雙擊要馬上看到內容） |
+**如果要設成 `.md` 的預設開啟程式，強烈建議用資料夾版。**實測啟動時間（從按下到視窗出現，各跑 8 次取平均）：
+
+| 打包方式 | 啟動時間 | 體積 | 行程數 |
+|---|---|---|---|
+| 單一 exe（`--onefile`） | **1,570 ms** | 28.5 MB（單檔） | 2（啟動器 + 本體） |
+| 資料夾版（`--onedir`） | **783 ms** | 67 MB（資料夾） | 1 |
+
+差距的來源很單純：單一 exe 每次啟動都要把整包約 30 MB 解壓到 `%TEMP%`，資料夾版直接載入現成檔案，省下約 780 ms。
+
+建置資料夾版：
+
+```bash
+powershell -ExecutionPolicy Bypass -File build.ps1 -OneDir
+```
+
+輸出在 `dist\MarkdownReader-onedir\MarkdownReader.exe`。刻意不用預設的 `dist\MarkdownReader\`，是為了避免和單一 exe 的 `dist\MarkdownReader.exe` 只差一個副檔名而相鄰——清理或搬移時很容易誤刪對方。
+
+換成資料夾版之後，記得重新指向檔案關聯：
+
+```bash
+py -3.13 tools/install_association.py --target "D:\software\Customize-Open-File\md\dist\MarkdownReader-onedir\MarkdownReader.exe"
+```
+
+### 啟動速度是怎麼調的
+
+除了打包方式，程式本身也做過一次量測與調整：
+
+| 項目 | 結果 |
+|---|---|
+| 匯入模組（PyQt6 + markdown + pygments） | 約 90 ms，沒有優化空間 |
+| **啟動時重複渲染** | 已修正，省下約 180 ms |
+| 建立主視窗 | 約 470 ms，其中大部分是 Qt 元件子系統的一次性初始化 |
+| 延後建立搜尋列／設定面板 | **實測無效**，不採用 |
+
+「重複渲染」是指：`__init__` 先套用主題並渲染一次（此時還沒載入檔案，畫的是歡迎頁），緊接著 `open_path` 又渲染一次真正的文件——第一次完全白做，而首次 Markdown 轉換要花 78 ms。現在啟動時的 `apply_theme` 帶 `render=False`。
+
+至於「延後建立隱藏的元件」，一開始看起來很有搞頭（單獨量搜尋列要 146 ms），但那是誤讀：那只是該行程中第一個被建立的元件，吸收了 Qt 的一次性初始化，換成別的元件也一樣。實測不建立它反而更慢，屬於量測雜訊，因此沒有採用。單次啟動的雜訊約 ±150 ms，比這個量級更小的優化在這個環境量不出來。
 
 ---
 

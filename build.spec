@@ -13,9 +13,12 @@ MarkdownReader.spec 並覆蓋同名檔案。取名 build.spec 就不會被蓋掉
 
 import os
 
-# True  = 單一 exe（方便散布，但每次啟動要解壓到暫存目錄，冷啟約 1~2 秒）
-# False = 資料夾版（啟動 <0.5 秒，適合設成 .md 的預設開啟程式）
-ONEFILE = True
+# True  = 單一 exe（方便散布，但每次啟動都要把整包解壓到暫存目錄）
+# False = 資料夾版（不需解壓，啟動快很多，適合設成 .md 的預設開啟程式）
+#
+# 可用環境變數覆寫，不必改檔案：
+#     $env:MDREADER_ONEDIR = "1"; py -3.13 -m PyInstaller --noconfirm --clean build.spec
+ONEFILE = os.environ.get("MDREADER_ONEDIR", "") != "1"
 
 # 用不到的 Python 模組。
 # 特別注意 PIL / numpy：pygments.formatters.img 會 import PIL，PIL 的 hook 又
@@ -136,11 +139,14 @@ else:
         disable_windowed_traceback=False,
         icon=["assets/app.ico"],
     )
+    # 資料夾刻意命名為 MarkdownReader-onedir，而不是預設的 MarkdownReader：
+    # 單一 exe 版的輸出是 dist\MarkdownReader.exe，兩者若只差一個副檔名而相鄰，
+    # 很容易在清理或搬移時誤刪對方。
     coll = COLLECT(
         exe,
         a.binaries,
         a.datas,
         strip=False,
         upx=False,
-        name="MarkdownReader",
+        name="MarkdownReader-onedir",
     )

@@ -308,7 +308,8 @@ class MarkdownViewer(QWidget):
 
         self._resizer = FramelessResizer(self)
 
-        self.apply_theme(self._theme)
+        # 這裡不重繪：下面的 open_path / _show_welcome 一定會渲染一次
+        self.apply_theme(self._theme, render=False)
         self._restore_window_state()
         self.title_bar.set_pinned(self._always_on_top)
         self.status_bar.setVisible(self._status_visible)
@@ -403,10 +404,13 @@ class MarkdownViewer(QWidget):
             QShortcut(QKeySequence(sequence), self, activated=slot)
 
     # -- 主題 ----------------------------------------------------------------
-    def apply_theme(self, theme: str) -> None:
+    def apply_theme(self, theme: str, render: bool = True) -> None:
         """套用主題：視窗 QSS、文件 CSS、圖示著色與程式碼高亮一次同步。
 
         這是全專案唯一的 setStyleSheet 呼叫。
+
+        render=False 用於程式啟動時：那時還沒載入檔案，重繪出來的是歡迎頁，
+        緊接著就會被 open_path 蓋掉，等於白做一次 Markdown 轉換與版面計算。
         """
         self._theme = theme
         self.setStyleSheet(styles.build_qss(theme))
@@ -414,7 +418,8 @@ class MarkdownViewer(QWidget):
         self.title_bar.apply_theme(theme)
         self.find_bar.apply_theme(theme)
         self.settings_panel.apply_theme(theme)
-        self._render()
+        if render:
+            self._render()
 
     def set_theme_mode(self, mode: str) -> None:
         """設定主題模式："light" / "dark" / "system"。"""

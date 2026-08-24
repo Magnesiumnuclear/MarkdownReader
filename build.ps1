@@ -48,28 +48,16 @@ if ($Clean) {
 # 4. 打包
 Write-Host "`n[4/4] 執行 PyInstaller..."
 if ($OneDir) {
-    # 資料夾版：啟動不需解壓，冷啟動 <0.5 秒
-    py -3.13 -m PyInstaller --noconfirm --clean --onedir --windowed --noupx `
-        --name MarkdownReader `
-        --icon assets/app.ico `
-        --add-data "assets;assets" `
-        --hidden-import PyQt6.QtSvg `
-        --exclude-module PyQt6.QtWebEngineCore `
-        --exclude-module PyQt6.QtWebEngineWidgets `
-        --exclude-module PyQt6.QtQml `
-        --exclude-module PyQt6.QtQuick `
-        --exclude-module PyQt6.QtMultimedia `
-        --exclude-module PyQt6.QtSql `
-        --exclude-module PyQt6.QtTest `
-        --exclude-module pyqtgraph `
-        --exclude-module numpy `
-        --exclude-module PIL `
-        --exclude-module tkinter `
-        main.py
-    $output = "dist\MarkdownReader\MarkdownReader.exe"
-} else {
-    # 單一 exe：使用 build.spec（排除清單較完整，exe 約小一半）
+    # 資料夾版：不需解壓，實測啟動時間約為單一 exe 的一半
+    $env:MDREADER_ONEDIR = "1"
     py -3.13 -m PyInstaller --noconfirm --clean build.spec
+    Remove-Item Env:\MDREADER_ONEDIR
+    $output = "dist\MarkdownReader-onedir\MarkdownReader.exe"
+} else {
+    # 單一 exe：方便散布，但每次啟動都要把整包解壓到暫存目錄
+    $env:MDREADER_ONEDIR = "0"
+    py -3.13 -m PyInstaller --noconfirm --clean build.spec
+    Remove-Item Env:\MDREADER_ONEDIR
     $output = "dist\MarkdownReader.exe"
 }
 
