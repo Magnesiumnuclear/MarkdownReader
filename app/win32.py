@@ -25,6 +25,51 @@ _SHCNE_ASSOCCHANGED = 0x08000000
 _SHCNF_IDLIST = 0x0000
 
 
+# 【務必保留這些 argtypes 宣告】
+# 64 位元 Windows 的 HWND 是 64-bit，但 ctypes 在沒有 argtypes 時會把 Python int
+# 當成 32-bit 的 C int 傳遞。SetWindowPos 的 HWND_TOPMOST（-1）因此被截斷成無效的
+# 視窗代碼，函式直接失敗、而且不會設定 LastError，從外面完全看不出哪裡有問題
+# ——「釘選最上層按鈕有反應但視窗沒有置頂」就是這樣來的。
+if IS_WINDOWS:
+    from ctypes import wintypes
+
+    _user32 = ctypes.windll.user32
+    _shell32 = ctypes.windll.shell32
+
+    _user32.SetWindowPos.argtypes = [
+        wintypes.HWND,      # hWnd
+        wintypes.HWND,      # hWndInsertAfter
+        ctypes.c_int,       # X
+        ctypes.c_int,       # Y
+        ctypes.c_int,       # cx
+        ctypes.c_int,       # cy
+        ctypes.c_uint,      # uFlags
+    ]
+    _user32.SetWindowPos.restype = wintypes.BOOL
+
+    _user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+    _user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+
+    _shell32.SetCurrentProcessExplicitAppUserModelID.argtypes = [wintypes.LPCWSTR]
+    _shell32.SetCurrentProcessExplicitAppUserModelID.restype = ctypes.HRESULT
+
+    _shell32.SHChangeNotify.argtypes = [
+        ctypes.c_long,      # wEventId
+        ctypes.c_uint,      # uFlags
+        ctypes.c_void_p,    # dwItem1
+        ctypes.c_void_p,    # dwItem2
+    ]
+    _shell32.SHChangeNotify.restype = None
+else:  # pragma: no cover - 只在非 Windows 平台走到
+    wintypes = None
+    _user32 = None
+    _shell32 = None
+
+# GetWindowLongPtrW 用的常數
+_GWL_EXSTYLE = -20
+_WS_EX_TOPMOST = 0x00000008
+
+
 def set_app_user_model_id(app_id: str = config.APP_USER_MODEL_ID) -> bool:
     """設定 AppUserModelID。
 
@@ -34,33 +79,47 @@ def set_app_user_model_id(app_id: str = config.APP_USER_MODEL_ID) -> bool:
     if not IS_WINDOWS:
         return False
     try:
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+        _shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
         return True
     except Exception:
         return False
 
 
 def set_topmost(window_id: int, enabled: bool) -> bool:
-    """切換視窗是否置頂。
+    """切換視窗是否置頂，回傳是否確實生效。
 
     比 Qt 的 setWindowFlag(WindowStaysOnTopHint) 好：後者在 Windows 上會重建
     原生視窗，造成畫面閃爍，而且容易掉失最大化狀態與焦點。
+
+    回傳值會實際回頭檢查 WS_EX_TOPMOST，而不是只看 API 的回傳值——呼叫端要靠
+    它決定是否改用 Qt 的旗標作為後備。
     """
     if not IS_WINDOWS or not window_id:
         return False
     try:
-        insert_after = _HWND_TOPMOST if enabled else _HWND_NOTOPMOST
-        return bool(
-            ctypes.windll.user32.SetWindowPos(
-                int(window_id),
-                insert_after,
-                0,
-                0,
-                0,
-                0,
-                _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOACTIVATE,
-            )
+        handle = wintypes.HWND(int(window_id))
+        insert_after = wintypes.HWND(_HWND_TOPMOST if enabled else _HWND_NOTOPMOST)
+        _user32.SetWindowPos(
+            handle,
+            insert_after,
+            0,
+            0,
+            0,
+            0,
+            _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOACTIVATE,
         )
+        return is_topmost(window_id) == bool(enabled)
+    except Exception:
+        return False
+
+
+def is_topmost(window_id: int) -> bool:
+    """查詢視窗目前是否具有 WS_EX_TOPMOST 樣式。"""
+    if not IS_WINDOWS or not window_id:
+        return False
+    try:
+        style = _user32.GetWindowLongPtrW(wintypes.HWND(int(window_id)), _GWL_EXSTYLE)
+        return bool(style & _WS_EX_TOPMOST)
     except Exception:
         return False
 
@@ -70,9 +129,7 @@ def notify_association_changed() -> bool:
     if not IS_WINDOWS:
         return False
     try:
-        ctypes.windll.shell32.SHChangeNotify(
-            _SHCNE_ASSOCCHANGED, _SHCNF_IDLIST, None, None
-        )
+        _shell32.SHChangeNotify(_SHCNE_ASSOCCHANGED, _SHCNF_IDLIST, None, None)
         return True
     except Exception:
         return False

@@ -291,6 +291,7 @@ class MarkdownViewer(QWidget):
         self._pending_anchor = ""
         self._has_scalable_images = False
         self._last_render_width = 0
+        self._applying_topmost = False
 
         self._build_ui()
         self._create_shortcuts()
@@ -839,8 +840,36 @@ class MarkdownViewer(QWidget):
         self._always_on_top = bool(enabled)
         self._settings.setValue(config.KEY_ALWAYS_ON_TOP, self._always_on_top)
         self.title_bar.set_pinned(self._always_on_top)
-        win32.set_topmost(int(self.winId()), self._always_on_top)
+        self._apply_always_on_top()
         self._sync_settings_panel()
+
+    def _apply_always_on_top(self) -> None:
+        """套用置頂狀態；原生作法失敗時退回 Qt 旗標。
+
+        優先用原生的 SetWindowPos——它不會重建視窗，沒有閃爍、也不會掉失最大化
+        狀態。但萬一失敗（平台不符、權限問題等），就改用 Qt 的旗標並補回原本的
+        顯示狀態，免得出現「按鈕有反應、視窗卻沒有置頂」這種只有 UI 說謊的情形。
+        """
+        if self._applying_topmost:
+            return
+        if win32.set_topmost(int(self.winId()), self._always_on_top):
+            return
+
+        self._applying_topmost = True
+        try:
+            was_maximized = self.isMaximized()
+            geometry = self.saveGeometry()
+            self.setWindowFlag(
+                Qt.WindowType.WindowStaysOnTopHint, self._always_on_top
+            )
+            # 更動旗標會讓 Windows 重建原生視窗並把它隱藏，必須重新顯示
+            if was_maximized:
+                self.showMaximized()
+            else:
+                self.restoreGeometry(geometry)
+                self.show()
+        finally:
+            self._applying_topmost = False
 
     def toggle_always_on_top(self) -> None:
         self.set_always_on_top(not self._always_on_top)
@@ -922,8 +951,9 @@ class MarkdownViewer(QWidget):
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
         # winId 必須在原生視窗建立後才有效
-        if self._always_on_top:
-            win32.set_topmost(int(self.winId()), True)
+        if self._always_on_top and not win32.set_topmost(int(self.winId()), True):
+            # 後備方案會呼叫 show()，不能在 showEvent 裡直接跑
+            QTimer.singleShot(0, self._apply_always_on_top)
         self._resizer.refresh_targets()
         self._resizer.update_margin()
         self._position_settings_panel()
