@@ -1,0 +1,7 @@
+# Markdown 閱讀器相依套件（Python 3.10+，建議 3.13）
+PyQt6>=6.6
+markdown>=3.5
+Pygments>=2.17
+
+# 只有打包 .exe 時才需要
+pyinstaller>=6.0
