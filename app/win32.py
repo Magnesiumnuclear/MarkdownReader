@@ -60,10 +60,21 @@ if IS_WINDOWS:
         ctypes.c_void_p,    # dwItem2
     ]
     _shell32.SHChangeNotify.restype = None
+
+    _kernel32 = ctypes.windll.kernel32
+    _user32.GetForegroundWindow.restype = wintypes.HWND
+    _user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    _user32.SetForegroundWindow.restype = wintypes.BOOL
+    _user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.c_void_p]
+    _user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    _user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+    _user32.AttachThreadInput.restype = wintypes.BOOL
+    _kernel32.GetCurrentThreadId.restype = wintypes.DWORD
 else:  # pragma: no cover - 只在非 Windows 平台走到
     wintypes = None
     _user32 = None
     _shell32 = None
+    _kernel32 = None
 
 # GetWindowLongPtrW 用的常數
 _GWL_EXSTYLE = -20
@@ -120,6 +131,31 @@ def is_topmost(window_id: int) -> bool:
     try:
         style = _user32.GetWindowLongPtrW(wintypes.HWND(int(window_id)), _GWL_EXSTYLE)
         return bool(style & _WS_EX_TOPMOST)
+    except Exception:
+        return False
+
+
+def force_foreground(window_id: int) -> bool:
+    """把視窗搶到前景。
+
+    Windows 會擋掉非前景行程的 SetForegroundWindow，導致「雙擊檔案後視窗只在
+    工作列閃爍」。把本執行緒暫時附加到目前前景視窗的輸入佇列就能繞過這個限制，
+    這是處理單一實例喚醒時的標準作法。
+    """
+    if not IS_WINDOWS or not window_id:
+        return False
+    try:
+        handle = wintypes.HWND(int(window_id))
+        foreground = _user32.GetForegroundWindow()
+        current = _kernel32.GetCurrentThreadId()
+        target = _user32.GetWindowThreadProcessId(foreground, None)
+        attached = False
+        if target and target != current:
+            attached = bool(_user32.AttachThreadInput(current, target, True))
+        _user32.SetForegroundWindow(handle)
+        if attached:
+            _user32.AttachThreadInput(current, target, False)
+        return True
     except Exception:
         return False
 

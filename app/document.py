@@ -232,7 +232,10 @@ def render_error(error: DocumentError, path: str = "") -> str:
 def render_welcome() -> str:
     """未指定檔案時顯示的歡迎頁。"""
     rows = [
-        ("Ctrl + O", "開啟 Markdown 檔案"),
+        ("Ctrl + O", "開啟 Markdown 檔案（開在新分頁）"),
+        ("Ctrl + T", "開一個空白分頁"),
+        ("Ctrl + W", "關閉目前分頁；只剩一個時關閉視窗"),
+        ("Ctrl + Tab / Ctrl + Shift + Tab", "切換到下一個／上一個分頁"),
         ("F5 / Ctrl + R", "重新載入目前檔案"),
         ("Ctrl + F", "在文件中搜尋"),
         ("Ctrl + ,", "開啟設定列"),
@@ -241,7 +244,7 @@ def render_welcome() -> str:
         ("Ctrl + + / - / 0", "放大／縮小／重設字級"),
         ("Alt + 左方向鍵", "回到上一篇文件"),
         ("F11", "切換最大化"),
-        ("Ctrl + W / Esc", "關閉視窗"),
+        ("Esc", "關閉視窗"),
     ]
     table = [
         '<table class="data"><thead><tr><th>快速鍵</th><th>功能</th></tr></thead><tbody>'

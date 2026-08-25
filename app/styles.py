@@ -145,6 +145,74 @@ QToolButton#navBtn:disabled { background-color: transparent; }
 QToolButton#closeBtn:hover   { background-color: $close_hover_bg; }
 QToolButton#closeBtn:pressed { background-color: $close_pressed_bg; }
 
+/* ---------- 分頁列 ---------- */
+#tabBar {
+    background-color: $surface;
+    border: none;
+    border-bottom: 1px solid $border;
+}
+#tabScroll, #tabStrip { background: transparent; border: none; }
+
+/* 未選取：融入分頁列底色。border-top 保留透明佔位，切換時不會位移 */
+#tab {
+    background-color: transparent;
+    border: none;
+    border-right: 1px solid $border;
+    border-top: 2px solid transparent;
+}
+#tab:hover { background-color: $hover_bg; }
+#tabLabel {
+    color: $text_muted;
+    font-family: $font_ui;
+    font-size: 12px;
+    background: transparent;
+}
+
+/* 選取中：底色與內容區相同，視覺上和下方文件連成一片 */
+#tabActive {
+    background-color: $window_bg;
+    border: none;
+    border-right: 1px solid $border;
+    border-top: 2px solid $accent;
+}
+#tabLabelActive {
+    color: $text;
+    font-family: $font_ui;
+    font-size: 12px;
+    background: transparent;
+}
+
+QToolButton#tabClose, QToolButton#tabNew {
+    background-color: transparent;
+    border: none;
+    border-radius: 3px;
+    padding: 0px;
+}
+QToolButton#tabClose:hover, QToolButton#tabNew:hover { background-color: $pressed_bg; }
+
+#tabScroll QScrollBar:horizontal {
+    background: transparent;
+    height: 6px;
+    margin: 0px;
+    border: none;
+}
+#tabScroll QScrollBar::handle:horizontal {
+    background-color: $scrollbar;
+    border-radius: 3px;
+    min-width: 30px;
+    margin: 1px;
+}
+#tabScroll QScrollBar::add-line:horizontal,
+#tabScroll QScrollBar::sub-line:horizontal {
+    width: 0px;
+    background: transparent;
+    border: none;
+}
+#tabScroll QScrollBar::add-page:horizontal,
+#tabScroll QScrollBar::sub-page:horizontal {
+    background: transparent;
+}
+
 /* ---------- 內容顯示區 ---------- */
 #contentView {
     background-color: $window_bg;

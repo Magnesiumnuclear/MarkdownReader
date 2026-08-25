@@ -45,14 +45,18 @@ from PyQt6.QtWidgets import (
     QLabel,
     QMessageBox,
     QScrollBar,
+    QStackedWidget,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
 
 from . import config, document, icons, qt_html, styles, theme as theme_utils, win32
+from .browser import MarkdownBrowser
+from .document_tab import DocumentTab
 from .find_bar import FindBar
 from .settings_panel import SettingsPanel
+from .tab_bar import TabBar
 from .title_bar import CustomTitleBar
 
 # 依邊緣組合決定游標形狀
@@ -99,13 +103,28 @@ class FramelessResizer(QObject):
         self._drag_controls = [w for w in widgets if w is not None]
 
     def _over_drag_control(self, global_x: int, global_y: int) -> bool:
+        """游標是否落在需要讓開的控制項上。
+
+        名單是快照，成員可能在分頁關閉後失效。這個函式是從 eventFilter 呼叫的，
+        讓 RuntimeError 逸出等於直接中止行程，所以就地把失效的成員剔除。
+        呼叫端已經會在分頁增減時重新登記，這裡只是最後一道防線。
+        """
+        alive: list[QWidget] = []
+        hit = False
         for widget in self._drag_controls:
-            if not widget.isVisible():
+            try:
+                visible = widget.isVisible()
+            except RuntimeError:
+                continue  # C++ 物件已被銷毀
+            alive.append(widget)
+            if not visible:
                 continue
             rect = QRect(widget.mapToGlobal(QPoint(0, 0)), widget.size())
             if rect.contains(global_x, global_y):
-                return True
-        return False
+                hit = True
+        if len(alive) != len(self._drag_controls):
+            self._drag_controls = alive
+        return hit
 
     # -- 邊緣判定 ------------------------------------------------------------
     def _edges_at(self, global_x: int, global_y: int) -> int:
@@ -188,59 +207,6 @@ class FramelessResizer(QObject):
         return False
 
 
-class MarkdownBrowser(QTextBrowser):
-    """負責自訂資源載入的閱讀區。"""
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setObjectName("contentView")
-        self._theme = config.DEFAULT_THEME
-        self.setOpenLinks(False)
-        self.setOpenExternalLinks(False)
-        self.setFrameShape(QFrame.Shape.NoFrame)
-        self.document().setDocumentMargin(styles.DOCUMENT_MARGIN)
-
-    def set_theme(self, theme: str) -> None:
-        self._theme = theme
-
-    def loadResource(self, resource_type: int, url: QUrl):  # noqa: N802
-        # 任務清單的核取方塊：Qt 不渲染 <input>，改以 QPainter 即時繪製
-        if url.scheme() == qt_html.CHECKBOX_SCHEME:
-            colors = styles.palette(self._theme)
-            checked = url.toString().endswith("checkbox-on")
-            return icons.checkbox_pixmap(checked, colors["text_muted"], colors["accent"])
-
-        resource = super().loadResource(resource_type, url)
-
-        # 過寬的圖片等比縮到可視寬度，避免撐爆版面（Qt 不會自動縮圖）
-        if resource_type == QTextDocument.ResourceType.ImageResource.value:
-            image = self._as_image(resource)
-            if image is not None and not image.isNull():
-                # setHtml 有可能在版面定案前就被呼叫，此時 viewport 寬度還不可靠
-                available = self.viewport().width()
-                if available < 100:
-                    available = self.width()
-                limit = available - 2 * styles.DOCUMENT_MARGIN - 8
-                if limit > 80 and image.width() > limit:
-                    return image.scaledToWidth(
-                        limit, Qt.TransformationMode.SmoothTransformation
-                    )
-                return image
-        return resource
-
-    @staticmethod
-    def _as_image(resource) -> QImage | None:
-        if isinstance(resource, QImage):
-            return resource
-        if isinstance(resource, QPixmap):
-            return resource.toImage()
-        if isinstance(resource, (QByteArray, bytes, bytearray)):
-            image = QImage()
-            if image.loadFromData(QByteArray(bytes(resource))):
-                return image
-        return None
-
-
 class MarkdownViewer(QWidget):
     """Markdown 閱讀器主視窗。"""
 
@@ -291,15 +257,12 @@ class MarkdownViewer(QWidget):
             config.KEY_CONFIRM_LINKS, config.DEFAULT_CONFIRM_LINKS, type=bool
         )
 
-        self._path: str | None = None
-        self._text = ""
-        self._meta: document.DocumentMeta | None = None
-        self._error: document.DocumentError | None = None
-        self._history: list[str] = []
-        self._file_stamp: tuple[float, int] | None = None
-        self._pending_anchor = ""
-        self._has_scalable_images = False
-        self._last_render_width = 0
+        self._restore_tabs = self._settings.value(
+            config.KEY_RESTORE_TABS, config.DEFAULT_RESTORE_TABS, type=bool
+        )
+        # 分頁清單。至少永遠有一個，_tab 屬性指向作用中的那個。
+        self._tabs: list[DocumentTab] = []
+        self._active = 0
         self._applying_topmost = False
 
         self._build_ui()
@@ -327,10 +290,218 @@ class MarkdownViewer(QWidget):
         # 「跟隨系統」需要在 Windows 切換深淺色時即時反應
         theme_utils.connect_system_changes(self._on_system_theme_changed)
 
+        self._open_initial_tabs(path)
+
+    # -- 分頁存取 ------------------------------------------------------------
+    @property
+    def _tab(self) -> DocumentTab:
+        """目前作用中的分頁。其餘程式碼都透過它取用單一文件的狀態。"""
+        return self._tabs[self._active]
+
+    @property
+    def browser(self) -> MarkdownBrowser:
+        """作用中分頁的閱讀區。
+
+        做成屬性而不是欄位，是為了讓既有那些「操作 self.browser」的程式碼
+        在改成多分頁後完全不用改寫。
+        """
+        return self._tabs[self._active].browser
+
+    # -- 分頁管理 ------------------------------------------------------------
+    def _open_initial_tabs(self, path: str | None) -> None:
+        """啟動時決定要開哪些分頁。
+
+        還原上次的分頁時只建立空殼並記住路徑，等切過去才讀檔，
+        否則還原十個分頁就要付十次 Markdown 轉換，啟動會明顯變慢。
+        """
+        restored: list[str] = []
+        if self._restore_tabs:
+            saved = self._settings.value(config.KEY_OPEN_TABS, [], type=list)
+            restored = [p for p in saved if isinstance(p, str) and os.path.isfile(p)]
+
+        for saved_path in restored:
+            if path and os.path.abspath(saved_path) == os.path.abspath(path):
+                continue  # 命令列指定的檔案稍後才開，避免重複
+            self._add_tab(DocumentTab(saved_path), activate=False)
+
         if path:
+            self._add_tab(DocumentTab(), activate=True)
             self.open_path(path, push_history=False)
+        elif self._tabs:
+            index = int(self._settings.value(config.KEY_ACTIVE_TAB, 0))
+            index = min(max(index, 0), len(self._tabs) - 1)
+            # _active 一開始就是 0，直接呼叫 activate_tab(0) 會被「已經在這一頁」
+            # 擋掉，於是還原出來的第一個分頁永遠不會被載入，畫面一片空白，
+            # 搜尋列也沒有接到任何閱讀區。先指到不可能相等的值強制走完整流程。
+            self._active = -1
+            self.activate_tab(index)
         else:
+            self._add_tab(DocumentTab(), activate=True)
             self._show_welcome()
+        self._sync_tab_bar()
+
+    def _add_tab(self, tab: DocumentTab, activate: bool) -> None:
+        """把分頁加進堆疊。"""
+        tab.browser.setParent(self.stack)
+        tab.browser.set_theme(self._theme)
+        tab.browser.anchorClicked.connect(self._on_anchor_clicked)
+        self.stack.addWidget(tab.browser)
+        self._tabs.append(tab)
+        if activate:
+            self._active = len(self._tabs) - 1
+            self.stack.setCurrentWidget(tab.browser)
+            self.find_bar.attach(tab.browser)
+        self._refresh_resizer_targets()
+
+    def _refresh_resizer_targets(self) -> None:
+        """分頁增減後重新登記邊緣縮放的目標。
+
+        縮放靠的是裝在「視窗與所有子元件」上的事件過濾器，原本只在 showEvent
+        裝一次。啟動之後才建立的分頁閱讀區不在那份名單裡，游標移到它上面時
+        MouseMove 收不到，邊緣就拖不動了。
+
+        更嚴重的是另一半：捲軸名單是同一時間拍下的快照，分頁一關，它的捲軸
+        C++ 物件就沒了，留下的 sip 包裝再被碰到會丟 RuntimeError——而那是在
+        eventFilter 裡，PyQt6 視為致命，滑鼠一動行程就中止。
+        """
+        if not self.isVisible():
+            # 還沒顯示時 showEvent 之後會做一次，這裡跳過省得白做
+            return
+        self._resizer.refresh_targets()
+        self._resizer.set_drag_controls(self.findChildren(QScrollBar))
+
+    def _index_of_path(self, path: str) -> int | None:
+        target = os.path.abspath(path)
+        for index, tab in enumerate(self._tabs):
+            if tab.path and os.path.abspath(tab.path) == target:
+                return index
+        return None
+
+    def activate_tab(self, index: int) -> None:
+        """切到指定分頁；內容還沒讀或需要重繪時在這裡補上。"""
+        if not (0 <= index < len(self._tabs)) or index == self._active:
+            if 0 <= index < len(self._tabs):
+                self._sync_tab_bar()
+            return
+
+        if self.find_bar.isVisible():
+            self.find_bar.deactivate()
+
+        self._active = index
+        tab = self._tabs[index]
+        self.stack.setCurrentWidget(tab.browser)
+        self.find_bar.attach(tab.browser)
+
+        if not tab.loaded:
+            tab.load()
+            if tab.path:
+                self._set_search_context(tab.path)
+        if tab.dirty:
+            self._render(preserve_scroll=False)
+
+        self._update_titles(tab.display_name)
+        self._update_status()
+        self.title_bar.set_back_enabled(bool(tab.history))
+        self._sync_tab_bar()
+
+    def new_tab(self) -> None:
+        """開一個空白分頁並顯示歡迎頁。"""
+        self._add_tab(DocumentTab(), activate=True)
+        self._show_welcome()
+        self._sync_tab_bar()
+
+    def close_tab(self) -> None:
+        """關閉作用中的分頁；只剩一個時關閉視窗。"""
+        self.close_tab_at(self._active)
+
+    def close_tab_at(self, index: int) -> None:
+        if not (0 <= index < len(self._tabs)):
+            return
+        if len(self._tabs) <= 1:
+            self.close()
+            return
+
+        # 比照 activate_tab：搜尋列裡的比對位置是針對「目前那份文件」算出來的
+        # 字元位移，換一份文件就完全對不上了（實測 300 筆比對留在一份只有 4 個
+        # 字元的文件上，計數器照跳、卻什麼都沒高亮）。
+        if self.find_bar.isVisible():
+            self.find_bar.deactivate()
+
+        tab = self._tabs.pop(index)
+        self.stack.removeWidget(tab.browser)
+        tab.browser.setParent(None)
+        tab.browser.deleteLater()
+
+        # 關掉的若在作用分頁之前，索引要往前挪
+        if index < self._active:
+            self._active -= 1
+        elif index == self._active:
+            self._active = min(index, len(self._tabs) - 1)
+        self._active = max(0, min(self._active, len(self._tabs) - 1))
+
+        current = self._tabs[self._active]
+        self.stack.setCurrentWidget(current.browser)
+        self.find_bar.attach(current.browser)
+        if not current.loaded:
+            current.load()
+        if current.dirty:
+            self._render(preserve_scroll=False)
+        self._update_titles(current.display_name)
+        self._update_status()
+        self._sync_tab_bar()
+        self._watch_files()
+        self._refresh_resizer_targets()
+
+    def next_tab(self) -> None:
+        if len(self._tabs) > 1:
+            self.activate_tab((self._active + 1) % len(self._tabs))
+
+    def previous_tab(self) -> None:
+        if len(self._tabs) > 1:
+            self.activate_tab((self._active - 1) % len(self._tabs))
+
+    def _mark_all_dirty(self) -> None:
+        """字級或行高改變後，背景分頁切過去時才重繪。"""
+        for tab in self._tabs:
+            tab.dirty = True
+
+    def _sync_tab_bar(self) -> None:
+        self.tab_bar.set_tabs(
+            [(tab.display_name, tab.tooltip) for tab in self._tabs], self._active
+        )
+
+    # -- 外部開檔（單一實例） ------------------------------------------------
+    def handle_external_open(self, path: str) -> None:
+        """另一個行程把檔案交過來時呼叫（雙擊 .md 而本程式已在執行）。"""
+        if path:
+            self.open_path(path, new_tab=True)
+        # 使用者是在檔案總管雙擊的，視窗要自己跳到前景
+        if self.isMinimized():
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        win32.force_foreground(int(self.winId()))
+
+    # -- 分頁狀態保存 --------------------------------------------------------
+    def set_restore_tabs(self, enabled: bool) -> None:
+        self._restore_tabs = bool(enabled)
+        self._settings.setValue(config.KEY_RESTORE_TABS, self._restore_tabs)
+        if not self._restore_tabs:
+            self._settings.remove(config.KEY_OPEN_TABS)
+            self._settings.remove(config.KEY_ACTIVE_TAB)
+        self._sync_settings_panel()
+
+    def _save_session(self) -> None:
+        if not self._restore_tabs:
+            return
+        paths = [tab.path for tab in self._tabs if tab.path]
+        self._settings.setValue(config.KEY_OPEN_TABS, paths)
+        # 索引要以「有路徑的分頁」為準，空白分頁不會被還原
+        active_path = self._tab.path
+        self._settings.setValue(
+            config.KEY_ACTIVE_TAB,
+            paths.index(active_path) if active_path in paths else 0,
+        )
 
     # -- 介面組裝 ------------------------------------------------------------
     def _build_ui(self) -> None:
@@ -347,9 +518,10 @@ class MarkdownViewer(QWidget):
         inner.setSpacing(0)
 
         self.title_bar = CustomTitleBar(self.root_frame)
-        self.browser = MarkdownBrowser(self.root_frame)
+        self.tab_bar = TabBar(self.root_frame)
+        # 每個分頁一個閱讀區，用堆疊切換，各自保有捲動位置與文件物件
+        self.stack = QStackedWidget(self.root_frame)
         self.find_bar = FindBar(self.root_frame)
-        self.find_bar.attach(self.browser)
         # 設定面板是覆蓋層，不放進版面，改由 _position_settings_panel 手動定位，
         # 這樣它才能整片蓋住標題列以下的區域（含搜尋列與狀態列）
         self.settings_panel = SettingsPanel(self.root_frame)
@@ -364,7 +536,8 @@ class MarkdownViewer(QWidget):
         status_layout.addWidget(self.status_label)
 
         inner.addWidget(self.title_bar)
-        inner.addWidget(self.browser, 1)
+        inner.addWidget(self.tab_bar)
+        inner.addWidget(self.stack, 1)
         inner.addWidget(self.find_bar)
         inner.addWidget(self.status_bar)
 
@@ -376,8 +549,11 @@ class MarkdownViewer(QWidget):
         self.title_bar.pinToggled.connect(self.set_always_on_top)
         self.title_bar.minimizeRequested.connect(self.showMinimized)
         self.title_bar.maximizeToggleRequested.connect(self.toggle_maximized)
-        self.title_bar.closeRequested.connect(self.close)
-        self.browser.anchorClicked.connect(self._on_anchor_clicked)
+        self.title_bar.closeRequested.connect(self.close_tab)
+
+        self.tab_bar.activated.connect(self.activate_tab)
+        self.tab_bar.closeRequested.connect(self.close_tab_at)
+        self.tab_bar.newTabRequested.connect(self.open_dialog)
 
         self.settings_panel.themeModeChanged.connect(self.set_theme_mode)
         self.settings_panel.lineHeightChanged.connect(self.set_line_height)
@@ -386,6 +562,7 @@ class MarkdownViewer(QWidget):
         self.settings_panel.alwaysOnTopChanged.connect(self.set_always_on_top)
         self.settings_panel.statusBarChanged.connect(self.set_status_bar_visible)
         self.settings_panel.confirmLinksChanged.connect(self.set_confirm_links)
+        self.settings_panel.restoreTabsChanged.connect(self.set_restore_tabs)
         self.settings_panel.resetRequested.connect(self.reset_settings)
         self.settings_panel.font_minus.clicked.connect(self.zoom_out)
         self.settings_panel.font_plus.clicked.connect(self.zoom_in)
@@ -406,7 +583,13 @@ class MarkdownViewer(QWidget):
             ("Ctrl+/", self.toggle_status_bar),
             ("Alt+Left", self.go_back),
             ("F11", self.toggle_maximized),
-            ("Ctrl+W", self.close),
+            # Ctrl+T 對應分頁列的「＋」，兩個入口行為一致；要直接挑檔案用 Ctrl+O
+            ("Ctrl+T", self.new_tab),
+            ("Ctrl+W", self.close_tab),
+            ("Ctrl+Tab", self.next_tab),
+            ("Ctrl+Shift+Tab", self.previous_tab),
+            ("Ctrl+PgDown", self.next_tab),
+            ("Ctrl+PgUp", self.previous_tab),
             ("Esc", self._on_escape),
         )
         for sequence, slot in bindings:
@@ -423,11 +606,15 @@ class MarkdownViewer(QWidget):
         """
         self._theme = theme
         self.setStyleSheet(styles.build_qss(theme))
-        self.browser.set_theme(theme)
         self.title_bar.apply_theme(theme)
+        self.tab_bar.apply_theme(theme)
         self.find_bar.apply_theme(theme)
         self.settings_panel.apply_theme(theme)
-        if render:
+        # 只重繪看得到的那個分頁，其餘標記待重繪，切過去時才處理
+        for tab in self._tabs:
+            tab.browser.set_theme(theme)
+            tab.dirty = True
+        if render and self._tabs:
             self._render()
 
     def set_theme_mode(self, mode: str) -> None:
@@ -464,6 +651,7 @@ class MarkdownViewer(QWidget):
             return
         self._line_height = key
         self._settings.setValue(config.KEY_LINE_HEIGHT, key)
+        self._mark_all_dirty()
         self._render()
         self._sync_settings_panel()
 
@@ -472,6 +660,7 @@ class MarkdownViewer(QWidget):
             return
         self._content_width = int(width)
         self._settings.setValue(config.KEY_CONTENT_WIDTH, self._content_width)
+        self._mark_all_dirty()
         self._apply_content_width()
         self._sync_settings_panel()
 
@@ -510,8 +699,7 @@ class MarkdownViewer(QWidget):
         self._auto_reload = bool(enabled)
         self._settings.setValue(config.KEY_AUTO_RELOAD, self._auto_reload)
         if self._auto_reload:
-            if self._path:
-                self._watch_file(self._path)
+            self._watch_files()
         else:
             self._unwatch_all()
         self._sync_settings_panel()
@@ -564,6 +752,7 @@ class MarkdownViewer(QWidget):
             always_on_top=self._always_on_top,
             status_bar=self._status_visible,
             confirm_links=self._confirm_links,
+            restore_tabs=self._restore_tabs,
         )
 
     def reset_settings(self) -> None:
@@ -573,6 +762,7 @@ class MarkdownViewer(QWidget):
         self._content_width = config.DEFAULT_CONTENT_WIDTH
         self._auto_reload = config.DEFAULT_AUTO_RELOAD
         self._confirm_links = config.DEFAULT_CONFIRM_LINKS
+        self._restore_tabs = config.DEFAULT_RESTORE_TABS
         self._status_visible = True
         self.status_bar.setVisible(True)
         self.set_always_on_top(False)
@@ -583,62 +773,85 @@ class MarkdownViewer(QWidget):
             (config.KEY_CONTENT_WIDTH, self._content_width),
             (config.KEY_AUTO_RELOAD, self._auto_reload),
             (config.KEY_CONFIRM_LINKS, self._confirm_links),
+            (config.KEY_RESTORE_TABS, self._restore_tabs),
             (config.KEY_STATUS_VISIBLE, self._status_visible),
         ):
             self._settings.setValue(key, value)
 
-        if self._path:
-            self._watch_file(self._path)
+        self._watch_files()
         self.set_theme_mode(config.DEFAULT_THEME_MODE)
         self.status_label.setText("已恢復預設設定")
 
     # -- 開檔與渲染 ----------------------------------------------------------
     def open_dialog(self) -> None:
-        start_dir = os.path.dirname(self._path) if self._path else ""
+        start_dir = os.path.dirname(self._tab.path) if self._tab.path else ""
         path, _selected = QFileDialog.getOpenFileName(
             self, "開啟 Markdown 檔案", start_dir, config.OPEN_DIALOG_FILTER
         )
         if path:
-            self.open_path(path)
+            self.open_path(path, new_tab=True)
 
-    def open_path(self, path: str, push_history: bool = True, anchor: str = "") -> None:
-        """載入指定檔案；讀取失敗時在閱讀區顯示錯誤頁。"""
+    def open_path(
+        self,
+        path: str,
+        push_history: bool = True,
+        anchor: str = "",
+        new_tab: bool = False,
+    ) -> None:
+        """載入指定檔案；讀取失敗時在閱讀區顯示錯誤頁。
+
+        new_tab=True 會開在新分頁；若該檔案已經開著，就直接切過去而不重複開。
+        """
         path = os.path.abspath(path)
-        if push_history and self._path and os.path.abspath(self._path) != path:
-            self._history.append(self._path)
+        if new_tab:
+            existing = self._index_of_path(path)
+            if existing is not None:
+                self.activate_tab(existing)
+                if anchor:
+                    QTimer.singleShot(0, lambda: self.browser.scrollToAnchor(anchor))
+                return
+            self._add_tab(DocumentTab(), activate=True)
+
+        if push_history and self._tab.path and os.path.abspath(self._tab.path) != path:
+            self._tab.history.append(self._tab.path)
             self.title_bar.set_back_enabled(True)
 
-        self._pending_anchor = anchor
-        self._path = path
+        self._tab.pending_anchor = anchor
+        self._tab.path = path
         self._set_search_context(path)
 
         try:
-            self._text, self._meta = document.read_text_file(path)
+            self._tab.text, self._tab.meta = document.read_text_file(path)
         except document.DocumentError as error:
-            self._text = ""
-            self._meta = None
-            self._error = error
-            self._file_stamp = None
+            self._tab.text = ""
+            self._tab.meta = None
+            self._tab.error = error
+            self._tab.file_stamp = None
+            self._tab.loaded = True
             self._render(preserve_scroll=False)
             self._update_titles(os.path.basename(path) or path)
             self.status_label.setText(f"無法讀取：{path}")
-            self._watch_file(path)
+            self._sync_tab_bar()
+            self._watch_files()
             return
 
-        self._error = None
-        self._file_stamp = self._stamp_of(path)
+        self._tab.error = None
+        self._tab.loaded = True
+        self._tab.file_stamp = self._stamp_of(path)
         self._render()
-        self._update_titles(self._meta.display_name)
+        self._update_titles(self._tab.meta.display_name)
         self._update_status()
-        self._watch_file(path)
+        self._sync_tab_bar()
+        self._watch_files()
         if anchor:
             QTimer.singleShot(0, lambda: self.browser.scrollToAnchor(anchor))
 
     def _show_welcome(self) -> None:
-        self._path = None
-        self._text = ""
-        self._meta = None
-        self._error = None
+        self._tab.path = None
+        self._tab.text = ""
+        self._tab.meta = None
+        self._tab.error = None
+        self._tab.loaded = True
         self._render(preserve_scroll=False)
         self._update_titles(config.APP_DISPLAY_NAME)
         self.status_label.setText("尚未開啟檔案 — 按 Ctrl+O 或直接拖放 .md 檔到視窗")
@@ -657,18 +870,14 @@ class MarkdownViewer(QWidget):
             )
         )
 
-        if self._error is not None:
-            html = document.render_error(self._error, self._path or "")
-        elif self._meta is not None:
-            html = document.render_document(self._text, self._meta, self._theme)
-        else:
-            html = document.render_welcome()
+        html = self._tab.build_html(self._theme)
+        self._tab.dirty = False
 
         # 任務清單的核取方塊也是 <img>，但尺寸固定，不需要隨視窗重繪
-        self._has_scalable_images = bool(
+        self._tab.has_scalable_images = bool(
             re.search(r'<img[^>]+src="(?!mdres:)', html)
         )
-        self._last_render_width = self.browser.viewport().width()
+        self._tab.last_render_width = self.browser.viewport().width()
 
         self.browser.setHtml(html)
         # setHtml 會重建文件，root frame 的邊距必須重設
@@ -677,15 +886,15 @@ class MarkdownViewer(QWidget):
             QTimer.singleShot(0, lambda: self._apply_scroll_ratio(ratio))
 
     def reload(self) -> None:
-        if not self._path:
+        if not self._tab.path:
             return
-        self.open_path(self._path, push_history=False)
+        self.open_path(self._tab.path, push_history=False)
 
     def go_back(self) -> None:
-        if not self._history:
+        if not self._tab.history:
             return
-        previous = self._history.pop()
-        self.title_bar.set_back_enabled(bool(self._history))
+        previous = self._tab.history.pop()
+        self.title_bar.set_back_enabled(bool(self._tab.history))
         self.open_path(previous, push_history=False)
 
     # -- 捲動位置 ------------------------------------------------------------
@@ -707,9 +916,9 @@ class MarkdownViewer(QWidget):
             self.setWindowTitle(f"{name} — {config.APP_DISPLAY_NAME}")
 
     def _update_status(self) -> None:
-        if self._meta is None:
+        if self._tab.meta is None:
             return
-        meta = self._meta
+        meta = self._tab.meta
         parts = [
             meta.path,
             meta.encoding,
@@ -738,8 +947,10 @@ class MarkdownViewer(QWidget):
         for watched in self._watcher.directories():
             self._watcher.removePath(watched)
 
-    def _watch_file(self, path: str) -> None:
-        """同時監看檔案與其所在目錄。
+    def _watch_files(self) -> None:
+        """監看所有分頁的檔案與其所在目錄。
+
+        背景分頁也要監看，否則切過去時看到的是舊內容。
 
         許多編輯器採「寫暫存檔再改名覆蓋」的原子存檔，原檔會短暫消失導致
         watcher 掉路徑，因此目錄事件是必要的補償來源。
@@ -747,41 +958,52 @@ class MarkdownViewer(QWidget):
         self._unwatch_all()
         if not self._auto_reload:
             return
-        if os.path.isfile(path):
-            self._watcher.addPath(path)
-        folder = os.path.dirname(path)
-        if os.path.isdir(folder):
-            self._watcher.addPath(folder)
+        for tab in self._tabs:
+            if not tab.path:
+                continue
+            if os.path.isfile(tab.path):
+                self._watcher.addPath(tab.path)
+            folder = os.path.dirname(tab.path)
+            if folder and os.path.isdir(folder) and folder not in self._watcher.directories():
+                self._watcher.addPath(folder)
 
     def _on_watch_event(self, _changed: str) -> None:
         self._reload_timer.start(config.WATCH_DEBOUNCE_MS)
 
     def _on_reload_timeout(self) -> None:
-        if not self._path:
-            return
-        # 原子存檔會讓 watcher 失去這個路徑，重新掛回去
-        if os.path.isfile(self._path) and self._path not in self._watcher.files():
-            self._watcher.addPath(self._path)
+        """檢查每個分頁的檔案有沒有真的變動。
 
-        stamp = self._stamp_of(self._path)
-        if stamp is None:
-            return
-        if stamp == self._file_stamp:
-            return  # 目錄裡其他檔案變動，與本文件無關
+        作用中的分頁立刻重繪；背景分頁只標記成待重讀，切過去時才處理，
+        免得背景改了十個檔案就要當場轉換十次 Markdown。
+        """
+        for tab in self._tabs:
+            if not tab.path:
+                continue
+            # 原子存檔會讓 watcher 失去這個路徑，重新掛回去
+            if os.path.isfile(tab.path) and tab.path not in self._watcher.files():
+                self._watcher.addPath(tab.path)
 
-        ratio = self._scroll_ratio()
-        try:
-            self._text, self._meta = document.read_text_file(self._path)
-        except document.DocumentError:
-            # 檔案暫時無法讀取（仍在寫入中），稍後再試一次
-            self._reload_timer.start(config.WATCH_DEBOUNCE_MS * 2)
-            return
+            stamp = tab.stamp()
+            if stamp is None or stamp == tab.file_stamp:
+                continue  # 目錄裡其他檔案變動，與這個分頁無關
 
-        self._error = None
-        self._file_stamp = stamp
-        self._render(preserve_scroll=False)
-        self._update_status()
-        QTimer.singleShot(0, lambda: self._apply_scroll_ratio(ratio))
+            if tab is not self._tab:
+                tab.loaded = False       # 切過去時再讀
+                tab.file_stamp = stamp
+                continue
+
+            ratio = tab.scroll_ratio()
+            try:
+                tab.text, tab.meta = document.read_text_file(tab.path)
+            except document.DocumentError:
+                # 檔案暫時無法讀取（仍在寫入中），稍後再試一次
+                self._reload_timer.start(config.WATCH_DEBOUNCE_MS * 2)
+                return
+            tab.error = None
+            tab.file_stamp = stamp
+            self._render(preserve_scroll=False)
+            self._update_status()
+            QTimer.singleShot(0, lambda r=ratio: self._apply_scroll_ratio(r))
 
     # -- 連結 ----------------------------------------------------------------
     def _set_search_context(self, path: str) -> None:
@@ -805,8 +1027,8 @@ class MarkdownViewer(QWidget):
             self.browser.scrollToAnchor(url.fragment())
             return
 
-        if url.isRelative() and self._path:
-            base = QUrl.fromLocalFile(os.path.dirname(self._path) + os.sep)
+        if url.isRelative() and self._tab.path:
+            base = QUrl.fromLocalFile(os.path.dirname(self._tab.path) + os.sep)
             url = base.resolved(url)
 
         if url.isLocalFile():
@@ -814,7 +1036,8 @@ class MarkdownViewer(QWidget):
             fragment = url.fragment()
             suffix = os.path.splitext(local_path)[1].lower()
             if suffix in config.SUPPORTED_SUFFIXES and os.path.isfile(local_path):
-                self.open_path(local_path, anchor=fragment)
+                # 文件裡的本機連結一律開新分頁，原本那篇留在原處
+                self.open_path(local_path, anchor=fragment, new_tab=True)
                 return
             if os.path.exists(local_path):
                 QDesktopServices.openUrl(QUrl.fromLocalFile(local_path))
@@ -899,7 +1122,7 @@ class MarkdownViewer(QWidget):
         elif self.find_bar.isVisible():
             self.find_bar.deactivate()
         else:
-            self.close()
+            self.close_tab()
 
     # -- 字級 ----------------------------------------------------------------
     def _set_font_point_size(self, size: int) -> None:
@@ -908,6 +1131,7 @@ class MarkdownViewer(QWidget):
             return
         self._font_point_size = size
         self._settings.setValue(config.KEY_FONT_SIZE, size)
+        self._mark_all_dirty()
         self._render()
         self._sync_settings_panel()
 
@@ -929,7 +1153,7 @@ class MarkdownViewer(QWidget):
         path = self._first_supported_path(event)
         if path is not None:
             event.acceptProposedAction()
-            self.open_path(path)
+            self.open_path(path, new_tab=True)
 
     @staticmethod
     def _first_supported_path(event) -> str | None:
@@ -960,7 +1184,15 @@ class MarkdownViewer(QWidget):
                     available.center().y() - self.height() // 2,
                 )
         if self._settings.value(config.KEY_MAXIMIZED, False, type=bool):
-            self.showMaximized()
+            # 【不要用 showMaximized()】
+            # 它會「立刻把視窗顯示出來」，而這個函式是在 __init__ 中段被呼叫的，
+            # 那時第一個分頁還沒建立。顯示會同步送出一個真正的 QResizeEvent，
+            # resizeEvent 便去存取 self.browser -> self._tabs[0] -> IndexError。
+            # PyQt6 對虛擬函式裡的未攔截例外是致命的，行程直接以 0xC0000409 中止。
+            # 而且 closeEvent 會把 isMaximized() 存回設定，所以只要使用者曾經在
+            # 最大化狀態關閉程式，之後每次啟動都會中止——完全打不開。
+            # setWindowState 只設定狀態不顯示視窗，等 main.py 呼叫 show() 才生效。
+            self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
@@ -980,18 +1212,22 @@ class MarkdownViewer(QWidget):
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
+        if not self._tabs:
+            # 分頁還沒建立就收到 resize（還原視窗狀態時可能發生）。這時沒有東西
+            # 需要排版，_open_initial_tabs 之後會自己渲染一次。
+            return
         # Qt 會保留圖片的原始高度、卻把圖畫成縮小後的尺寸，導致下方留下空白，
         # 因此圖片是在載入時就等比縮到可視寬度。視窗寬度改變後必須重繪，
         # 讓縮放依新寬度重新計算（setHtml 會清掉舊的資源快取）。
         # 限制內文寬度時，左右邊距是依可視寬度算出來的，必須立即重算
         self._apply_content_width()
         self._position_settings_panel()
-        if self._has_scalable_images:
+        if self._tab.has_scalable_images:
             self._resize_timer.start(180)
 
     def _on_resize_settled(self) -> None:
         width = self.browser.viewport().width()
-        if abs(width - self._last_render_width) < 24:
+        if abs(width - self._tab.last_render_width) < 24:
             return
         self._render()
 
@@ -1009,5 +1245,19 @@ class MarkdownViewer(QWidget):
         self._settings.setValue(config.KEY_ALWAYS_ON_TOP, self._always_on_top)
         self._settings.setValue(config.KEY_AUTO_RELOAD, self._auto_reload)
         self._settings.setValue(config.KEY_CONFIRM_LINKS, self._confirm_links)
+        self._settings.setValue(config.KEY_RESTORE_TABS, self._restore_tabs)
+        self._save_session()
         self._settings.sync()
+
+        # 【關閉時一定要放掉分頁的 Python 參考】
+        # 每個 DocumentTab 都握著一個 MarkdownBrowser。視窗一關，Qt 會連同這些
+        # 子元件一起銷毀 C++ 物件，但 Python 這邊的 sip 包裝要等直譯器結束才回收
+        # ——那時 QApplication 往往已經先消失，回收動作就會踩到已釋放的記憶體。
+        # 實測分頁功能加進來之後，關閉時約有四成機率發生存取違規；先停掉還會回頭
+        # 存取分頁的計時器與監看器，再清空清單，就不再重現。
+        self._reload_timer.stop()
+        self._resize_timer.stop()
+        self._watcher.blockSignals(True)
+        self._tabs.clear()
+
         super().closeEvent(event)

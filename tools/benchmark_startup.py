@@ -236,7 +236,17 @@ def _run_probe() -> int:
     t_show = (_time.perf_counter() - mark) * 1000
 
     total = (_time.perf_counter() - start) * 1000
+
+    # 【拆除順序很重要】
+    # 這裡沒有跑 app.exec()，所以 close() 之後不會有任何一輪事件迴圈。少了它，
+    # 主視窗的 C++ 物件會活到函式返回、Python 回收區域變數時才被拆，那時
+    # QApplication 可能已經先消失，就會存取違規（實測 12 次有 4 次直接崩潰，
+    # 量測子行程連 PROBE 那行都印不出來）。
+    # 正式執行路徑靠 main.py 的 WA_DeleteOnClose + app.exec() 達到同樣效果。
     viewer.close()
+    viewer.deleteLater()
+    application.processEvents()
+    del viewer
 
     print(
         "PROBE"

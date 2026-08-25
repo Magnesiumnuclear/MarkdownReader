@@ -55,6 +55,7 @@ class SettingsPanel(QWidget):
     alwaysOnTopChanged = pyqtSignal(bool)
     statusBarChanged = pyqtSignal(bool)
     confirmLinksChanged = pyqtSignal(bool)
+    restoreTabsChanged = pyqtSignal(bool)
     resetRequested = pyqtSignal()
     closed = pyqtSignal()
 
@@ -268,6 +269,7 @@ class SettingsPanel(QWidget):
         self.always_on_top_chip = _Chip("釘選最上層", parent=self)
         self.status_bar_chip = _Chip("顯示狀態列", parent=self)
         self.confirm_links_chip = _Chip("開啟前詢問", parent=self)
+        self.restore_tabs_chip = _Chip("還原上次分頁", parent=self)
 
         rows = (
             (
@@ -293,6 +295,13 @@ class SettingsPanel(QWidget):
                 self.confirm_links_chip,
                 self.confirmLinksChanged,
                 "點擊外部連結時先跳出確認，再交給系統預設瀏覽器開啟。",
+            ),
+            (
+                "分頁",
+                self.restore_tabs_chip,
+                self.restoreTabsChanged,
+                "關閉程式時記住開著哪些檔案，下次啟動自動還原。"
+                "還原的分頁會等你切過去才載入內容，不影響啟動速度。",
             ),
         )
         for label, chip, signal, hint in rows:
@@ -328,6 +337,7 @@ class SettingsPanel(QWidget):
         always_on_top: bool,
         status_bar: bool,
         confirm_links: bool,
+        restore_tabs: bool,
     ) -> None:
         """依目前設定更新所有控制項外觀（不會反向送出訊號）。"""
         self._check(self._theme_chips.get(theme_mode))
@@ -342,6 +352,7 @@ class SettingsPanel(QWidget):
             (self.always_on_top_chip, always_on_top),
             (self.status_bar_chip, status_bar),
             (self.confirm_links_chip, confirm_links),
+            (self.restore_tabs_chip, restore_tabs),
         ):
             chip.blockSignals(True)
             chip.setChecked(value)

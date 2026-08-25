@@ -93,3 +93,25 @@ KEY_CONFIRM_LINKS = "behavior/confirmExternalLinks"
 DEFAULT_THEME = "light"          # 系統偵測失敗時的保底值
 DEFAULT_AUTO_RELOAD = True
 DEFAULT_CONFIRM_LINKS = False
+
+# --- 分頁 -------------------------------------------------------------------
+TAB_HEIGHT = 34
+TAB_MAX_WIDTH = 190
+TAB_MIN_WIDTH = 92
+TAB_LABEL_WIDTH = 130            # 檔名可用寬度，超過就中間省略
+
+KEY_RESTORE_TABS = "behavior/restoreTabs"
+KEY_OPEN_TABS = "session/openTabs"
+KEY_ACTIVE_TAB = "session/activeTab"
+DEFAULT_RESTORE_TABS = False
+
+# --- 單一實例 ---------------------------------------------------------------
+# 具名管道的名稱要含使用者名稱，避免多使用者登入時互相搶。
+IPC_SERVER_NAME = "MarkdownReader.SingleInstance"
+IPC_CONNECT_TIMEOUT_MS = 150     # 連不到就當作沒有既有實例，不要卡住啟動
+IPC_WRITE_TIMEOUT_MS = 1000
+# 送出後等對方關閉連線的確認。只是保險，等不到也不影響正確性
+# （資料已經在管道裡），所以放短一點，別讓使用者對著沒反應的畫面枯等。
+IPC_DISCONNECT_TIMEOUT_MS = 300
+# 對方已經斷線、但資料還沒被拉進 Qt 讀取緩衝區時，補讀一次的等待上限。
+IPC_READ_TIMEOUT_MS = 200

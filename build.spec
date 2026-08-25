@@ -60,7 +60,9 @@ EXCLUDES = [
 #                         不需要它；若日後在極舊的顯卡或虛擬機出現空白視窗，
 #                         把這一行拿掉重新打包即可。
 #   Qt6Pdf.dll       4.6MB QtPdf 模組，本程式沒有用到。
-#   libcrypto/libssl 6MB   QtNetwork 的 TLS 後端，本程式不連網。
+#   libcrypto/libssl 6MB   QtNetwork 的 TLS 後端。單一實例只用 QLocalSocket
+#                         （Windows 具名管道），不走 TCP/TLS，因此可以排除。
+#                         注意 Qt6Network.dll 本身不能排除，那是 QLocalSocket 的家。
 EXCLUDE_BINARIES = (
     "opengl32sw.dll",
     "qt6pdf.dll",
@@ -88,8 +90,9 @@ a = Analysis(
     # app.resources.resource_path() 讀取，會自動處理 sys._MEIPASS
     datas=[("assets", "assets")],
     # 搭配 main.py 頂端的顯式 import，確保 Qt 的 SVG 插件
-    # （qsvg.dll / qsvgicon.dll）一併被收錄
-    hiddenimports=["PyQt6.QtSvg"],
+    # （qsvg.dll / qsvgicon.dll）一併被收錄。
+    # QtNetwork 供單一實例的具名管道使用，寫在這裡避免日後被誤判成沒用到。
+    hiddenimports=["PyQt6.QtSvg", "PyQt6.QtNetwork"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
