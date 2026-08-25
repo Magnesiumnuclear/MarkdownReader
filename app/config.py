@@ -28,10 +28,15 @@ TITLE_BUTTON_SIZE = (44, 28)   # 最小化／最大化／關閉
 TOOL_BUTTON_SIZE = (32, 28)    # 返回／開檔／搜尋／主題／釘選
 ICON_PIXEL_SIZE = 16
 
-# 無邊框視窗的邊緣縮放感應寬度（邏輯像素，實際會依 devicePixelRatio 放大）
-RESIZE_MARGIN_BASE = 6
-RESIZE_MARGIN_MIN = 6
-RESIZE_MARGIN_MAX = 14
+# 無邊框視窗的邊緣縮放感應寬度（邏輯像素）。
+# 不依 devicePixelRatio 放大：Qt 的座標本來就是邏輯像素，系統縮放 150% 時
+# 6 邏輯像素已經等於 9 實體像素，物理寬度是固定的；再乘一次 dpr 等於放大兩倍，
+# 反而會把右側捲軸整條蓋掉。
+RESIZE_MARGIN = 6
+
+# 游標落在捲軸這類「本來就要拖曳」的控制項上時，只保留最外側這幾像素給視窗縮放，
+# 其餘讓給控制項。沒有這條規則，10px 的捲軸會有 9px 被縮放判定搶走。
+RESIZE_MARGIN_OVER_CONTROL = 4
 
 # --- 字級縮放 ---------------------------------------------------------------
 BASE_FONT_POINT_SIZE = 11

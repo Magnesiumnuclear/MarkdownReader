@@ -1,4 +1,4 @@
-# Markdown 閱讀器打包腳本
+﻿# Markdown 閱讀器打包腳本
 #
 #   .\build.ps1              單一 exe（隱藏主控台）
 #   .\build.ps1 -OneDir      資料夾版（啟動快很多，建議用於檔案關聯）
@@ -62,8 +62,14 @@ if ($OneDir) {
 }
 
 if (Test-Path $output) {
-    $size = [math]::Round((Get-Item $output).Length / 1MB, 1)
-    Write-Host "`n打包完成：$output（$size MB）" -ForegroundColor Green
+    # 資料夾版要算整個目錄；只報執行檔大小會嚴重低估（實際要連 _internal 一起帶走）
+    if ($OneDir) {
+        $bytes = (Get-ChildItem "dist\MarkdownReader-onedir" -Recurse -File | Measure-Object -Property Length -Sum).Sum
+        $sizeText = "整個資料夾 {0:N0} MB" -f ($bytes / 1MB)
+    } else {
+        $sizeText = "{0:N1} MB" -f ((Get-Item $output).Length / 1MB)
+    }
+    Write-Host "`n打包完成：$output（$sizeText）" -ForegroundColor Green
     Write-Host "`n測試指令："
     Write-Host "  .\$output `"$PSScriptRoot\sample.md`""
     Write-Host "`n設定成 .md 的開啟程式（只寫 HKCU，可反安裝）："

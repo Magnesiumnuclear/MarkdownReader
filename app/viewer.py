@@ -2,7 +2,7 @@
 
 包含三個部分：
 * FramelessResizer —— 無邊框視窗失去系統縮放，這裡用事件過濾器補回四邊四角
-  的縮放，並依 devicePixelRatio 動態調整感應寬度（高 DPI 螢幕才點得到）。
+  的縮放，並讓開捲軸這類需要拖曳的控制項。
 * MarkdownBrowser  —— QTextBrowser 子類，負責任務清單核取方塊的即時繪製，
   以及過寬圖片的自動縮放（Qt 不會自動縮圖）。
 * MarkdownViewer   —— 主視窗本體：標題列、閱讀區、搜尋列、狀態列、檔案監看、
@@ -21,6 +21,8 @@ from PyQt6.QtCore import (
     QEvent,
     QFileSystemWatcher,
     QObject,
+    QPoint,
+    QRect,
     QSettings,
     QTimer,
     QUrl,
@@ -42,6 +44,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMessageBox,
+    QScrollBar,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
@@ -76,12 +79,12 @@ class FramelessResizer(QObject):
     def __init__(self, window: QWidget) -> None:
         super().__init__(window)
         self._window = window
-        self._margin = config.RESIZE_MARGIN_BASE
-        self._corner = config.RESIZE_MARGIN_BASE * 2
+        self._margin = config.RESIZE_MARGIN
         self._override_active = False
+        # 這些控制項本來就要靠拖曳操作，縮放判定必須讓開（見 _edges_at）
+        self._drag_controls: list[QWidget] = []
         window.installEventFilter(self)
         self.refresh_targets()
-        self.update_margin()
 
     # -- 安裝與 DPI ----------------------------------------------------------
     def refresh_targets(self) -> None:
@@ -91,16 +94,18 @@ class FramelessResizer(QObject):
             child.setMouseTracking(True)
             child.installEventFilter(self)
 
-    def update_margin(self) -> None:
-        """依 devicePixelRatio 調整感應寬度。
+    def set_drag_controls(self, widgets: list[QWidget]) -> None:
+        """登記需要讓開的控制項（捲軸等）。"""
+        self._drag_controls = [w for w in widgets if w is not None]
 
-        Qt 的滑鼠座標是邏輯像素，固定 6px 在高 DPI 螢幕上物理寬度極窄、
-        非常難點中，因此依縮放比例放大，並限制在合理範圍內。
-        """
-        ratio = float(self._window.devicePixelRatioF() or 1.0)
-        margin = int(round(config.RESIZE_MARGIN_BASE * ratio))
-        self._margin = max(config.RESIZE_MARGIN_MIN, min(config.RESIZE_MARGIN_MAX, margin))
-        self._corner = self._margin * 2
+    def _over_drag_control(self, global_x: int, global_y: int) -> bool:
+        for widget in self._drag_controls:
+            if not widget.isVisible():
+                continue
+            rect = QRect(widget.mapToGlobal(QPoint(0, 0)), widget.size())
+            if rect.contains(global_x, global_y):
+                return True
+        return False
 
     # -- 邊緣判定 ------------------------------------------------------------
     def _edges_at(self, global_x: int, global_y: int) -> int:
@@ -109,7 +114,11 @@ class FramelessResizer(QObject):
             return 0
 
         rect = window.frameGeometry()
-        margin, corner = self._margin, self._corner
+        margin = self._margin
+        # 游標在捲軸上時，縮放只保留最外側幾像素，其餘讓給捲軸拖曳
+        if self._over_drag_control(global_x, global_y):
+            margin = min(margin, config.RESIZE_MARGIN_OVER_CONTROL)
+        corner = margin * 2
         edges = 0
 
         if global_x <= rect.left() + margin:
@@ -960,7 +969,8 @@ class MarkdownViewer(QWidget):
             # 後備方案會呼叫 show()，不能在 showEvent 裡直接跑
             QTimer.singleShot(0, self._apply_always_on_top)
         self._resizer.refresh_targets()
-        self._resizer.update_margin()
+        # 所有捲軸都要讓開，包含設定面板裡的
+        self._resizer.set_drag_controls(self.findChildren(QScrollBar))
         self._position_settings_panel()
 
     def changeEvent(self, event) -> None:  # noqa: N802
@@ -987,8 +997,6 @@ class MarkdownViewer(QWidget):
 
     def moveEvent(self, event) -> None:  # noqa: N802
         super().moveEvent(event)
-        # 拖到不同 DPI 的螢幕時重新計算邊緣感應寬度
-        self._resizer.update_margin()
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._settings.setValue(config.KEY_MAXIMIZED, self.isMaximized())

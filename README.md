@@ -260,6 +260,77 @@ Windows 10/11 以 **UserChoice** 雜湊保護預設程式設定，第三方程�
 
 ---
 
+## 改完程式之後的重新編譯流程
+
+設定過檔案關聯之後，每次改完程式固定跑這三步：
+
+```bash
+taskkill /F /IM MarkdownReader.exe 2>nul
+powershell -ExecutionPolicy Bypass -File build.ps1 -OneDir
+py -3.13 tools/benchmark_startup.py
+```
+
+第二行的打包方式要**對應你的關聯指向哪個版本**（見下方），第三行順便確認這次改動
+沒有把啟動拖慢。
+
+`build.ps1` 兩種模式都會自動檢查相依套件、必要時產生圖示，並在結尾印出測試指令與
+註冊關聯的指令，不需要自己記參數。
+
+### 為什麼第一步要先關掉程式
+
+程式還開著時 PyInstaller 無法覆寫執行檔，兩種打包方式都會失敗：
+
+```
+PermissionError: [WinError 5] 存取被拒。: '...\dist\MarkdownReader.exe'
+```
+
+而且是跑到**最後一步才失敗**，前面二十幾秒的分析與打包全部白做。舊的執行檔不會
+損壞，只是沒被更新——所以雙擊 `.md` 仍然會開，只是開到改動前的版本。
+
+### 為什麼要指定正確的打包方式
+
+| 關聯指向 | 必須用的指令 |
+|---|---|
+| `dist\MarkdownReader.exe`（單一 exe） | `build.ps1`（不加參數） |
+| `dist\MarkdownReader-onedir\MarkdownReader.exe`（資料夾版） | `build.ps1 -OneDir` |
+
+**用錯的那個編譯，關聯指向的檔案不會被更新，而且完全沒有錯誤訊息。**實際會看到：
+
+```
+onefile (剛重新編譯): Aug 25 00:16
+onedir  (關聯指向這個): Aug 24 23:04   <- 完全沒動
+```
+
+症狀就是「我明明改了程式，雙擊開起來卻還是舊的」。不確定目前指向哪個時：
+
+```bash
+reg query "HKCU\Software\Classes\MarkdownReader.md\shell\open\command"
+```
+
+### 什麼時候需要重跑 install_association.py
+
+登錄檔記的是**路徑**，不是檔案內容或版本，所以：
+
+| 情況 | 要不要重新註冊 |
+|---|---|
+| 改程式、重新編譯到同一路徑 | **不用** |
+| 執行檔大小或時間戳改變 | 不用 |
+| `--clean` 清掉 `build/` | 不用 |
+| 換打包方式（單一 exe ↔ 資料夾版） | **要**，路徑變了 |
+| 搬移或更名 `dist/` 底下的檔案 | **要** |
+| 換了應用程式圖示 | 不用，但檔案總管可能顯示舊圖示；重跑一次會呼叫 `SHChangeNotify` 刷新 |
+
+若關聯指向的檔案被刪掉或搬走，雙擊 `.md` 會跳出「找不到應用程式」。重新編譯回原
+路徑即可恢復，不需要重新註冊。
+
+### 編譯瞬間的短暫空窗
+
+`build.ps1 -OneDir` 會先清掉整個 `dist\MarkdownReader-onedir\` 再重建，那幾秒內
+關聯指向的檔案並不存在。一般不會撞上，但如果剛好在編譯途中雙擊 `.md` 而失敗，
+等編譯完成後重試即可。
+
+---
+
 ## 專案結構
 
 ```
@@ -307,6 +378,7 @@ assets/icons/*.svg          所有 UI 圖示
 | `h1`～`h5` 忽略所有 `font-size` 單位，固定使用內建比例 2.0 / 1.5 / 1.2 / 1.0 / 0.8 | 沿用內建比例；`h6` 是唯一吃 `pt` 的標題，明確指定字級避免階層反轉 |
 | 段落行高倍率會套用到圖片所在的行框，圖片下方多出大片空白 | 只含一張圖片的段落改用 100% 行高 |
 | `<input type="checkbox">` 會被丟棄 | 改用 `QPainter` 繪製的行內圖片 |
+| 無邊框視窗的邊緣縮放判定會蓋掉右側捲軸 | 游標落在捲軸上時，縮放感應寬度縮到 4px，其餘讓給捲軸拖曳 |
 | 圖片不會自動縮到視窗寬度，且會保留原始高度 | 覆寫 `loadResource()` 在載入時等比縮小；視窗寬度改變後重繪 |
 | 字級要能隨縮放等比變化 | 文件 CSS 一律用 `em` / `%`（`px` 不會跟著縮放） |
 
@@ -324,6 +396,10 @@ assets/icons/*.svg          所有 UI 圖示
 
 | 狀況 | 處理方式 |
 |---|---|
+| **改了程式，雙擊開起來還是舊的** | 編到了另一個產物。確認關聯指向哪個版本，用對應的 `build.ps1` 或 `build.ps1 -OneDir`（見「改完程式之後的重新編譯流程」） |
+| **編譯失敗 `PermissionError: [WinError 5]`** | 程式還開著，執行檔被鎖住。先 `taskkill /F /IM MarkdownReader.exe` 再編譯 |
+| 雙擊 `.md` 跳「找不到應用程式」 | 關聯指向的檔案被刪掉或搬走了。重新編譯回原路徑即可，不需要重新註冊 |
+| 編輯 `build.ps1` 後出現 parser error、中文變亂碼 | `.ps1` 必須存成 **UTF-8 with BOM**。PowerShell 5.1 讀沒有 BOM 的檔案會當成 ANSI（繁中系統為 cp950），中文會壞掉並讓字串沒有結尾 |
 | 打包後圖示全部空白 | 確認打包指令有 `--add-data "assets;assets"` 與 `--hidden-import PyQt6.QtSvg` |
 | 程式沒有畫面就消失 | 查看 `%LOCALAPPDATA%\MarkdownReader\error.log`，未攔截的例外都會寫在這裡 |
 | 雙擊 `.md` 仍由其他程式開啟 | Windows UserChoice 優先，請用「開啟檔案 → 選擇其他應用程式 → 一律使用此應用程式」指定一次 |
