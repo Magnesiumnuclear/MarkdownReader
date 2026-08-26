@@ -251,6 +251,20 @@ def section_rendering(args) -> None:
     pump(900)
     check("存檔後自動重新載入", "gamma" in viewer.browser.toPlainText())
 
+    # 狀態列的路徑可點擊：在檔案總管中顯示該檔
+    from app import win32 as _win32
+
+    check("狀態列顯示目前分頁的路徑",
+          viewer.status_path_label.text() == os.path.abspath(main_doc),
+          viewer.status_path_label.text())
+    revealed: list[str] = []
+    original_reveal = _win32.reveal_in_explorer
+    _win32.reveal_in_explorer = lambda target: revealed.append(target) or True
+    viewer.status_path_label.clicked.emit()
+    _win32.reveal_in_explorer = original_reveal
+    check("點路徑會以目前分頁的檔案呼叫「在檔案總管中顯示」",
+          revealed == [os.path.abspath(main_doc)], str(revealed))
+
     viewer.close()
     pump(300)
     QSettings(config.ORG_NAME, config.APP_NAME).clear()

@@ -27,6 +27,7 @@ from PyQt6.QtCore import (
     QTimer,
     QUrl,
     Qt,
+    pyqtSignal,
 )
 from PyQt6.QtGui import (
     QDesktopServices,
@@ -70,6 +71,28 @@ _CURSOR_BY_EDGES = {
     (Qt.Edge.RightEdge | Qt.Edge.TopEdge).value: Qt.CursorShape.SizeBDiagCursor,
     (Qt.Edge.LeftEdge | Qt.Edge.BottomEdge).value: Qt.CursorShape.SizeBDiagCursor,
 }
+
+
+class StatusPathLabel(QLabel):
+    """狀態列裡的檔案路徑——點一下在檔案總管中顯示該檔。
+
+    做成按鈕語意（press 進、release 在範圍內才算數），
+    但外觀維持文字，hover 的底線與變色在 QSS（#statusPathLabel）。
+    """
+
+    clicked = pyqtSignal()
+
+    def __init__(self, parent=None) -> None:
+        super().__init__("", parent)
+        self.setObjectName("statusPathLabel")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("在檔案總管中顯示")
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if (event.button() == Qt.MouseButton.LeftButton
+                and self.rect().contains(event.position().toPoint())):
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
 
 
 class FramelessResizer(QObject):
@@ -531,9 +554,13 @@ class MarkdownViewer(QWidget):
         status_layout = QHBoxLayout(self.status_bar)
         status_layout.setContentsMargins(12, 4, 12, 4)
         status_layout.setSpacing(0)
+        self.status_path_label = StatusPathLabel(self.status_bar)
+        self.status_path_label.clicked.connect(self._on_status_path_clicked)
+        status_layout.addWidget(self.status_path_label)
         self.status_label = QLabel("", self.status_bar)
         self.status_label.setObjectName("statusLabel")
         status_layout.addWidget(self.status_label)
+        status_layout.addStretch(1)
 
         inner.addWidget(self.title_bar)
         inner.addWidget(self.tab_bar)
@@ -784,6 +811,7 @@ class MarkdownViewer(QWidget):
 
         self._watch_files()
         self.set_theme_mode(config.DEFAULT_THEME_MODE)
+        self.status_path_label.setText("")
         self.status_label.setText("已恢復預設設定")
 
     # -- 開檔與渲染 ----------------------------------------------------------
@@ -834,6 +862,7 @@ class MarkdownViewer(QWidget):
             self._tab.loaded = True
             self._render(preserve_scroll=False)
             self._update_titles(os.path.basename(path) or path)
+            self.status_path_label.setText("")
             self.status_label.setText(f"無法讀取：{path}")
             self._sync_tab_bar()
             self._watch_files()
@@ -858,6 +887,7 @@ class MarkdownViewer(QWidget):
         self._tab.loaded = True
         self._render(preserve_scroll=False)
         self._update_titles(config.APP_DISPLAY_NAME)
+        self.status_path_label.setText("")
         self.status_label.setText("尚未開啟檔案 — 按 Ctrl+O 或直接拖放 .md 檔到視窗")
 
     def _render(self, preserve_scroll: bool = True) -> None:
@@ -924,14 +954,25 @@ class MarkdownViewer(QWidget):
             return
         meta = self._tab.meta
         parts = [
-            meta.path,
             meta.encoding,
             meta.size_text,
             f"{meta.line_count} 行",
             f"{meta.char_count} 字",
             meta.modified.strftime("%Y-%m-%d %H:%M:%S"),
         ]
-        self.status_label.setText("　·　".join(parts))
+        self.status_path_label.setText(meta.path)
+        self.status_label.setText("　·　" + "　·　".join(parts))
+
+    def _on_status_path_clicked(self) -> None:
+        """點狀態列的路徑：在檔案總管中開啟所在資料夾並選取該檔。"""
+        path = self._tab.path
+        if not path:
+            return
+        if not win32.reveal_in_explorer(path):
+            # 後備：Shell API 失敗（例如檔案剛被移走）就至少把資料夾打開
+            folder = os.path.dirname(path)
+            if os.path.isdir(folder):
+                QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
 
     def toggle_status_bar(self) -> None:
         self.set_status_bar_visible(not self._status_visible)

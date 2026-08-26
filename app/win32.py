@@ -62,6 +62,28 @@ if IS_WINDOWS:
     _shell32.SHChangeNotify.restype = None
 
     _kernel32 = ctypes.windll.kernel32
+    _ole32 = ctypes.windll.ole32
+
+    # SHParseDisplayName / SHOpenFolderAndSelectItems（「在檔案總管中顯示」用）。
+    # PIDL 是 64-bit 指標，一樣必須宣告 argtypes，否則會被截斷（見檔頭說明）。
+    _shell32.SHParseDisplayName.argtypes = [
+        wintypes.LPCWSTR,               # pszName
+        ctypes.c_void_p,                # pbc
+        ctypes.POINTER(ctypes.c_void_p),  # ppidl
+        ctypes.c_ulong,                 # sfgaoIn
+        ctypes.POINTER(ctypes.c_ulong),   # psfgaoOut
+    ]
+    _shell32.SHParseDisplayName.restype = ctypes.c_long
+    _shell32.SHOpenFolderAndSelectItems.argtypes = [
+        ctypes.c_void_p,                # pidlFolder
+        ctypes.c_uint,                  # cidl
+        ctypes.c_void_p,                # apidl
+        wintypes.DWORD,                 # dwFlags
+    ]
+    _shell32.SHOpenFolderAndSelectItems.restype = ctypes.c_long
+    _ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+    _ole32.CoTaskMemFree.restype = None
+
     _user32.GetForegroundWindow.restype = wintypes.HWND
     _user32.SetForegroundWindow.argtypes = [wintypes.HWND]
     _user32.SetForegroundWindow.restype = wintypes.BOOL
@@ -156,6 +178,41 @@ def force_foreground(window_id: int) -> bool:
         if attached:
             _user32.AttachThreadInput(current, target, False)
         return True
+    except Exception:
+        return False
+
+
+def reveal_in_explorer(path: str) -> bool:
+    """在檔案總管中開啟檔案所在的資料夾，並把該檔案選取起來。
+
+    用 SHOpenFolderAndSelectItems 而不是 `explorer /select,<path>`：
+    後者對含逗號的路徑會解析錯誤，而且每次都硬開一個新視窗；
+    Shell API 會重用已開著同一個資料夾的視窗，行為和檔案總管右鍵的
+    「開啟檔案位置」一致。
+    """
+    if not IS_WINDOWS or not path:
+        return False
+    try:
+        import os as _os
+
+        target = _os.path.abspath(path)
+        if not _os.path.exists(target):
+            return False
+        _ole32.CoInitialize(None)
+        try:
+            pidl = ctypes.c_void_p()
+            flags = ctypes.c_ulong(0)
+            result = _shell32.SHParseDisplayName(
+                target, None, ctypes.byref(pidl), 0, ctypes.byref(flags)
+            )
+            if result != 0 or not pidl.value:
+                return False
+            try:
+                return _shell32.SHOpenFolderAndSelectItems(pidl, 0, None, 0) == 0
+            finally:
+                _ole32.CoTaskMemFree(pidl)
+        finally:
+            _ole32.CoUninitialize()
     except Exception:
         return False
 

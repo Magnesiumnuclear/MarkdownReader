@@ -436,6 +436,18 @@ QToolButton#resetBtn:pressed { background-color: $pressed_bg; }
     background: transparent;
     padding: 0px 4px;
 }
+/* 路徑是可以點的（在檔案總管中顯示），hover 時給出可點的暗示 */
+#statusPathLabel {
+    color: $text_muted;
+    font-family: $font_ui;
+    font-size: 11px;
+    background: transparent;
+    padding: 0px 4px;
+}
+#statusPathLabel:hover {
+    color: $accent;
+    text-decoration: underline;
+}
 
 /* ---------- 對話框與提示 ---------- */
 QMessageBox {
