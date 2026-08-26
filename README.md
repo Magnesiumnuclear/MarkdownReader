@@ -139,6 +139,63 @@
 > 量測時注意：把送方和收方寫在同一個行程裡會失真——送方的 `waitFor*` 會鎖住事
 > 件迴圈，收方根本沒機會處理連線。要用兩個真正的行程量。
 
+### 原生轉交器（MarkdownOpen.exe）
+
+上面的轉交成本還能再砍。轉交那 170 ms／1064 ms 幾乎全花在「載入 python313.dll
+與整套 PyQt6」——即使那個行程只是要把路徑送出去就結束。`src_cpp/md_open/` 是
+一支 38 KB 的原生 Win32 程式，只做三件事：
+
+1. 試著連上具名管道（Qt 的 `QLocalServer` 在 Windows 上就是 `\\.\pipe\<名稱>`
+   的位元組模式管道，用 `CreateFile` + `WriteFile` 就能當它的客戶端，不需要 Qt）。
+2. 連得上就把路徑送過去、結束；連不上就啟動本體，參數原封不動傳過去。
+3. 用具名互斥鎖排隊：一次選取多個 `.md` 按 Enter 時，第一個負責帶起本體，
+   其餘等管道出現後轉交，不會各自開一個視窗。
+
+實測（`tools/benchmark_handoff.py`，各 10 次取最小值，量測工具本身的
+地板 9 ms 已列出供對照）：
+
+| 動作 | 直接啟動本體 | 經原生轉交器 |
+|---|---|---|
+| 已開著時再雙擊（資料夾版） | 169 ms | **10 ms** |
+| 已開著時再雙擊（單一 exe） | 1,046 ms | **9 ms** |
+| 冷啟動到視窗出現（資料夾版） | 622 ms | 634 ms（+22～26 ms） |
+
+冷啟動多出的 22～26 ms 是多開一個行程的固定成本；轉交器會在本體的管道
+開起來後（早於視窗出現）就退場，不會殘留。
+
+把檔案關聯指向轉交器就能吃到這個加速（`build.ps1` 完成訊息也會提示這個路徑）：
+
+```bash
+py -3.13 tools/install_association.py --target "D:\software\Customize-Open-File\md\dist\MarkdownReader-onedir\MarkdownOpen.exe"
+```
+
+轉交器由 `build.ps1` 的第 5 步自動編譯（需要 MSYS2 UCRT64 的 g++；沒有就
+略過，主程式不受影響）。要在 VS Code／Cursor 裡改它：`.vscode/` 已設好
+IntelliSense（對準 UCRT64 g++）、`Ctrl+Shift+B` 建置（旗標與 build.ps1 一致），
+以及 `F5` 用 gdb 除錯（會另編一份帶符號、未 strip 的 `MarkdownOpen-debug.exe`
+——發佈版的 `-s` 會把符號拔光，直接除錯發佈版什麼都看不到）。圖示是內嵌的必要品：關聯腳本拿「目標 exe 的第 0 個
+圖示」當 `.md` 的檔案圖示，沒有它所有 `.md` 都會變白紙。
+
+幾個實作上的防呆，都寫在 `main.cpp` 的註解裡：
+
+- **等待以本體行程的狀態為界，不是死板的時鐘。** 本體啟動就當機 -> 立刻放棄
+  （實測 138 ms）；本體 GUI 起來了卻始終沒開管道（`listen()` 失敗）-> 寬限
+  4 秒後放棄（實測 5.1 s），不會握著排隊鎖空等滿 15 秒。
+- **管道名稱兩邊寫死，靠測試鎖住一致性**：`tools/smoke_test.py` 會比對
+  `main.cpp` 的 `kPipePath` 與 `config.IPC_SERVER_NAME`，改到不同步立刻紅燈
+  ——否則不會有任何錯誤訊息，只是安靜退化成每個檔案開一個視窗。
+- **送出前呼叫 `AllowSetForegroundWindow`**：前景權限在剛被雙擊的行程手上，
+  不轉讓的話既有視窗只能在工作列閃爍。
+- **管道「存在但忙」要重試，不能一次放棄**：這個狀態代表本體一定活著（管道會
+  隨行程消失），只是還沒回到事件迴圈。放棄的代價是誤判「沒有實例」再生一個
+  完整的本體行程（600 ms 起跳），所以忙碌重試的上限放到 3 秒。
+- **收方不能在 socket 的訊號裡直接做重活**（這是 Python 端 `single_instance.py`
+  的相對修正）：`readyRead` 來自 Qt 管道讀取回呼，在那個框架裡直接
+  「拆 socket → 開分頁 → 渲染大檔」，會與其他排隊連線的管道回呼交錯，實測
+  三條連線背靠背時必定以 `0xC0000005` 崩潰在原生層。`deliver()` 改用
+  `QTimer.singleShot(0, ...)` 把派送推回事件迴圈。`tools/smoke_test.py` 有
+  對應的回歸測試（掛起本體 + 三連發）。
+
 ### 還原上次的分頁
 
 設定面板的「還原上次分頁」**預設關閉**。開啟後，關閉視窗時會記下當時開著的檔案
@@ -467,7 +524,10 @@ tools/
   install_association.py    檔案關聯註冊／移除（僅 HKCU）
   benchmark_startup.py      啟動速度基準測試
   startup_baseline.json     基準線數據（與機器相關）
-  smoke_test.py             功能回歸測試（69 項，每項對應一個真的發生過的問題）
+  smoke_test.py             功能回歸測試（每項對應一個真的發生過的問題）
+  benchmark_handoff.py      轉交速度量測（轉交器 vs 直接啟動本體）
+src_cpp/md_open/            原生轉交器（Win32，38 KB，見「原生轉交器」一節）
+.vscode/                    轉交器的 C++ 開發環境（IntelliSense、Ctrl+Shift+B 建置、F5 gdb 除錯）
 assets/icons/*.svg          所有 UI 圖示
 ```
 

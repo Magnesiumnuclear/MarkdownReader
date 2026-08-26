@@ -1,0 +1,30 @@
+{
+    // F5 除錯轉交器。會先跑 CMake 的除錯建置（帶符號、未 strip——
+    // 發佈版被 -s strip 過，直接除錯什麼都看不到）。
+    //
+    // 兩種常用情境：
+    //   - 轉交路徑：先手動開著閱讀器，再按 F5 —— 轉交器會把 sample.md
+    //     送過去然後結束，適合在 try_send 裡下中斷點。
+    //   - 冷啟動路徑：先把閱讀器全關掉再按 F5 —— 會走互斥鎖與 wait_for_pipe。
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "除錯轉交器（gdb）",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/cmake/debug/MarkdownOpen.exe",
+            "args": ["${workspaceFolder}/sample.md"],
+            "cwd": "${workspaceFolder}",
+            "MIMode": "gdb",
+            "miDebuggerPath": "C:/msys64/ucrt64/bin/gdb.exe",
+            "preLaunchTask": "轉交器：CMake 建置（除錯）",
+            "setupCommands": [
+                {
+                    "description": "gdb 的 pretty printing",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ]
+        }
+    ]
+}

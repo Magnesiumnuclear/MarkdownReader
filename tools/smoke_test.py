@@ -614,6 +614,23 @@ def section_single_instance(args) -> None:
 
     from app import single_instance
 
+    # --- 管道名稱一致性 ---
+    # C++ 轉交器（src_cpp/md_open/main.cpp）用寫死的管道名稱和本體講話。
+    # 兩邊改到不同步的話不會有任何錯誤訊息：轉交器每次都「找不到管道」，
+    # 安靜退化成每個檔案開一個視窗。這裡直接比對原始碼，改壞立刻紅燈。
+    launcher_src = os.path.join(PROJECT_ROOT, "src_cpp", "md_open", "main.cpp")
+    if os.path.isfile(launcher_src):
+        with open(launcher_src, encoding="utf-8") as handle:
+            cpp = handle.read()
+        pipe_line = next(
+            (line for line in cpp.splitlines()
+             if "kPipePath" in line and 'L"' in line),
+            "",
+        )
+        check("C++ 轉交器的管道名稱與 config.IPC_SERVER_NAME 一致",
+              config.IPC_SERVER_NAME in pipe_line,
+              pipe_line.strip() or "(找不到 kPipePath)")
+
     pipe_name = f"MarkdownReaderSmokeTest.{os.getpid()}"
     original_pipe = config.IPC_SERVER_NAME
     config.IPC_SERVER_NAME = pipe_name
@@ -686,6 +703,67 @@ def section_single_instance(args) -> None:
     check("沒有實例時的探測幾乎不花時間（不拖慢正常啟動）",
           elapsed < 25, f"{elapsed:.2f} ms")
     config.IPC_SERVER_NAME = original_pipe
+
+    # --- 回歸：本體忙碌時三條轉交連線背靠背 ---
+    # C++ 轉交器的忙碌重試讓多條連線能在本體恢復後一口氣灌進來。收方若在
+    # socket 的 readyRead 回呼裡直接做完「拆 socket -> 開分頁 -> 渲染」，
+    # 管道回呼會與拆除中的 socket 狀態交錯，必定以 0xC0000005 死在原生層
+    # （當時 6 / 6 重現）。修法是 deliver() 用 singleShot(0) 延後派送。
+    # 這裡用掛起行程重現「本體正忙」，比等它渲染大檔更可控。
+    launcher = os.path.join(PROJECT_ROOT, "dist", "MarkdownReader-onedir",
+                            "MarkdownOpen.exe")
+    if os.path.isfile(launcher):
+        import ctypes as _ct
+        _k32 = _ct.windll.kernel32
+        _k32.OpenProcess.restype = _ct.c_void_p
+        _ntdll = _ct.windll.ntdll
+        py313 = sys.executable
+        subprocess.run(["taskkill", "/F", "/IM", "MarkdownReader.exe"],
+                       capture_output=True, check=False)
+        app_proc = subprocess.Popen(
+            [py313, "main.py", SAMPLE],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            cwd=PROJECT_ROOT,
+        )
+        import time as _t
+        deadline = _t.perf_counter() + 30
+        window = None
+        _u32 = _ct.windll.user32
+        while _t.perf_counter() < deadline:
+            window = _u32.FindWindowW(None, "sample.md — Markdown 閱讀器")
+            if window:
+                break
+            _t.sleep(0.05)
+        if not window:
+            check("忙碌背靠背回歸：第一個視窗有起來", False)
+            app_proc.kill()
+        else:
+            _t.sleep(0.6)
+            handle = _k32.OpenProcess(0x1F0FFF, False, app_proc.pid)
+            _ntdll.NtSuspendProcess(_ct.c_void_p(handle))
+            senders = [subprocess.Popen([launcher, README]) for _ in range(3)]
+            _t.sleep(1.5)
+            _ntdll.NtResumeProcess(_ct.c_void_p(handle))
+            _k32.CloseHandle(_ct.c_void_p(handle))
+            for proc in senders:
+                try:
+                    proc.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            _t.sleep(2.0)
+            alive = app_proc.poll() is None
+            got_tab = bool(_u32.FindWindowW(None, "README.md — Markdown 閱讀器"))
+            check("本體忙碌時三連發轉交不會讓它崩潰", alive,
+                  "" if alive else f"結束碼 {app_proc.poll() & 0xFFFFFFFF:#x}")
+            check("忙碌解除後轉交的檔案有開出來", got_tab)
+            if alive:
+                app_proc.terminate()
+            try:
+                app_proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                app_proc.kill()
+        subprocess.run(["taskkill", "/F", "/IM", "MarkdownReader.exe"],
+                       capture_output=True, check=False)
 
 
 # ===========================================================================

@@ -26,7 +26,7 @@ Unix 的 socket 檔案，listen() 的重試是為了那個平台而寫，在 Win
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QObject, pyqtSignal
+from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
 from . import config
@@ -115,7 +115,14 @@ class InstanceServer(QObject):
             socket.disconnectFromServer()
             socket.deleteLater()
             text = bytes(buffer).decode(_ENCODING, errors="replace").strip()
-            self.pathReceived.emit(text)
+            # 【不要在 socket 的訊號裡直接做重活】
+            # readyRead 是從 Qt 的管道讀取回呼（QWindowsPipeReader）發出來的。
+            # 在這個呼叫框架裡直接 emit -> 開分頁 -> 渲染大檔要花數百毫秒，
+            # 期間其他排隊連線的管道回呼會與上面正在拆除的 socket 狀態交錯，
+            # 實測三條連線背靠背時必定以 0xC0000005 崩潰在原生層
+            # （faulthandler 停在 on_ready）。用 singleShot(0) 把工作推回
+            # 事件迴圈，讓 socket 的回呼框架先乾淨退場再處理路徑。
+            QTimer.singleShot(0, lambda: self.pathReceived.emit(text))
 
         def on_ready() -> None:
             drain()

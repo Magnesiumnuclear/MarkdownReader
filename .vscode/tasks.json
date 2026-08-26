@@ -1,0 +1,63 @@
+{
+    // C++ 轉交器的建置工作，全部走 CMake —— 旗標的單一事實來源是
+    // src_cpp/md_open/CMakeLists.txt，工具鏈釘在 CMakePresets.json。
+    // 平常用狀態列的 CMake「建置」按鈕即可；這些 tasks 是給 Ctrl+Shift+B、
+    // F5 的 preLaunchTask、以及「編好順手放進 dist」用的。
+    "version": "2.0.0",
+    "options": {
+        "cwd": "${workspaceFolder}"
+    },
+    "tasks": [
+        {
+            "label": "轉交器：CMake 設定（發佈）",
+            "type": "shell",
+            "command": "C:/Program Files/CMake/bin/cmake.exe",
+            "args": ["--preset", "ucrt64-release"],
+            "options": { "cwd": "${workspaceFolder}/src_cpp/md_open" },
+            "problemMatcher": []
+        },
+        {
+            "label": "轉交器：CMake 建置（發佈）",
+            "type": "shell",
+            "command": "C:/Program Files/CMake/bin/cmake.exe",
+            "args": ["--build", "build/cmake/release"],
+            "dependsOn": ["轉交器：CMake 設定（發佈）"],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "轉交器：CMake 設定（除錯）",
+            "type": "shell",
+            "command": "C:/Program Files/CMake/bin/cmake.exe",
+            "args": ["--preset", "ucrt64-debug"],
+            "options": { "cwd": "${workspaceFolder}/src_cpp/md_open" },
+            "problemMatcher": []
+        },
+        {
+            // 除錯版帶符號、未 strip（發佈版的 -s 會把符號拔光，gdb 什麼都看不到）。
+            // 輸出在 build/cmake/debug/，和發佈產物分開，互不覆蓋。
+            "label": "轉交器：CMake 建置（除錯）",
+            "type": "shell",
+            "command": "C:/Program Files/CMake/bin/cmake.exe",
+            "args": ["--build", "build/cmake/debug"],
+            "dependsOn": ["轉交器：CMake 設定（除錯）"],
+            "group": "build",
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            // 編好順手放進 dist，方便直接雙擊 .md 驗證（等同 build.ps1 第 5 步的複製）
+            "label": "轉交器：建置並部署到 dist",
+            "type": "shell",
+            "command": "powershell.exe",
+            "args": [
+                "-NoProfile", "-Command",
+                "foreach ($d in @('dist', 'dist\\MarkdownReader-onedir')) { if (Test-Path $d) { Copy-Item 'build\\cmake\\release\\MarkdownOpen.exe' $d -Force; Write-Host \"已複製到 $d\" } }"
+            ],
+            "dependsOn": ["轉交器：CMake 建置（發佈）"],
+            "problemMatcher": []
+        }
+    ]
+}

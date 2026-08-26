@@ -1,0 +1,28 @@
+// 轉交器的資源：圖示與版本資訊。
+//
+// 圖示不是裝飾——tools/install_association.py 會把 DefaultIcon 設成
+// 「關聯目標的第 0 個圖示」。轉交器要當 .md 的關聯目標，沒有內嵌圖示的話
+// 檔案總管裡所有 .md 都會變成一張白紙。
+// 路徑相對於本檔案；windres 用 -I 也找得到，但寫相對路徑最不容易壞。
+
+1 ICON "../../assets/app.ico"
+
+1 VERSIONINFO
+FILEVERSION     1,0,0,0
+PRODUCTVERSION  1,0,0,0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040404b0"
+        BEGIN
+            VALUE "FileDescription", "Markdown 閱讀器啟動器"
+            VALUE "ProductName", "Markdown 閱讀器"
+            VALUE "FileVersion", "1.0.0.0"
+            VALUE "OriginalFilename", "MarkdownOpen.exe"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0404, 1200
+    END
+END
