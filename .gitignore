@@ -70,7 +70,14 @@ tools/CHANGELOG.md
 # ---------------------------------------------------------------------------
 # 編輯器與 IDE
 # ---------------------------------------------------------------------------
-.vscode/
+# .vscode 整體排除，但 C++ 轉交器的建置／除錯設定是專案建置設施的一部分
+# （IntelliSense 對準 UCRT64 g++、Ctrl+Shift+B 建置、F5 gdb 除錯），
+# 換機器 clone 下來要能直接用，所以放行這三個檔案。settings.json 屬於
+# 個人偏好，維持排除。
+.vscode/*
+!.vscode/c_cpp_properties.json
+!.vscode/tasks.json
+!.vscode/launch.json
 .idea/
 .trae/
 *.code-workspace
