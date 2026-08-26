@@ -314,7 +314,21 @@ def section_tabs(args) -> None:
         pump(150)
     check("關到只剩一個分頁時分頁列隱藏", not viewer.tab_bar.isVisible())
 
-    viewer.close()
+    # 回歸：標題列的 X 曾被誤接到 close_tab——開著多個分頁時按視窗的關閉鈕，
+    # 視窗不關、只少一個分頁。視窗控制鈕必須關整個視窗。
+    viewer.open_path(README, new_tab=True)
+    pump(300)
+    tabs_before = len(viewer._tabs)
+    viewer.title_bar.closeRequested.emit()
+    pump(400)
+    # WA_DeleteOnClose：視窗真的關了的話 C++ 物件會被銷毀，
+    # 摸它會丟 RuntimeError——那正是我們要的結果。
+    from PyQt6 import sip as _sip
+    closed = _sip.isdeleted(viewer) or not viewer.isVisible()
+    check("多分頁時按標題列的 X 會關閉整個視窗", closed,
+          f"視窗仍在，分頁 {tabs_before} -> {len(viewer._tabs)}")
+    if not closed:
+        viewer.close()
     pump(300)
     QSettings(config.ORG_NAME, config.APP_NAME).clear()
 

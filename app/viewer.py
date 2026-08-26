@@ -549,7 +549,11 @@ class MarkdownViewer(QWidget):
         self.title_bar.pinToggled.connect(self.set_always_on_top)
         self.title_bar.minimizeRequested.connect(self.showMinimized)
         self.title_bar.maximizeToggleRequested.connect(self.toggle_maximized)
-        self.title_bar.closeRequested.connect(self.close_tab)
+        # 標題列的 X 是「視窗」控制鈕，一律關整個視窗（開著的分頁由
+        # closeEvent 的 _save_session 記住）。關「分頁」是 Ctrl+W 與
+        # 分頁列上各自的 X 的事，兩者不要混——混了會變成「明明按了視窗的
+        # 關閉鈕，視窗卻還在，只是分頁少一個」。
+        self.title_bar.closeRequested.connect(self.close)
 
         self.tab_bar.activated.connect(self.activate_tab)
         self.tab_bar.closeRequested.connect(self.close_tab_at)
