@@ -22,6 +22,12 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG")
 # WIN32 -> -mwindows（GUI 子系統，不開主控台）
 add_executable(MarkdownOpen WIN32 main.cpp app.rc)
 
+# make 不會解析 .rc 內部引用的檔案。少了這行，改了 assets/app.ico 之後
+# 增量建置不會重編資源檔，轉交器會默默帶著舊圖示出貨。
+set_source_files_properties(app.rc PROPERTIES
+    OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../../assets/app.ico"
+)
+
 set_target_properties(MarkdownOpen PROPERTIES
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON

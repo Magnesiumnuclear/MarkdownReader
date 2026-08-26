@@ -1,9 +1,29 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
-  <rect x="2" y="7" width="60" height="50" rx="11" fill="#2F81F7"/>
-  <rect x="2" y="7" width="60" height="50" rx="11" fill="none" stroke="#1F63C8" stroke-width="2"/>
-  <path d="M11 45 V23 L21 35 L31 23 V45" fill="none" stroke="#FFFFFF" stroke-width="5"
-        stroke-linejoin="round" stroke-linecap="round"/>
-  <path d="M46 22 V40" fill="none" stroke="#FFFFFF" stroke-width="5" stroke-linecap="round"/>
-  <path d="M39.5 33.5 L46 41 L52.5 33.5" fill="none" stroke="#FFFFFF" stroke-width="5"
-        stroke-linejoin="round" stroke-linecap="round"/>
+  <!-- 字形依 SolidWorks 草圖：M 的中央 V 往下延伸成下箭頭（Markdown 的 M↓ 合體）。
+       草圖座標系：高 80、寬 100（柱寬 20、內緣距中線 30）、對角線 45°、
+       箭桿寬 20（±10）、鏃半寬 22、尖點落在與柱底同高的 y=80。
+       調整（定稿）：V 臂垂直厚度加寬為 20（與柱同寬）；方形底 58×58；
+       M 的角導圓角（凸 r5、凹 r4），箭頭導小圓角（r3）。
+       以 0.46 縮放置中到 64 視窗（X = 9 + 0.46*(x+50)，Y = 13.6 + 0.46*y）。 -->
+  <rect x="3" y="3" width="58" height="58" rx="12" fill="#2F81F7"/>
+  <rect x="3" y="3" width="58" height="58" rx="12" fill="none" stroke="#1F63C8" stroke-width="2"/>
+  <path fill="#FFFFFF" d="M 11.3 13.6
+    L 15.9 13.6 Q 18.2 13.6 19.8 15.2
+    L 30.4 25.8 Q 32 27.4 33.6 25.8
+    L 44.2 15.2 Q 45.8 13.6 48.1 13.6
+    L 52.7 13.6 Q 55 13.6 55 15.9
+    L 55 48.1 Q 55 50.4 52.7 50.4
+    L 48.1 50.4 Q 45.8 50.4 45.8 48.1
+    L 45.8 28.5 Q 45.8 26.6 44.5 27.9
+    L 37.6 34.8 Q 36.6 35.8 36.6 37.2
+    L 36.6 38.9 Q 36.6 40.3 38.0 40.3
+    L 40.7 40.3 Q 42.1 40.3 41.1 41.3
+    L 33.0 49.4 Q 32 50.4 31.0 49.4
+    L 22.9 41.3 Q 21.9 40.3 23.3 40.3
+    L 26.0 40.3 Q 27.4 40.3 27.4 38.9
+    L 27.4 37.2 Q 27.4 35.8 26.4 34.8
+    L 19.5 27.9 Q 18.2 26.6 18.2 28.5
+    L 18.2 48.1 Q 18.2 50.4 15.9 50.4
+    L 11.3 50.4 Q 9 50.4 9 48.1
+    L 9 15.9 Q 9 13.6 11.3 13.6 Z"/>
 </svg>
