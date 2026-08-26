@@ -233,8 +233,20 @@ class FramelessResizer(QObject):
 class MarkdownViewer(QWidget):
     """Markdown 閱讀器主視窗。"""
 
-    def __init__(self, path: str | None = None) -> None:
+    def __init__(
+        self,
+        path: str | None = None,
+        manager=None,
+        restore_session: bool = True,
+    ) -> None:
         super().__init__()
+        # 多視窗管理器（app/window_manager.py）。None 表示單視窗模式，
+        # 分頁拆分／合併功能會安靜停用，其餘功能不受影響（測試大多走這條）。
+        self._manager = manager
+        # 「還原上次分頁」只屬於行程的第一個視窗。拆分／合併建立的視窗若也去
+        # 讀 KEY_OPEN_TABS，會把上次 session 的殼分頁整批復活塞進來——拖一個
+        # 分頁出去卻多出一堆舊分頁，關閉時又把污染後的清單存回去，越滾越大。
+        self._restore_session_allowed = restore_session
         self.setWindowFlags(
             Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint
         )
@@ -338,7 +350,7 @@ class MarkdownViewer(QWidget):
         否則還原十個分頁就要付十次 Markdown 轉換，啟動會明顯變慢。
         """
         restored: list[str] = []
-        if self._restore_tabs:
+        if self._restore_tabs and self._restore_session_allowed:
             saved = self._settings.value(config.KEY_OPEN_TABS, [], type=list)
             restored = [p for p in saved if isinstance(p, str) and os.path.isfile(p)]
 
@@ -392,6 +404,162 @@ class MarkdownViewer(QWidget):
             return
         self._resizer.refresh_targets()
         self._resizer.set_drag_controls(self.findChildren(QScrollBar))
+
+    def tab_count(self) -> int:
+        return len(self._tabs)
+
+    def move_tab(self, frm: int, to: int) -> None:
+        """重排分頁（拖曳排序）。分頁列已經自己把按鈕移好位置，
+        這裡只同步資料順序，「不要」呼叫 _sync_tab_bar 重建。"""
+        if frm == to or not (0 <= frm < len(self._tabs)) or not (0 <= to < len(self._tabs)):
+            return
+        tab = self._tabs.pop(frm)
+        self._tabs.insert(to, tab)
+        if self._active == frm:
+            self._active = to
+        elif frm < self._active <= to:
+            self._active -= 1
+        elif to <= self._active < frm:
+            self._active += 1
+
+    def take_tab(self, index: int) -> DocumentTab | None:
+        """把分頁從這個視窗取出（不銷毀），準備搬去別的視窗。
+
+        與 close_tab_at 的差別：browser 不 deleteLater、anchorClicked 要斷開
+        （否則點連結會開在舊視窗）。取走最後一個分頁後這個視窗就空了，
+        呼叫端負責把視窗關掉——這裡不能自己關，關了 take 的回傳值就沒人接。
+        """
+        if not (0 <= index < len(self._tabs)):
+            return None
+        if self.find_bar.isVisible():
+            self.find_bar.deactivate()
+
+        tab = self._tabs.pop(index)
+        try:
+            tab.browser.anchorClicked.disconnect(self._on_anchor_clicked)
+        except TypeError:
+            pass
+        # 【拆掉來源視窗的縮放事件過濾器】
+        # refresh_targets 把 resizer 裝在每個子元件上，而 Qt 的過濾器不會因為
+        # reparent 而移除。少了這段，搬到新視窗的閱讀區仍會把滑鼠事件餵給
+        # 「舊視窗」的縮放器：兩窗重疊時，游標在新視窗內卻讓舊視窗跳出縮放
+        # 游標、甚至按下去開始縮放舊視窗。
+        for widget in [tab.browser, *tab.browser.findChildren(QWidget)]:
+            widget.removeEventFilter(self._resizer)
+        # 帶走目前的閱讀位置，讓收養端渲染後還原（adopt_tab 會重新渲染，
+        # setHtml 之後捲軸會回到頂端）
+        tab.transfer_scroll = tab.scroll_ratio()
+        self.stack.removeWidget(tab.browser)
+        tab.browser.setParent(None)
+
+        if not self._tabs:
+            # 空視窗：不再碰 self._tab（會 IndexError），交給呼叫端收尾
+            self._watch_files()
+            return tab
+
+        if index < self._active:
+            self._active -= 1
+        elif index == self._active:
+            self._active = min(index, len(self._tabs) - 1)
+        self._active = max(0, min(self._active, len(self._tabs) - 1))
+
+        current = self._tabs[self._active]
+        self.stack.setCurrentWidget(current.browser)
+        self.find_bar.attach(current.browser)
+        if not current.loaded:
+            current.load()
+            if current.path:
+                self._set_search_context(current.path)
+        if current.dirty:
+            self._render(preserve_scroll=False)
+        self.title_bar.set_back_enabled(bool(current.history))
+        self._update_titles(current.display_name)
+        self._update_status()
+        self._sync_tab_bar()
+        self._watch_files()
+        self._refresh_resizer_targets()
+        return tab
+
+    def adopt_tab(self, tab: DocumentTab, index: int | None = None) -> None:
+        """收養從別的視窗搬來的分頁，並切換到它（和 Chrome 一致）。
+
+        主題可能和來源視窗不同：一律標記 dirty，activate_tab 會用本視窗的
+        主題重新渲染，不然會出現「深色視窗裡有一頁是淺色」。
+        """
+        if index is None or not (0 <= index <= len(self._tabs)):
+            index = len(self._tabs)
+        if self.settings_panel.isVisible():
+            # 設定面板是整片覆蓋層，不收起來的話剛合併進來的分頁會被蓋住，
+            # 使用者只看到「拖進去之後什麼都沒發生」
+            self.toggle_settings()
+        tab.browser.setParent(self.stack)
+        tab.browser.set_theme(self._theme)
+        tab.browser.anchorClicked.connect(self._on_anchor_clicked)
+        tab.dirty = True
+        self.stack.insertWidget(index, tab.browser)
+        self._tabs.insert(index, tab)
+        if index <= self._active and len(self._tabs) > 1:
+            self._active += 1
+        self._sync_tab_bar()
+        # activate_tab 需要「目前不在那個分頁」才會走完整流程
+        if self._active == index:
+            self._active = -1
+        self.activate_tab(index)
+        self._watch_files()
+        self._refresh_resizer_targets()
+        # 還原搬移前的閱讀位置。activate_tab 的重新渲染（setHtml）把捲軸打回
+        # 頂端；文件高度要等版面算完才正確，所以下一個事件回合再套用。
+        ratio = getattr(tab, "transfer_scroll", None)
+        if ratio:
+            QTimer.singleShot(0, lambda: tab.apply_scroll_ratio(ratio))
+            tab.transfer_scroll = None
+
+    def _drag_intent_at(self, global_pos, outside_band: bool) -> str:
+        """拖曳中的即時預告：這個位置放開會發生什麼。
+
+        與 _on_tab_detached 的決策必須一致，否則徽章寫「合併」放開卻拆分，
+        比沒有預告更糟。
+        """
+        if self._manager is None:
+            return "none"
+        if self._manager.drop_target_at(global_pos, exclude=self) is not None:
+            return "merge"
+        if outside_band and len(self._tabs) > 1:
+            return "detach"
+        return "none"
+
+    def _on_tab_detached(
+        self, index: int, global_pos, allow_new_window: bool = True
+    ) -> None:
+        """分頁被拖出列外放開：合併進游標下的視窗，否則拆成新視窗。
+
+        allow_new_window=False 表示放開點只離開了分頁列、還在容忍帶內
+        （通常是相鄰視窗的分頁列上）：有合併目標就合併，沒有就不動作，
+        不會因為手滑幾個像素噴出一個新視窗。
+        """
+        if self._manager is None:
+            return
+        target = self._manager.drop_target_at(global_pos, exclude=self)
+        if target is not None:
+            other, insert_at = target
+            tab = self.take_tab(index)
+            if tab is None:
+                return
+            other.adopt_tab(tab, insert_at)
+            other.raise_()
+            other.activateWindow()
+        else:
+            if not allow_new_window:
+                return
+            if len(self._tabs) <= 1:
+                # 單一分頁拖到空白處＝把整個視窗搬過去，沒有拆分的意義
+                return
+            tab = self.take_tab(index)
+            if tab is None:
+                return
+            self._manager.create_window(adopt=tab, near=global_pos)
+        if not self._tabs:
+            self.close()
 
     def _index_of_path(self, path: str) -> int | None:
         target = os.path.abspath(path)
@@ -467,8 +635,11 @@ class MarkdownViewer(QWidget):
         self.find_bar.attach(current.browser)
         if not current.loaded:
             current.load()
+            if current.path:
+                self._set_search_context(current.path)
         if current.dirty:
             self._render(preserve_scroll=False)
+        self.title_bar.set_back_enabled(bool(current.history))
         self._update_titles(current.display_name)
         self._update_status()
         self._sync_tab_bar()
@@ -516,6 +687,11 @@ class MarkdownViewer(QWidget):
 
     def _save_session(self) -> None:
         if not self._restore_tabs:
+            return
+        if not self._tabs:
+            # 分頁被合併到別的視窗後，空視窗的 close 會走到這裡。兩件事都不能做：
+            # self._tab 會 IndexError（closeEvent 是 Qt 虛擬函式，例外＝行程中止），
+            # 寫入空清單則會把還有分頁的那個視窗待存的 session 清掉。
             return
         paths = [tab.path for tab in self._tabs if tab.path]
         self._settings.setValue(config.KEY_OPEN_TABS, paths)
@@ -584,6 +760,9 @@ class MarkdownViewer(QWidget):
 
         self.tab_bar.activated.connect(self.activate_tab)
         self.tab_bar.closeRequested.connect(self.close_tab_at)
+        self.tab_bar.tabMoved.connect(self.move_tab)
+        self.tab_bar.detachRequested.connect(self._on_tab_detached)
+        self.tab_bar.drop_intent_probe = self._drag_intent_at
         self.tab_bar.newTabRequested.connect(self.open_dialog)
 
         self.settings_panel.themeModeChanged.connect(self.set_theme_mode)
@@ -1253,6 +1432,10 @@ class MarkdownViewer(QWidget):
     def changeEvent(self, event) -> None:  # noqa: N802
         if event.type() == QEvent.Type.WindowStateChange:
             self.title_bar.set_maximized(self.isMaximized())
+        elif event.type() == QEvent.Type.ActivationChange:
+            if self.isActiveWindow() and self._manager is not None:
+                # 單一實例轉交進來的檔案，開在使用者最後碰過的視窗
+                self._manager.note_activated(self)
         super().changeEvent(event)
 
     def resizeEvent(self, event) -> None:  # noqa: N802

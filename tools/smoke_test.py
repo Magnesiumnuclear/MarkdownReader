@@ -21,9 +21,27 @@ PyQt6 對「虛擬函式裡的未攔截例外」是致命的：不會拋出 Pyth
 【為什麼要備份 QSettings】
 測試會寫入程式真正使用的登錄檔位置（不能改，否則測不到「還原上次狀態」這類
 邏輯）。開頭先快照、結束後還原，不會動到使用者自己的設定。
+
+【已知問題：低頻的建構期存取違規（僅測試環境）】
+約每四、五次完整跑會有一個區塊以 0xC0000005 死在「視窗建構」期
+（faulthandler 疊停在 MarkdownViewer 建構或 showEvent 的 refresh_targets）。
+已知事實：
+  - 單獨跑任一區塊從未發生（各 10+ 次）；純建毀 120 輪、還原殼建毀 90 輪
+    的定向實驗也從未重現——需要完整區段序列＋系統負載。
+  - 真實程式路徑乾淨：打包端到端、WM_CLOSE 連測 15/15、從無 error.log。
+  - 特徵是「先前某次釋放造成的堆積損壞在無辜行號引爆」，要 PageHeap 級
+    工具才能抓到真兇。
+處置：區塊已各自隔離成子行程（一個崩不影響其他），stderr 會轉印崩潰疊。
+遇到單一區塊紅燈時先重跑該區塊確認；若「單獨跑」也能重現，那就是真回歸。
 """
 
 from __future__ import annotations
+
+# 原生層崩潰（0xC0000005 等）時把 Python 呼叫疊印到 stderr。
+# 沒有它，區段以存取違規死掉時連死在哪一行都看不到。
+import faulthandler
+
+faulthandler.enable()
 
 import argparse
 import os
@@ -295,7 +313,9 @@ def section_tabs(args) -> None:
     viewer.show()
     pump(500)
 
-    check("單一分頁時不顯示分頁列", not viewer.tab_bar.isVisible())
+    # 分頁列永遠顯示（含單分頁）：隱藏的話單開一個 .md 就沒有分頁可抓，
+    # 永遠拖不去別的視窗合併（實際使用回報）
+    check("單一分頁時分頁列也顯示（要能拖去合併）", viewer.tab_bar.isVisible())
     viewer.open_path(README, new_tab=True)
     pump(400)
     check("多分頁時顯示分頁列", viewer.tab_bar.isVisible())
@@ -326,7 +346,7 @@ def section_tabs(args) -> None:
     while len(viewer._tabs) > 1:
         viewer.close_tab_at(len(viewer._tabs) - 1)
         pump(150)
-    check("關到只剩一個分頁時分頁列隱藏", not viewer.tab_bar.isVisible())
+    check("關到只剩一個分頁時分頁列仍顯示", viewer.tab_bar.isVisible())
 
     # 回歸：標題列的 X 曾被誤接到 close_tab——開著多個分頁時按視窗的關閉鈕，
     # 視窗不關、只少一個分頁。視窗控制鈕必須關整個視窗。
@@ -858,34 +878,342 @@ def section_teardown(args) -> None:
 
 
 # ===========================================================================
+def section_tab_dnd(args) -> None:
+    """Chrome 式分頁操作：拖曳排序、拆分成新視窗、合併回別的視窗。
+
+    這些檢查走 viewer 層的 API（move_tab / _on_tab_detached / drop_target_at），
+    拖曳手勢本身另以合成滑鼠事件驗證重排。座標的教訓：測「拖到空白處」時，
+    空白點必須先把所有視窗移開再選——上一版用 (3000,3000)，結果剛拆出去的
+    視窗就停在那裡，變成測到合併。
+    """
+    import tempfile as _tempfile
+
+    from PyQt6.QtCore import QEvent, QEventLoop, QPoint, QPointF, QSettings, Qt, QTimer
+    from PyQt6.QtGui import QMouseEvent
+    from PyQt6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+
+    def pump(ms=280):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+        for _ in range(3):
+            app.processEvents()
+
+    from app.window_manager import WindowManager
+
+    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    tmp = _tempfile.mkdtemp()
+    docs = []
+    for i in range(3):
+        path = os.path.join(tmp, f"d{i}.md")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(f"# 文件{i}\n\n內容 {i}\n")
+        docs.append(os.path.abspath(path))
+
+    manager = WindowManager()
+    viewer = manager.create_window(docs[0])
+    viewer.move(80, 80)
+    for path in docs[1:]:
+        viewer.open_path(path, new_tab=True)
+        pump()
+    pump()
+
+    def names(w):
+        return [t.display_name for t in w._tabs]
+
+    # --- 移動（資料層）---
+    viewer.activate_tab(0)
+    pump(150)
+    viewer.move_tab(0, 2)
+    check("拖曳排序：順序正確", names(viewer) == ["d1.md", "d2.md", "d0.md"], str(names(viewer)))
+    check("拖曳排序：作用中分頁跟著移動", viewer._tab.display_name == "d0.md")
+    viewer.move_tab(2, 0)
+
+    # --- 移動（真實拖曳手勢：合成滑鼠事件掃過鄰居中心）---
+    buttons = viewer.tab_bar._buttons
+    src = buttons[0]
+    start = src.mapToGlobal(src.rect().center())
+    press = QMouseEvent(QEvent.Type.MouseButtonPress,
+                        QPointF(src.rect().center()), QPointF(start),
+                        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                        Qt.KeyboardModifier.NoModifier)
+    app.sendEvent(src, press)
+    target_x = buttons[1].mapToGlobal(buttons[1].rect().center()).x() + 10
+    for step_x in range(start.x(), target_x, 12):
+        move = QMouseEvent(QEvent.Type.MouseMove,
+                           QPointF(src.mapFromGlobal(QPoint(step_x, start.y()))),
+                           QPointF(step_x, start.y()),
+                           Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
+                           Qt.KeyboardModifier.NoModifier)
+        app.sendEvent(src, move)
+    release = QMouseEvent(QEvent.Type.MouseButtonRelease,
+                          QPointF(src.mapFromGlobal(QPoint(target_x, start.y()))),
+                          QPointF(target_x, start.y()),
+                          Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
+                          Qt.KeyboardModifier.NoModifier)
+    app.sendEvent(src, release)
+    pump(200)
+    check("真實拖曳手勢能重排（跨過右鄰的中心）",
+          names(viewer)[1] == "d0.md", str(names(viewer)))
+    check("手勢重排後資料與按鈕一致",
+          [b._name for b in viewer.tab_bar._buttons] == names(viewer))
+    viewer.move_tab(names(viewer).index("d0.md"), 0)
+    viewer.activate_tab(0)
+    pump(150)
+
+    # --- 拆分 ---
+    empty_spot = QPoint(1100, 700)   # 視窗都在左上，這裡保證是空白
+    viewer._on_tab_detached(1, empty_spot)
+    pump(400)
+    check("拆分：多出一個視窗", len(manager.windows()) == 2, str(len(manager.windows())))
+    others = [w for w in manager.windows() if w is not viewer]
+    if not others:
+        check("拆分失敗，後續合併測試跳過", False)
+        QSettings(config.ORG_NAME, config.APP_NAME).clear()
+        return
+    new_window = others[0]
+    check("拆分：新視窗只有拆出去的那個分頁", names(new_window) == ["d1.md"], str(names(new_window)))
+    check("拆分：內容直接搬移（不重讀檔）", "內容 1" in new_window.browser.toPlainText())
+    # 拆分後兩邊滑鼠移動都要存活（縮放器殘留快照的教訓）
+    for w in (viewer, new_window):
+        g = w.frameGeometry()
+        gp = QPointF(float(g.center().x()), float(g.center().y()))
+        ev = QMouseEvent(QEvent.Type.MouseMove, w.mapFromGlobal(gp.toPoint()).toPointF(),
+                         gp, Qt.MouseButton.NoButton, Qt.MouseButton.NoButton,
+                         Qt.KeyboardModifier.NoModifier)
+        app.sendEvent(w, ev)
+    check("拆分後兩邊滑鼠移動存活", True)
+
+    # --- 合併 ---
+    x, y, width, height = viewer.tab_bar.global_drop_rect()
+    drop = QPoint(x + 10, y + height // 2)
+    hit = manager.drop_target_at(drop, exclude=new_window)
+    check("合併：命中測試找到目標視窗與插入位置",
+          hit is not None and hit[0] is viewer and hit[1] == 0, str(hit))
+    new_window._on_tab_detached(0, drop)
+    pump(400)
+    check("合併：分頁插到目標視窗最前面", names(viewer) == ["d1.md", "d0.md", "d2.md"],
+          str(names(viewer)))
+    check("合併：切換到搬來的分頁", viewer._tab.display_name == "d1.md")
+    check("合併：空掉的來源視窗自動關閉", len(manager.windows()) == 1,
+          str(len(manager.windows())))
+
+    # --- 單一分頁拖到真正的空白處：不動作 ---
+    viewer.move(80, 80)
+    while viewer.tab_count() > 1:
+        viewer.close_tab_at(viewer.tab_count() - 1)
+        pump(120)
+    viewer._on_tab_detached(0, empty_spot)
+    pump(250)
+    check("單一分頁拖到空白處不拆分（等同拖整個視窗）",
+          len(manager.windows()) == 1 and viewer.tab_count() == 1)
+
+    viewer.close()
+    pump(300)
+
+    # =====================================================================
+    # 對抗式審查抓出的回歸（每一項都真的發生過）
+    # =====================================================================
+    def settings():
+        return QSettings(config.ORG_NAME, config.APP_NAME)
+
+    settings().clear()
+    settings().setValue(config.KEY_RESTORE_TABS, True)
+    settings().setValue(config.KEY_OPEN_TABS, docs[:2])
+    settings().setValue(config.KEY_ACTIVE_TAB, 0)
+    settings().sync()
+
+    manager2 = WindowManager()
+    main_win = manager2.create_window(None)
+    pump(400)
+    check("開啟還原設定時第一個視窗照常還原", main_win.tab_count() == 2)
+    main_win.move(80, 80)
+    main_win.open_path(docs[2], new_tab=True)
+    pump(300)
+
+    # 拆分建立的視窗曾把上次 session 的殼分頁整批復活塞進來
+    main_win._on_tab_detached(2, QPoint(1200, 700))
+    pump(400)
+    torn = [w for w in manager2.windows() if w is not main_win][0]
+    check("拆出的視窗只含被拖的分頁（不復活舊 session）",
+          torn.tab_count() == 1 and torn._tabs[0].display_name == "d2.md",
+          str([t.display_name for t in torn._tabs]))
+    check("即使上次最大化關閉，拆出的視窗也不最大化", not torn.isMaximized())
+
+    # 合併走最後一個分頁：空視窗的 closeEvent 曾在 _save_session 裡
+    # IndexError（Qt 虛擬函式內＝行程中止），或把空清單寫進 session
+    saved_before = settings().value(config.KEY_OPEN_TABS)
+    x, y, _w, h = main_win.tab_bar.global_drop_rect()
+    torn._on_tab_detached(0, QPoint(x + 10, y + h // 2))
+    pump(500)
+    check("合併走最後一個分頁：空視窗關閉不崩潰", len(manager2.windows()) == 1)
+    check("空視窗關閉不清空已存的 session",
+          settings().value(config.KEY_OPEN_TABS) == saved_before)
+
+    # 閱讀位置要跟著分頁走（adopt 的重新渲染曾把捲軸打回頂端）
+    long_doc = os.path.join(tmp, "long.md")
+    with open(long_doc, "w", encoding="utf-8") as handle:
+        handle.write("# 長文\n\n" + "\n\n".join(f"段落 {i}" for i in range(200)))
+    main_win.open_path(long_doc, new_tab=True)
+    pump(400)
+    bar = main_win.browser.verticalScrollBar()
+    bar.setValue(bar.maximum() // 2)
+    pump(200)
+    ratio_before = main_win._tab.scroll_ratio()
+    main_win._on_tab_detached(main_win._active, QPoint(1200, 700))
+    pump(600)
+    moved_win = [w for w in manager2.windows() if w is not main_win][0]
+    ratio_after = moved_win._tabs[0].scroll_ratio()
+    check("拆分後閱讀位置保留",
+          abs(ratio_after - ratio_before) < 0.1,
+          f"{ratio_before:.2f} -> {ratio_after:.2f}")
+
+    # 搬走的閱讀區曾殘留「來源視窗」的縮放事件過濾器：兩窗重疊時，
+    # 游標在新視窗內會讓舊視窗跳出縮放游標、按下去縮放到舊視窗
+    from PyQt6.QtWidgets import QApplication as _QApp
+    geometry = main_win.frameGeometry()
+    moved_win.move(geometry.right() - 200, geometry.top() + 100)
+    pump(300)
+    viewport = moved_win._tabs[0].browser.viewport()
+    probe = QPointF(float(geometry.right() - 2), float(geometry.top() + 200))
+    hover = QMouseEvent(QEvent.Type.MouseMove,
+                        viewport.mapFromGlobal(probe.toPoint()).toPointF(), probe,
+                        Qt.MouseButton.NoButton, Qt.MouseButton.NoButton,
+                        Qt.KeyboardModifier.NoModifier)
+    app.sendEvent(viewport, hover)
+    pump(100)
+    check("搬走的閱讀區不再觸發來源視窗的縮放游標",
+          _QApp.overrideCursor() is None)
+
+    for w in manager2.windows():
+        w.close()
+    pump(400)
+
+    # =====================================================================
+    # 實際使用回饋的回歸（2026-08-27）
+    # =====================================================================
+    def gesture_drag(button, points):
+        """在 button 上合成 按下 -> 逐點移動 -> 在最後一點放開。"""
+        start_pos = button.mapToGlobal(button.rect().center())
+        app.sendEvent(button, QMouseEvent(
+            QEvent.Type.MouseButtonPress, QPointF(button.rect().center()),
+            QPointF(start_pos), Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
+        for gp in points:
+            app.sendEvent(button, QMouseEvent(
+                QEvent.Type.MouseMove, QPointF(button.mapFromGlobal(gp)),
+                QPointF(gp), Qt.MouseButton.NoButton,
+                Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
+            app.processEvents()
+        end = points[-1]
+        app.sendEvent(button, QMouseEvent(
+            QEvent.Type.MouseButtonRelease, QPointF(button.mapFromGlobal(end)),
+            QPointF(end), Qt.MouseButton.LeftButton,
+            Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier))
+
+    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    manager3 = WindowManager()
+    solo = manager3.create_window(docs[0])
+    solo.move(80, 80)
+    pump(400)
+    # 回報 2：單開一個 .md 沒有分頁可拖 -> 分頁列永遠顯示
+    check("單開一個檔也有分頁列可拖", solo.tab_bar.isVisible()
+          and len(solo.tab_bar._buttons) == 1)
+
+    # 回報 3：兩窗相鄰（間距 20px < 容忍帶 48px）、分頁列同高，橫向拖過去
+    # 放開在對方分頁列上。舊版撕下判定只看垂直、且放開點不重新判定，
+    # 這個幾何下 torn 永遠是 False，放開什麼都不做。
+    neighbor = manager3.create_window(docs[1])
+    pump(400)
+    neighbor.move(solo.frameGeometry().right() + 20, 80)
+    pump(300)
+    grab_btn = solo.tab_bar._buttons[0]
+    grab_start = grab_btn.mapToGlobal(grab_btn.rect().center())
+    nx, ny, nw, nh = neighbor.tab_bar.global_drop_rect()
+    drop_end = QPoint(nx + 40, grab_start.y())
+    gesture_drag(grab_btn,
+                 [QPoint(x, grab_start.y())
+                  for x in range(grab_start.x(), drop_end.x(), 20)] + [drop_end])
+    pump(500)
+    check("相鄰視窗橫向拖曳（容忍帶內）能合併",
+          neighbor.tab_count() == 2 and len(manager3.windows()) == 1,
+          f"tabs={neighbor.tab_count()} windows={len(manager3.windows())}")
+
+    # 回報 1：撕下期間要有幽靈分頁跟著游標
+    neighbor.activate_tab(0)
+    pump(200)
+    tear_btn = neighbor.tab_bar._buttons[0]
+    tear_start = tear_btn.mapToGlobal(tear_btn.rect().center())
+    app.sendEvent(tear_btn, QMouseEvent(
+        QEvent.Type.MouseButtonPress, QPointF(tear_btn.rect().center()),
+        QPointF(tear_start), Qt.MouseButton.LeftButton,
+        Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
+    ghost_seen = False
+    badge_texts: set[str] = set()
+    for i in range(1, 11):
+        gp = QPoint(tear_start.x() + i * 10, tear_start.y() + i * 30)
+        app.sendEvent(tear_btn, QMouseEvent(
+            QEvent.Type.MouseMove, QPointF(tear_btn.mapFromGlobal(gp)),
+            QPointF(gp), Qt.MouseButton.NoButton,
+            Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
+        app.processEvents()
+        ghost = neighbor.tab_bar._ghost
+        if ghost is not None and ghost.isVisible():
+            ghost_seen = True
+            badge_texts.add(ghost._badge.text())
+    far = QPoint(tear_start.x() + 100, tear_start.y() + 300)
+    app.sendEvent(tear_btn, QMouseEvent(
+        QEvent.Type.MouseButtonRelease, QPointF(tear_btn.mapFromGlobal(far)),
+        QPointF(far), Qt.MouseButton.LeftButton,
+        Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier))
+    pump(500)
+    from PyQt6.QtWidgets import QApplication as _QAppG
+    check("撕下期間幽靈分頁跟著游標", ghost_seen)
+    # 幽靈下方的徽章要預告放開的結果；拖向遠處空白的路徑上應出現「拆分」
+    check("徽章預告下一步（拆分為新視窗）", "拆分為新視窗" in badge_texts,
+          str(badge_texts))
+    check("放開後幽靈與覆蓋游標清乾淨",
+          neighbor.tab_bar._ghost is None and _QAppG.overrideCursor() is None)
+    check("拖到遠處仍能拆分", len(manager3.windows()) == 2)
+
+    # 手滑：超出分頁列一點點（容忍帶內、游標下沒有其他視窗）不噴新視窗
+    stray = [w for w in manager3.windows() if w is not neighbor][0]
+    stray.move(80, 620)
+    pump(200)
+    neighbor.open_path(docs[2], new_tab=True)
+    pump(300)
+    state_before = (neighbor.tab_count(), len(manager3.windows()))
+    slip_btn = neighbor.tab_bar._buttons[0]
+    slip_start = slip_btn.mapToGlobal(slip_btn.rect().center())
+    bar_bottom = neighbor.tab_bar.mapToGlobal(
+        neighbor.tab_bar.rect().bottomLeft()).y()
+    gesture_drag(slip_btn, [QPoint(slip_start.x() + 40, slip_start.y()),
+                            QPoint(slip_start.x(), bar_bottom + 20)])
+    pump(400)
+    check("手滑超出一點點（容忍帶內、無目標）不噴出新視窗",
+          (neighbor.tab_count(), len(manager3.windows())) == state_before)
+
+    for w in manager3.windows():
+        w.close()
+    pump(400)
+    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+
+
 SECTIONS = [
     ("渲染與閱讀", section_rendering),
     ("分頁操作", section_tabs),
     ("分頁狀態還原", section_session),
+    ("分頁拖曳（移動/拆分/合併）", section_tab_dnd),
     ("視窗與邊緣縮放", section_window),
     ("單一實例", section_single_instance),
     ("關閉穩定度", section_teardown),
 ]
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Markdown 閱讀器功能回歸測試")
-    parser.add_argument("--only", default="", help="只跑名稱含這個字串的區塊")
-    parser.add_argument("--list", action="store_true", help="列出所有區塊後結束")
-    parser.add_argument("--runs", type=int, default=12,
-                        help="穩定度測試的重複次數（預設 12）")
-    args = parser.parse_args()
-
-    if args.list:
-        for name, _ in SECTIONS:
-            print(f"  {name}")
-        return 0
-
-    selected = [(n, f) for n, f in SECTIONS if args.only in n]
-    if not selected:
-        print(f"沒有符合「{args.only}」的區塊")
-        return 1
-
+def _run_sections_in_process(selected, args) -> int:
+    """在本行程內跑指定區塊（--only 與子行程模式走這裡）。"""
     saved = snapshot_settings()
     try:
         for name, func in selected:
@@ -907,6 +1235,67 @@ def main() -> int:
         for label, detail in _FAIL:
             print(f"  - {label}" + (f"  ({detail})" if detail else ""))
     return 1 if _FAIL else 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Markdown 閱讀器功能回歸測試")
+    parser.add_argument("--only", default="", help="只跑名稱含這個字串的區塊")
+    parser.add_argument("--list", action="store_true", help="列出所有區塊後結束")
+    parser.add_argument("--runs", type=int, default=12,
+                        help="穩定度測試的重複次數（預設 12）")
+    args = parser.parse_args()
+
+    if args.list:
+        for name, _ in SECTIONS:
+            print(f"  {name}")
+        return 0
+
+    if args.only:
+        selected = [(n, f) for n, f in SECTIONS if args.only in n]
+        if not selected:
+            print(f"沒有符合「{args.only}」的區塊")
+            return 1
+        return _run_sections_in_process(selected, args)
+
+    # 【完整跑：每個區塊各開一個子行程】
+    # 同一個行程連跑多個區塊時，前面區塊大量建毀視窗（WA_DeleteOnClose、
+    # 監看器、延遲刪除）累積的拆除工作，會和後面區塊的建構交錯，偶發
+    # 0xC0000005——實測約每四、五次完整跑出現一次，單跑任一區塊永遠正常。
+    # 這種行程級的拆除競態沒辦法在同行程內「修」，隔離才是正解，
+    # 副作用是每個區塊各付一次 Qt 啟動成本（約多十幾秒）。
+    import re as _re
+
+    total_pass = total_all = 0
+    failed_sections: list[str] = []
+    for name, _func in SECTIONS:
+        proc = subprocess.run(
+            [sys.executable, "-u", os.path.abspath(__file__),
+             "--only", name, "--runs", str(args.runs)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        body = proc.stdout.rstrip()
+        summary = _re.search(r"===== (\d+) / (\d+) 通過", body)
+        if proc.returncode == 0 and summary:
+            total_pass += int(summary.group(1))
+            total_all += int(summary.group(2))
+            print(f"[{name}] 通過（{summary.group(1)} 項）")
+        else:
+            failed_sections.append(name)
+            print(f"[{name}] 失敗（子行程結束碼 {proc.returncode}）")
+            for line in body.splitlines():
+                print(f"    {line}")
+            # faulthandler 的原生崩潰疊在 stderr，不轉印就等於白裝
+            stderr_tail = proc.stderr.strip().splitlines()[-25:]
+            for line in stderr_tail:
+                print(f"    [stderr] {line}")
+            if summary:
+                total_pass += int(summary.group(1))
+                total_all += int(summary.group(2))
+
+    print()
+    print(f"===== {total_pass} / {total_all} 通過，"
+          f"{len(failed_sections)} 個區塊失敗 =====")
+    return 1 if failed_sections else 0
 
 
 if __name__ == "__main__":

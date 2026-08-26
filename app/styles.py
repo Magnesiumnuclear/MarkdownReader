@@ -485,6 +485,37 @@ def build_qss(theme: str) -> str:
     return _QSS.substitute(_values(theme))
 
 
+# 拖曳幽靈是獨立的頂層小視窗，吃不到主視窗的 QSS，要自己套一份。
+# 徽章用 intent 動態屬性切換配色：合併＝強調色實心、拆分＝描邊、無動作＝灰。
+_GHOST_QSS = Template("""
+QLabel#dragGhostBadge {
+    font-family: $font_ui;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px 10px;
+    border-radius: 4px;
+    border: 1px solid $border;
+    color: $text_muted;
+    background-color: $surface;
+}
+QLabel#dragGhostBadge[intent="merge"] {
+    color: $icon_on_accent;
+    background-color: $accent;
+    border: 1px solid $accent;
+}
+QLabel#dragGhostBadge[intent="detach"] {
+    color: $accent;
+    background-color: $surface;
+    border: 1px solid $accent;
+}
+""")
+
+
+def build_ghost_qss(theme: str) -> str:
+    """拖曳幽靈（分頁縮影＋下一步徽章）的 QSS。"""
+    return _GHOST_QSS.substitute(_values(theme))
+
+
 # --- Markdown 文件樣式（QTextDocument CSS） ---------------------------------
 # 所有 font-size 一律用 em/%，才能隨 QTextBrowser 的字級設定等比縮放。
 # 區塊元素的 border/padding 在 Qt 無效，因此引用區塊、程式碼區塊與分隔線

@@ -107,11 +107,10 @@ def main() -> int:
     # build.spec 的 hiddenimports 也有一份，兩道保險。
     import PyQt6.QtSvg  # noqa: F401
 
-    from PyQt6.QtCore import Qt
     from PyQt6.QtWidgets import QApplication
 
     from app import icons, win32
-    from app.viewer import MarkdownViewer
+    from app.window_manager import WindowManager
 
     # 讓工作列正確辨識為獨立應用程式（無邊框視窗尤其需要）
     win32.set_app_user_model_id()
@@ -127,22 +126,26 @@ def main() -> int:
         # 監聽不起來（權限或環境限制）就退化成各自開視窗，功能不受影響
         server = None
 
-    viewer = MarkdownViewer(target)
-    # 讓 Qt 在視窗關閉時就地銷毀它。否則視窗會活到直譯器結束後才被拆除，
-    # 那時 QApplication 可能已經先一步消失，Qt 內部就會踩到已釋放的記憶體
-    # （實測會有約六成機率在結束時發生存取違規）。
-    viewer.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+    # 多視窗管理器：分頁可以拖出去拆成新視窗、拖回來合併（見 window_manager.py）。
+    # 視窗各自帶 WA_DeleteOnClose（在 create_window 裡設），關閉即就地銷毀——
+    # 否則視窗會活到直譯器結束後才被拆除，那時 QApplication 可能已先消失，
+    # Qt 內部會踩到已釋放的記憶體（實測約六成機率在結束時存取違規）。
+    manager = WindowManager(parent=app)
     if server is not None:
-        # 【不要把 server 掛在 viewer 底下】
-        # viewer 帶著 WA_DeleteOnClose，關閉時 Qt 會連同它的子物件一起銷毀，
-        # QLocalServer 的 C++ 物件就跟著沒了；等 app.exec() 返回後那句
-        # server.close() 一碰就是「wrapped C/C++ object has been deleted」。
-        # 掛在 app 底下，生命週期才會涵蓋 close() 之後，直到 main() 返回。
+        # 【不要把 server 掛在視窗底下】
+        # 視窗帶著 WA_DeleteOnClose，關閉時 Qt 會連同子物件一起銷毀，
+        # QLocalServer 的 C++ 物件就跟著沒了；app.exec() 之後的 server.close()
+        # 一碰就是「wrapped C/C++ object has been deleted」。掛在 app 底下，
+        # 生命週期才會涵蓋 close() 之後，直到 main() 返回。
         server.setParent(app)
-        # 接收端是 QObject 的繫結方法，viewer 被銷毀時 Qt 會自動斷開這條連線，
-        # 因此關閉過程中即使有人送路徑進來，也不會呼叫到已死的視窗。
-        server.pathReceived.connect(viewer.handle_external_open)
-    viewer.show()
+        # 轉交進來的路徑由管理器路由到最後作用中的視窗
+        server.pathReceived.connect(manager.route_external_open)
+        # 最後一個視窗關閉的瞬間就停止監聽：此時行程正在退出，晚一步送進來的
+        # 雙擊若還連得上管道，檔案會被一個垂死的行程吞掉、什麼都不開。
+        # 管道一關，新行程連不上就會自己開視窗——正確的退化。close 可重入，
+        # 與 app.exec() 之後那次不衝突。
+        app.lastWindowClosed.connect(server.close)
+    manager.create_window(target)
 
     exit_code = app.exec()
     if server is not None:

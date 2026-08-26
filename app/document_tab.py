@@ -35,6 +35,8 @@ class DocumentTab:
 
         self.loaded: bool = False             # 是否已讀進檔案內容
         self.dirty: bool = True               # 是否需要重新渲染
+        # 跨視窗搬移時暫存的捲動比例：take_tab 寫入、adopt_tab 讀走後清空
+        self.transfer_scroll: float | None = None
         self.has_scalable_images: bool = False
         self.last_render_width: int = 0
 
