@@ -380,6 +380,7 @@ class MarkdownViewer(QWidget):
         tab.browser.setParent(self.stack)
         tab.browser.set_theme(self._theme)
         tab.browser.anchorClicked.connect(self._on_anchor_clicked)
+        tab.browser.highlighted.connect(self._on_link_hovered)
         self.stack.addWidget(tab.browser)
         self._tabs.append(tab)
         if activate:
@@ -435,10 +436,14 @@ class MarkdownViewer(QWidget):
             self.find_bar.deactivate()
 
         tab = self._tabs.pop(index)
-        try:
-            tab.browser.anchorClicked.disconnect(self._on_anchor_clicked)
-        except TypeError:
-            pass
+        for signal, slot in (
+            (tab.browser.anchorClicked, self._on_anchor_clicked),
+            (tab.browser.highlighted, self._on_link_hovered),
+        ):
+            try:
+                signal.disconnect(slot)
+            except TypeError:
+                pass
         # 【拆掉來源視窗的縮放事件過濾器】
         # refresh_targets 把 resizer 裝在每個子元件上，而 Qt 的過濾器不會因為
         # reparent 而移除。少了這段，搬到新視窗的閱讀區仍會把滑鼠事件餵給
@@ -495,6 +500,7 @@ class MarkdownViewer(QWidget):
         tab.browser.setParent(self.stack)
         tab.browser.set_theme(self._theme)
         tab.browser.anchorClicked.connect(self._on_anchor_clicked)
+        tab.browser.highlighted.connect(self._on_link_hovered)
         tab.dirty = True
         self.stack.insertWidget(index, tab.browser)
         self._tabs.insert(index, tab)
@@ -518,15 +524,40 @@ class MarkdownViewer(QWidget):
         """拖曳中的即時預告：這個位置放開會發生什麼。
 
         與 _on_tab_detached 的決策必須一致，否則徽章寫「合併」放開卻拆分，
-        比沒有預告更糟。
+        比沒有預告更糟。順帶在目標視窗的分頁列畫出插入位置指示線——
+        兩者共用同一個 drop_target_at 的結果，線的位置就是實際落點。
         """
         if self._manager is None:
             return "none"
-        if self._manager.drop_target_at(global_pos, exclude=self) is not None:
+        target = self._manager.drop_target_at(global_pos, exclude=self)
+        self._update_insert_markers(target)
+        if target is not None:
             return "merge"
         if outside_band and len(self._tabs) > 1:
             return "detach"
         return "none"
+
+    def _update_insert_markers(self, target) -> None:
+        """只在目標視窗顯示插入指示線，其餘視窗一律清掉。
+
+        每次移動都全部掃一遍而不是記住上一個目標：拖曳期間視窗可能被關閉，
+        留著參照去清會踩到已銷毀的物件（本專案在捲軸快照上吃過這個虧）。
+        """
+        if self._manager is None:
+            return
+        target_window = target[0] if target else None
+        for window in self._manager.windows():
+            if window is target_window:
+                window.tab_bar.show_insert_marker(target[1])
+            else:
+                window.tab_bar.hide_insert_marker()
+
+    def _clear_insert_markers(self) -> None:
+        if self._manager is None:
+            self.tab_bar.hide_insert_marker()
+            return
+        for window in self._manager.windows():
+            window.tab_bar.hide_insert_marker()
 
     def _on_tab_detached(
         self, index: int, global_pos, allow_new_window: bool = True
@@ -539,6 +570,7 @@ class MarkdownViewer(QWidget):
         """
         if self._manager is None:
             return
+        self._clear_insert_markers()
         target = self._manager.drop_target_at(global_pos, exclude=self)
         if target is not None:
             other, insert_at = target
@@ -1070,7 +1102,15 @@ class MarkdownViewer(QWidget):
         self.status_label.setText("尚未開啟檔案 — 按 Ctrl+O 或直接拖放 .md 檔到視窗")
 
     def _render(self, preserve_scroll: bool = True) -> None:
-        """重新產生 HTML 並套用，預設保留閱讀位置。"""
+        """重新產生 HTML 並套用，預設保留閱讀位置。
+
+        這裡是所有渲染路徑的咽喉（開檔、延後載入、切主題、字級、收養分頁），
+        大檔的忙碌回饋因此只需要掛在這一處。
+        """
+        with self._busy_feedback(self._tab.path):
+            self._render_now(preserve_scroll)
+
+    def _render_now(self, preserve_scroll: bool) -> None:
         ratio = self._scroll_ratio() if preserve_scroll else 0.0
         font = self.browser.font()
         font.setPointSize(self._font_point_size)
@@ -1127,6 +1167,62 @@ class MarkdownViewer(QWidget):
             self.setWindowTitle(config.APP_DISPLAY_NAME)
         else:
             self.setWindowTitle(f"{name} — {config.APP_DISPLAY_NAME}")
+
+    def _on_link_hovered(self, url: QUrl) -> None:
+        """滑鼠移到連結上：在狀態列顯示目標，移開就恢復原本的檔案資訊。
+
+        外部連結會交給系統瀏覽器開啟，點下去之前看得到要去哪很重要。
+        路徑欄位保持不動（它是可點的「在檔案總管中顯示」，不該被連結蓋掉）。
+
+        注意 QTextBrowser.highlighted 帶的是 QUrl 不是 str；接成 str 會在
+        真的 hover 時因型別不符而完全不觸發（測試才抓到）。本機檔案顯示成
+        原生路徑，看起來才像這個程式的其他地方。
+        """
+        # toLocalFile 回傳的是正斜線；狀態列路徑與其他地方都用 Windows
+        # 原生的反斜線，這裡正規化以免同一列出現兩種風格
+        text = (os.path.normpath(url.toLocalFile()) if url.isLocalFile()
+                else url.toString())
+        if not text:
+            self._update_status()
+            return
+        self.status_label.setText("　·　" + text)
+
+    def _busy_feedback(self, path: str | None):
+        """大檔載入期間的等待游標與提示，用 with 包住會凍結的那段。
+
+        回傳 context manager。檔案夠小就什麼都不做——小檔渲染在百毫秒內，
+        閃一下游標反而是雜訊。
+        """
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _noop():
+            yield
+
+        @contextmanager
+        def _busy():
+            name = os.path.basename(path) if path else ""
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            previous = self.status_label.text()
+            self.status_label.setText(f"　·　正在載入 {name}…")
+            # 這一段會同步凍結，訊息必須在凍結前就畫出來；repaint() 直接重繪，
+            # 不像 processEvents 會重入事件迴圈（重入會在載入途中處理別的
+            # 訊號，本專案已經為此付過代價，見 single_instance 的註解）。
+            self.status_label.repaint()
+            try:
+                yield
+            finally:
+                # 一定要用 finally：例外路徑若沒還原，等待游標會永遠卡住。
+                # FramelessResizer 也在用覆蓋游標，這裡必須成對還原不能清空堆疊。
+                QApplication.restoreOverrideCursor()
+                if self.status_label.text().startswith("　·　正在載入"):
+                    self.status_label.setText(previous)
+
+        try:
+            large = path and os.path.getsize(path) >= config.BUSY_FEEDBACK_BYTES
+        except OSError:
+            large = False
+        return _busy() if large else _noop()
 
     def _update_status(self) -> None:
         if self._tab.meta is None:

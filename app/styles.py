@@ -503,6 +503,11 @@ QLabel#dragGhostBadge[intent="merge"] {
     background-color: $accent;
     border: 1px solid $accent;
 }
+/* 跨視窗合併時，標出分頁會插進哪個縫隙 */
+QFrame#tabInsertMarker {
+    background-color: $accent;
+    border: none;
+}
 QLabel#dragGhostBadge[intent="detach"] {
     color: $accent;
     background-color: $surface;

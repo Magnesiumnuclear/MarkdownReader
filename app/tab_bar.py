@@ -283,6 +283,12 @@ class TabBar(QFrame):
         self._row.setSpacing(0)
         self._row.addStretch(1)
         self._scroll.setWidget(self._strip)
+        # 跨視窗合併時標示插入位置。放在分頁條上當覆蓋層（不進版面），
+        # 否則插入標記會把分頁擠開、每次移動都重新排版。
+        self._insert_marker = QFrame(self._strip)
+        self._insert_marker.setObjectName("tabInsertMarker")
+        self._insert_marker.setFixedWidth(config.TAB_INSERT_MARKER_WIDTH)
+        self._insert_marker.hide()
 
         self.new_button = IconButton(
             "plus", "開新分頁 (Ctrl+T)", self, size=(30, config.TAB_HEIGHT)
@@ -467,10 +473,35 @@ class TabBar(QFrame):
             QApplication.restoreOverrideCursor()
 
     def _dispose_ghost(self) -> None:
+        self.hide_insert_marker()
         if self._ghost is not None:
             self._ghost.hide()
             self._ghost.deleteLater()
             self._ghost = None
+
+    # -- 插入位置指示線 -------------------------------------------------------
+    def show_insert_marker(self, index: int) -> None:
+        """在第 index 個分頁「之前」的縫隙畫一條線（index == 分頁數代表最後）。
+
+        位置用同一套 insert_index_at 算出來的索引，因此指示線與實際落點
+        必然一致——預告不能說一套做一套。
+        """
+        if not self._buttons:
+            x = 0
+        elif index >= len(self._buttons):
+            last = self._buttons[-1]
+            x = last.x() + last.width()
+        else:
+            x = self._buttons[index].x()
+        half = self._insert_marker.width() // 2
+        self._insert_marker.setGeometry(
+            max(0, x - half), 0, self._insert_marker.width(), config.TAB_HEIGHT
+        )
+        self._insert_marker.raise_()
+        self._insert_marker.show()
+
+    def hide_insert_marker(self) -> None:
+        self._insert_marker.hide()
 
     # -- 給視窗管理器的查詢 ---------------------------------------------------
     def insert_index_at(self, global_pos: QPoint) -> int:

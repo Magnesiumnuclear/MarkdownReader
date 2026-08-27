@@ -283,6 +283,64 @@ def section_rendering(args) -> None:
     check("點路徑會以目前分頁的檔案呼叫「在檔案總管中顯示」",
           revealed == [os.path.abspath(main_doc)], str(revealed))
 
+    # 連結 hover 在狀態列顯示目標。QTextBrowser.highlighted 帶的是 QUrl 不是
+    # str——接成 str 不會報錯，只是真的 hover 時完全不觸發（測試才抓到）。
+    meta_line = viewer.status_label.text()
+    viewer.browser.highlighted.emit(QUrl("https://example.com/docs"))
+    pump(120)
+    check("hover 外部連結時狀態列顯示網址",
+          "https://example.com/docs" in viewer.status_label.text(),
+          viewer.status_label.text())
+    check("hover 時不覆蓋可點的路徑欄位",
+          viewer.status_path_label.text() == os.path.abspath(main_doc))
+    viewer.browser.highlighted.emit(
+        QUrl.fromLocalFile(os.path.join("D:", os.sep, "docs", "note.md")))
+    pump(120)
+    check("hover 本機連結顯示原生反斜線路徑",
+          "D:\\docs\\note.md" in viewer.status_label.text(),
+          viewer.status_label.text())
+    viewer.browser.highlighted.emit(QUrl())
+    pump(120)
+    check("移開連結後恢復檔案資訊", viewer.status_label.text() == meta_line)
+
+    # 大檔的忙碌回饋：等待游標與「正在載入」必須在凍結『之前』就畫出來，
+    # 否則使用者看到的仍是數百毫秒的無反應。用 repaint 當取樣點。
+    big_doc = os.path.join(PROJECT_ROOT, "tools", "CHANGELOG.md")
+    if os.path.isfile(big_doc):
+        observed = {"cursor": False, "text": ""}
+        original_repaint = viewer.status_label.repaint
+
+        def sampling_repaint(*args, **kwargs):
+            cursor = QApplication.overrideCursor()
+            if cursor is not None and cursor.shape() == Qt.CursorShape.WaitCursor:
+                observed["cursor"] = True
+            observed["text"] = viewer.status_label.text()
+            return original_repaint(*args, **kwargs)
+
+        viewer.status_label.repaint = sampling_repaint
+        viewer.open_path(big_doc, new_tab=True)
+        pump(700)
+        viewer.status_label.repaint = original_repaint
+        check("大檔渲染前就設好等待游標", observed["cursor"])
+        check("大檔渲染前就顯示「正在載入」",
+              "正在載入" in observed["text"], observed["text"])
+        check("渲染結束後游標已還原（try/finally）",
+              QApplication.overrideCursor() is None)
+
+        # 小檔不該閃忙碌提示（低於門檻時渲染在百毫秒內，閃一下只是雜訊）
+        calls = {"n": 0}
+        plain_repaint = viewer.status_label.repaint
+
+        def counting_repaint(*args, **kwargs):
+            calls["n"] += 1
+            return plain_repaint(*args, **kwargs)
+
+        viewer.status_label.repaint = counting_repaint
+        viewer.open_path(other_doc, new_tab=True)
+        pump(300)
+        viewer.status_label.repaint = plain_repaint
+        check("小檔不觸發忙碌回饋", calls["n"] == 0, str(calls["n"]))
+
     viewer.close()
     pump(300)
     QSettings(config.ORG_NAME, config.APP_NAME).clear()
@@ -992,6 +1050,27 @@ def section_tab_dnd(args) -> None:
     hit = manager.drop_target_at(drop, exclude=new_window)
     check("合併：命中測試找到目標視窗與插入位置",
           hit is not None and hit[0] is viewer and hit[1] == 0, str(hit))
+
+    # 插入位置指示線：徽章說「合併」但不說插在哪，這條線補上落點。
+    # 它與實際落點共用同一個 drop_target_at 結果，不會說一套做一套。
+    marker = viewer.tab_bar._insert_marker
+    check("平常插入指示線是隱藏的", not marker.isVisible())
+    intent = new_window._drag_intent_at(drop, False)
+    check("拖到目標分頁列時預告為合併", intent == "merge", intent)
+    check("目標視窗顯示插入指示線", marker.isVisible())
+    check("來源視窗不顯示插入指示線",
+          not new_window.tab_bar._insert_marker.isVisible())
+    first_button = viewer.tab_bar._buttons[0]
+    check("指示線畫在插入處（第一個分頁左緣）",
+          abs(marker.x() - max(0, first_button.x() - marker.width() // 2)) <= 1,
+          f"{marker.x()} vs {first_button.x()}")
+    new_window._drag_intent_at(QPoint(1500, 950), True)
+    check("游標離開目標後指示線收起", not marker.isVisible())
+    # 拖曳被取消（分頁列重建、Esc 等）也不能留下殘影
+    new_window._drag_intent_at(drop, False)
+    new_window._clear_insert_markers()
+    check("取消拖曳後所有視窗的指示線都清掉", not marker.isVisible())
+
     new_window._on_tab_detached(0, drop)
     pump(400)
     check("合併：分頁插到目標視窗最前面", names(viewer) == ["d1.md", "d0.md", "d2.md"],
