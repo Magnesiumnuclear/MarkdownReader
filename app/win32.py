@@ -1,7 +1,8 @@
 """Windows 原生 API 的薄封裝（ctypes）。
 
 只包含幾個 Qt 無法妥善處理、或原生作法明顯較佳的操作。
-所有函式在非 Windows 平台或呼叫失敗時都會安靜地回傳 False，不影響主流程。
+所有函式在非 Windows 平台或呼叫失敗時都會安靜地退回中性值（動作類回傳 False，
+查詢類回傳 0），不影響主流程。
 """
 
 from __future__ import annotations
@@ -92,6 +93,14 @@ if IS_WINDOWS:
     _user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
     _user32.AttachThreadInput.restype = wintypes.BOOL
     _kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+    # WindowFromPoint 的 POINT 是「傳值」的結構參數，不是指標。沒有 argtypes 的話
+    # ctypes 會把它拆成兩個 int 推上堆疊，函式讀到的座標是垃圾、回傳的視窗代碼
+    # 也是垃圾——和檔頭說的 HWND 截斷是同一類問題，一樣不會設定 LastError。
+    _user32.WindowFromPoint.argtypes = [wintypes.POINT]
+    _user32.WindowFromPoint.restype = wintypes.HWND
+    _user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    _user32.GetAncestor.restype = wintypes.HWND
 else:  # pragma: no cover - 只在非 Windows 平台走到
     wintypes = None
     _user32 = None
@@ -101,6 +110,9 @@ else:  # pragma: no cover - 只在非 Windows 平台走到
 # GetWindowLongPtrW 用的常數
 _GWL_EXSTYLE = -20
 _WS_EX_TOPMOST = 0x00000008
+
+# GetAncestor 用的常數
+_GA_ROOT = 2
 
 
 def set_app_user_model_id(app_id: str = config.APP_USER_MODEL_ID) -> bool:
@@ -155,6 +167,29 @@ def is_topmost(window_id: int) -> bool:
         return bool(style & _WS_EX_TOPMOST)
     except Exception:
         return False
+
+
+def top_level_hwnd_at(x: int, y: int) -> int:
+    """回傳原生座標 (x, y) 底下最上層視窗的 HWND，問不出來回 0。
+
+    要繞過 Qt 自己的 QApplication.topLevelAt，是因為它在 Windows 上走的是
+    ChildWindowFromPointEx(desktop, pt, CWP_SKIPINVISIBLE)——只跳過隱藏的視窗，
+    不跳過 WS_EX_TRANSPARENT 的視窗，於是拖曳幽靈（相對跟隨之後永遠蓋在游標
+    正下方的那個頂層視窗）會被當成命中結果。WindowFromPoint 會跳過
+    WS_EX_TRANSPARENT，游標壓在幽靈上時仍然答得出底下真正的視窗。
+    實測 60 個落在幽靈內的點：topLevelAt 抓到幽靈 60/60，這裡 0/60。
+    """
+    if not IS_WINDOWS:
+        return 0
+    try:
+        handle = _user32.WindowFromPoint(wintypes.POINT(int(x), int(y)))
+        if not handle:
+            return 0
+        # 回傳的可能是子視窗（有些元件有自己的原生視窗），要爬到頂層才對得上
+        # QWidget.find——它只認得 Qt 頂層視窗的代碼
+        return int(_user32.GetAncestor(handle, _GA_ROOT) or handle)
+    except Exception:
+        return 0
 
 
 def force_foreground(window_id: int) -> bool:

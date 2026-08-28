@@ -1,4 +1,4 @@
-"""多視窗管理：Chrome 式的分頁拆分與合併。
+"""多視窗管理：瀏覽器式的分頁拆分與合併。
 
 單一「行程」、多個視窗。拆出去的分頁仍活在同一個行程裡，DocumentTab（含已
 渲染好的 QTextBrowser）直接搬到另一個視窗，不需要序列化任何狀態。
@@ -20,8 +20,64 @@ from __future__ import annotations
 
 from PyQt6.QtCore import QObject, QPoint, QRect
 
-from . import config
+from . import config, win32
 from .viewer import MarkdownViewer
+
+
+def _native_point(global_pos: QPoint) -> tuple[int, int] | None:
+    """邏輯座標 -> 原生像素座標。
+
+    不能全域乘一個 devicePixelRatio：Qt 的高 DPI 換算是「每個螢幕各自縮放、
+    原點守恆」（QHighDpiScaling 以螢幕自己的左上角為原點縮放它的矩形），
+    多螢幕不同縮放時，只有把點所在那個螢幕的原點與縮放拿出來算才會對。
+    """
+    from PyQt6.QtGui import QGuiApplication
+
+    screen = QGuiApplication.screenAt(global_pos) or QGuiApplication.primaryScreen()
+    if screen is None:
+        return None
+    ratio = screen.devicePixelRatio()
+    origin = screen.geometry().topLeft()
+    return (
+        round(origin.x() + (global_pos.x() - origin.x()) * ratio),
+        round(origin.y() + (global_pos.y() - origin.y()) * ratio),
+    )
+
+
+def top_level_widget_at(global_pos: QPoint):
+    """游標下最上層的本程式視窗；是別的程式的視窗、或問不出來時回 None。
+
+    不直接用 QApplication.topLevelAt：拖曳幽靈維持「按下時抓的那一點在游標
+    底下」（見 tab_bar.DragGhost），因此它必然蓋住游標，而 Qt 的版本會把它
+    當成命中結果——見 win32.top_level_hwnd_at 的說明。
+
+    最後那道 frameGeometry 檢查是座標換算的保險。換算若在某種多螢幕組合下
+    失準，這裡會發現解出來的視窗根本不含這個點而回 None，呼叫端就退回既有的
+    幾何掃描——寧可退化成修正前的行為，也不能拿一個錯的視窗當答案。
+
+    整段包在 try 裡：這個函式在 mouseMoveEvent 的呼叫鏈上跑，PyQt6 對虛擬
+    函式裡漏出去的例外是直接中止行程（0xC0000409），沒有第二次機會。
+    """
+    from PyQt6.QtWidgets import QApplication, QWidget
+
+    try:
+        if not win32.IS_WINDOWS:
+            # 非 Windows 只剩 Qt 的版本可用（幽靈仍可能被當成命中結果）。
+            # 這個程式的目標平台是 Windows，不為此再養一套 X11/Cocoa 的路徑。
+            return QApplication.topLevelAt(global_pos)
+        native = _native_point(global_pos)
+        if native is None:
+            return None
+        handle = win32.top_level_hwnd_at(*native)
+        if not handle:
+            return None
+        widget = QWidget.find(handle)
+        if widget is None:
+            return None
+        window = widget.window()
+        return window if window.frameGeometry().contains(global_pos) else None
+    except Exception:
+        return None
 
 
 class WindowManager(QObject):
@@ -123,15 +179,18 @@ class WindowManager(QObject):
         否則永遠沒辦法把分頁合併進單分頁的視窗。
         由上而下依「最後作用優先」檢查，重疊時取使用者最近碰過的那個。
         """
-        from PyQt6.QtWidgets import QApplication
-
         candidates = [w for w in self._windows if w is not exclude and w.isVisible()]
 
         # 【以真實堆疊順序解決重疊】
         # 依登記順序掃描的話，被完全蓋住的視窗可能先命中，分頁就合併進一個
         # 使用者根本看不到的視窗。先問視窗系統游標下最上層的是誰：是候選者
         # 就只考慮它；是被排除的來源視窗就當作沒有目標（放在自己視窗上＝拆分）。
-        top = QApplication.topLevelAt(global_pos)
+        #
+        # 【這裡不能用 QApplication.topLevelAt】拖曳幽靈永遠蓋在游標底下，Qt 會
+        # 回傳幽靈；它既不是 exclude 也不在候選裡，上面兩條規則會整段失效而
+        # 安靜退回下面的幾何掃描——「合併進看不見的視窗」這個 bug 就原封不動
+        # 回來了，而且因為幾何掃描有時剛好猜對，症狀會是時好時壞。
+        top = top_level_widget_at(global_pos)
         if top is not None:
             if top is exclude:
                 return None

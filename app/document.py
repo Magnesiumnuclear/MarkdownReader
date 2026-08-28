@@ -182,9 +182,26 @@ def _build_converter(theme: str) -> markdown.Markdown:
     return markdown.Markdown(extensions=extensions, extension_configs=configs)
 
 
+# 每個主題各留一個轉換器實例重複使用。建立轉換器要載入並串接八個擴充
+# （extra、toc、codehilite、本專案的 QtRichTextExtension…），每次渲染都重建
+# 是純粹的浪費——主題只有淺色與深色兩種，字典最多兩筆。
+#
+# 【一定要 reset()】
+# Markdown 實例會累積狀態：註腳、參考連結、toc、htmlStash（本專案用來取出
+# fenced code 再包成表格的那個）。不重設就重用，第二份文件會帶著第一份的
+# 註腳與參考連結，而且 htmlStash 的編號會對不上，程式碼區塊會整段錯位。
+_CONVERTERS: dict[str, markdown.Markdown] = {}
+
+
 def markdown_to_html(text: str, theme: str) -> str:
     """把 Markdown 原始碼轉成 Qt 相容的 HTML 片段。"""
-    return _build_converter(theme).convert(text)
+    converter = _CONVERTERS.get(theme)
+    if converter is None:
+        converter = _build_converter(theme)
+        _CONVERTERS[theme] = converter
+    else:
+        converter.reset()
+    return converter.convert(text)
 
 
 def _page(body: str) -> str:

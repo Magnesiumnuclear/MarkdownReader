@@ -486,7 +486,7 @@ class MarkdownViewer(QWidget):
         return tab
 
     def adopt_tab(self, tab: DocumentTab, index: int | None = None) -> None:
-        """收養從別的視窗搬來的分頁，並切換到它（和 Chrome 一致）。
+        """收養從別的視窗搬來的分頁，並切換到它（和瀏覽器一致）。
 
         主題可能和來源視窗不同：一律標記 dirty，activate_tab 會用本視窗的
         主題重新渲染，不然會出現「深色視窗裡有一頁是淺色」。
@@ -795,6 +795,7 @@ class MarkdownViewer(QWidget):
         self.tab_bar.tabMoved.connect(self.move_tab)
         self.tab_bar.detachRequested.connect(self._on_tab_detached)
         self.tab_bar.drop_intent_probe = self._drag_intent_at
+        self.tab_bar.drag_ended = self._clear_insert_markers
         self.tab_bar.newTabRequested.connect(self.open_dialog)
 
         self.settings_panel.themeModeChanged.connect(self.set_theme_mode)
@@ -1559,6 +1560,10 @@ class MarkdownViewer(QWidget):
         super().moveEvent(event)
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        # 拖曳中關窗（中鍵按在被拖的分頁上、Ctrl+W）不會經過放開事件，
+        # 要在這裡收掉手勢，否則全域拖曳游標與置頂的幽靈視窗會殘留
+        # （詳見 tab_bar.cancel_active_drag 的說明）
+        self.tab_bar.cancel_active_drag()
         self._settings.setValue(config.KEY_MAXIMIZED, self.isMaximized())
         if not self.isMaximized():
             self._settings.setValue(config.KEY_GEOMETRY, self.saveGeometry())

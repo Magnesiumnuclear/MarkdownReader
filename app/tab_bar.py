@@ -7,7 +7,7 @@
 未選取的分頁融入分頁列底色。分頁列永遠顯示（含單一分頁）——單分頁若隱藏，
 就沒有分頁可以抓，永遠拖不去別的視窗合併。
 
-【拖曳（比照 Chrome）】
+【拖曳（比照瀏覽器）】
 - 在列內左右拖 -> 即時重排，每跨過一個鄰居就交換位置並發出 tabMoved。
 - 拖出列外（任一方向超過 TEAR_OFF_MARGIN）再放開 -> 發出 detachRequested，
   由視窗層決定是「拆成新視窗」還是「合併進游標下的另一個視窗」。
@@ -40,7 +40,7 @@ from . import config, styles
 from .title_bar import IconButton
 
 # 離開分頁列矩形四周多少邏輯像素才算「撕下來」。太小會誤觸，
-# 太大則拖不出去；Chrome 實測大約就是這個量級。
+# 太大則拖不出去；瀏覽器實測大約就是這個量級。
 TEAR_OFF_MARGIN = 48
 
 
@@ -49,13 +49,18 @@ class DragGhost(QWidget):
     放開會發生什麼事（實際回饋就是這樣來的）。
 
     要點：
-    - WindowTransparentForInput + 游標偏移 (12,12)：幽靈本身是一個頂層視窗，
-      不偏移的話游標點會落在幽靈裡，合併的命中測試（topLevelAt）會抓到
-      幽靈而不是底下的目標視窗。
+    - 縮影維持「按下時抓的那一點在游標底下」（比照瀏覽器），因此幽靈**必然**
+      蓋住游標。合併的命中測試不能再用 QApplication.topLevelAt——它會回傳幽靈，
+      而幽靈既不是來源視窗也不是候選視窗，堆疊判定會整段失效、安靜退回幾何
+      掃描，分頁就併進一個被蓋住、使用者看不見的視窗。改由
+      window_manager.top_level_widget_at 用原生 WindowFromPoint 穿過幽靈。
+    - WindowTransparentForInput 從此是**功能相依而不是視覺選擇**：它就是上面那個
+      WS_EX_TRANSPARENT 的唯一來源（只留 WA_TransparentForMouseEvents 產生不出
+      這個 exstyle），拿掉之後連 WindowFromPoint 也會抓到幽靈。
+    - 縮影必須是版面的第一個項目、AlignLeft、外層 margins 為 0：抓取點是相對
+      縮影左上角量的，徽章變寬時縮影一旦跟著位移，跟隨就整個歪掉。
     - ShowWithoutActivating：不能搶焦點，搶了拖曳手勢就斷了。
     """
-
-    OFFSET = QPoint(12, 12)
 
     # 下一步預告的文案。key 與 viewer 的 _drag_intent_at 回傳值對應。
     INTENT_TEXT = {
@@ -64,13 +69,21 @@ class DragGhost(QWidget):
         "none": "無動作",
     }
 
-    def __init__(self, pixmap, theme: str) -> None:
+    def __init__(self, pixmap, theme: str, grab_offset: QPoint) -> None:
         super().__init__(
             None,
             Qt.WindowType.ToolTip
             | Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.WindowTransparentForInput,
+        )
+        # 抓取點夾在縮影矩形內。offset 是按下當下量的，縮影卻是第一次拖出列外
+        # 才 grab 的；中間分頁寬度若變過（關閉鈕出現／消失就差一截），沒夾住的話
+        # 幽靈會整個偏到游標外面去。
+        size = pixmap.deviceIndependentSize()
+        self._grab_offset = QPoint(
+            max(0, min(grab_offset.x(), int(size.width()) - 1)),
+            max(0, min(grab_offset.y(), int(size.height()) - 1)),
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
@@ -84,9 +97,11 @@ class DragGhost(QWidget):
         column = QVBoxLayout(self)
         column.setContentsMargins(0, 0, 0, 0)
         column.setSpacing(4)
-        snapshot = QLabel(self)
-        snapshot.setPixmap(pixmap)
-        column.addWidget(snapshot, 0, Qt.AlignmentFlag.AlignLeft)
+        # 留成屬性讓回歸測試量得到它的位置：相對跟隨的前提是「縮影左上角＝幽靈
+        # 左上角」，這件事只靠註解鎖不住（改成 AlignHCenter 就悄悄歪掉）。
+        self._snapshot = QLabel(self)
+        self._snapshot.setPixmap(pixmap)
+        column.addWidget(self._snapshot, 0, Qt.AlignmentFlag.AlignLeft)
         self._badge = QLabel(self)
         self._badge.setObjectName("dragGhostBadge")
         self._intent = ""
@@ -104,9 +119,24 @@ class DragGhost(QWidget):
         self._badge.style().unpolish(self._badge)
         self._badge.style().polish(self._badge)
         self.adjustSize()
+        # 【合併時幽靈要讓路】相對跟隨後幽靈蓋在游標正下方，而合併瞄準的唯一
+        # 落點回饋——目標分頁列上的插入指示線——就在游標底下。實測抓分頁中央
+        # 拖去合併時，0.9 的不透明度會把指示線 100% 蓋掉，使用者根本瞄不了。
+        # 合併時降到 0.45：指示線與目標分頁列透出來、徽章仍看得清。
+        self.setWindowOpacity(0.45 if intent == "merge" else 0.9)
+
+    def apply_theme(self, theme: str) -> None:
+        """拖曳途中主題被切換（例如 Windows 排程的自動深色模式）時重套樣式，
+        否則徽章配色會停在舊主題直到放開。"""
+        self.setStyleSheet(styles.build_ghost_qss(theme))
 
     def follow(self, global_pos: QPoint) -> None:
-        self.move(global_pos + self.OFFSET)
+        """讓按下時抓的那一點一直待在游標底下（瀏覽器的行為）。
+
+        不需要補償縮影在幽靈內的位置：縮影靠左貼齊、是版面第一個項目、外層
+        margins 為 0，它的左上角恆等於幽靈的左上角（見類別說明）。
+        """
+        self.move(global_pos - self._grab_offset)
 
 
 class TabButton(QFrame):
@@ -130,6 +160,7 @@ class TabButton(QFrame):
         self._active = active
         self._theme = theme
         self._press_pos: QPoint | None = None
+        self._grab_offset: QPoint | None = None
         self._dragging = False
         self.setObjectName("tabActive" if active else "tab")
         self.setFixedHeight(config.TAB_HEIGHT)
@@ -194,8 +225,15 @@ class TabButton(QFrame):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
-            # 和 Chrome 一致：按下立刻切換到這個分頁，之後才可能進入拖曳
+            # 和瀏覽器一致：按下立刻切換到這個分頁，之後才可能進入拖曳
             self._press_pos = event.globalPosition().toPoint()
+            # 抓取點在按下這一刻就定案，不能等要建幽靈時再 mapFromGlobal 現算：
+            # 幽靈是「第一次拖出列外」才建立的，在那之前使用者可能已經在列內
+            # 重排過，_move_button 會把按鈕挪到別的槽位、x 瞬間跳走而游標不跳，
+            # 那時候算出來的相對點已經不是使用者抓的那一點。
+            # （_label 帶 WA_TransparentForMouseEvents，事件直接投遞到本體，
+            #   event.position() 已經是這顆分頁的區域座標，不需要再 map。）
+            self._grab_offset = event.position().toPoint()
             self._dragging = False
             self.clicked.emit()
             event.accept()
@@ -225,6 +263,7 @@ class TabButton(QFrame):
         if event.button() == Qt.MouseButton.LeftButton and self._press_pos is not None:
             was_dragging = self._dragging
             self._press_pos = None
+            self._grab_offset = None
             self._dragging = False
             if was_dragging:
                 self.dragReleased.emit(event.globalPosition().toPoint())
@@ -232,8 +271,20 @@ class TabButton(QFrame):
             return
         super().mouseReleaseEvent(event)
 
+    def grab_offset(self) -> QPoint:
+        """按下時游標落在這顆分頁內的位置；拖曳幽靈靠它維持相對跟隨。
+
+        回傳副本而不是本體：QPoint 可變，幽靈那邊還會夾值。取不到時回
+        QPoint() 而不是 None——None 進到 follow() 的減法會在 mouseMoveEvent
+        的呼叫鏈上拋 TypeError，那在 PyQt6 是直接中止行程。
+        """
+        return QPoint(self._grab_offset) if self._grab_offset is not None else QPoint()
+
     def cancel_drag(self) -> None:
+        # 抓取點和 _press_pos 同生共死：留下一個屬於舊按鈕的抓取點，下一次
+        # 幽靈重建就會拿錯世代的座標去定位
         self._press_pos = None
+        self._grab_offset = None
         self._dragging = False
 
 
@@ -263,6 +314,10 @@ class TabBar(QFrame):
         # 由視窗層注入：callable(global_pos, outside_band) -> "merge"|"detach"|"none"。
         # 分頁列不認識其他視窗，「放開會發生什麼」只有視窗層答得出來。
         self.drop_intent_probe = None
+        # 由視窗層注入：callable()，拖曳結束（放開或取消）時通知。分頁列只藏得了
+        # 自己那條插入指示線，別的視窗上的要靠視窗層去清——少了這個通知，
+        # 「拖去 B 畫了線、拖回自己列上放開」會讓 B 的指示線永久殘留。
+        self.drag_ended = None
 
         outer = QHBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -326,7 +381,7 @@ class TabBar(QFrame):
                 self._row.insertWidget(index, button)
                 self._buttons.append(button)
 
-        # 永遠顯示（比照 Chrome）。原本單分頁時隱藏，但那樣「單開一個 .md」
+        # 永遠顯示（比照瀏覽器）。原本單分頁時隱藏，但那樣「單開一個 .md」
         # 就沒有分頁可以抓，永遠拖不去別的視窗合併。
         self.setVisible(len(entries) > 0)
         if 0 <= active < len(self._buttons):
@@ -352,6 +407,9 @@ class TabBar(QFrame):
         self.new_button.apply_theme(theme)
         for button in self._buttons:
             button.apply_theme(theme)
+        # 拖曳進行中主題可能被系統切換（自動深色模式），幽靈也要跟上
+        if self._ghost is not None:
+            self._ghost.apply_theme(theme)
 
     # -- 拖曳 ----------------------------------------------------------------
     def _on_drag_started(self, button: TabButton) -> None:
@@ -384,15 +442,24 @@ class TabBar(QFrame):
         # 容忍帶內雖不能拆分，仍可能合併進相鄰視窗，也需要預告。
         if not on_bar:
             if self._ghost is None:
-                self._ghost = DragGhost(button.grab(), self._theme)
+                self._ghost = DragGhost(
+                    button.grab(), self._theme, button.grab_offset()
+                )
             intent = "none"
             if self.drop_intent_probe is not None:
                 intent = self.drop_intent_probe(global_pos, outside_band)
             self._ghost.set_intent(intent)
-            self._ghost.show()
+            # 先定位再顯示：反過來的話，新建的幽靈會先在預設位置（螢幕左上角）
+            # 閃現一幀才跳到游標下
             self._ghost.follow(global_pos)
+            self._ghost.show()
         elif self._ghost is not None:
             self._ghost.hide()
+            # 回到本列也要探一次：剛才可能在別的視窗畫了插入指示線，游標在
+            # 本列上時 drop_target_at 會回 None，探測順帶把所有指示線清掉。
+            # 只在幽靈存在（曾離開過本列）時才付這個成本，純列內重排不受影響。
+            if self.drop_intent_probe is not None:
+                self.drop_intent_probe(global_pos, False)
 
         if outside_band:
             if not self._torn_off:
@@ -463,6 +530,16 @@ class TabBar(QFrame):
             return
         self.detachRequested.emit(index, global_pos, outside_band)
 
+    def cancel_active_drag(self) -> None:
+        """取消進行中的拖曳手勢（給視窗層在 closeEvent 呼叫）。
+
+        拖曳中把視窗關掉（中鍵按在被拖的分頁上、Ctrl+W）不會經過放開事件，
+        少了這一步會留下兩個殘留：全域的拖曳游標永遠不會被還原（其餘所有
+        視窗從此都顯示拖曳游標），以及無父件、置頂的幽靈視窗——它和已關閉
+        視窗互相參照成環，引用計數收不掉，會一直掛在畫面最上層等世代 GC。
+        """
+        self._cancel_drag()
+
     def _cancel_drag(self) -> None:
         if self._drag_button is not None:
             self._drag_button.cancel_drag()
@@ -478,6 +555,10 @@ class TabBar(QFrame):
             self._ghost.hide()
             self._ghost.deleteLater()
             self._ghost = None
+            # 拖曳結束的單一收斂點：放開（不論落點）與取消都會經過這裡，
+            # 通知視窗層把「其他視窗」的插入指示線一併清掉
+            if self.drag_ended is not None:
+                self.drag_ended()
 
     # -- 插入位置指示線 -------------------------------------------------------
     def show_insert_marker(self, index: int) -> None:

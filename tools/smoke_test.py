@@ -347,6 +347,133 @@ def section_rendering(args) -> None:
 
 
 # ===========================================================================
+# 區塊：渲染快取
+# ===========================================================================
+def section_render_cache(args) -> None:
+    """HTML 快取與轉換器重用——重點是「快得對」，不只是快。
+
+    轉換器重用最危險的是狀態累積：Markdown 實例會留住註腳、參考連結、toc
+    與 htmlStash（本專案用來把 fenced code 取出再包成表格的那個）。少了
+    reset()，第二份文件會帶著第一份的註腳、程式碼區塊會整段錯位。因此這裡
+    比對的是「與全新轉換器逐字元相同」，而不是「看起來沒壞」。
+    """
+    import re
+
+    from PyQt6.QtCore import QEventLoop, QSettings, Qt, QTimer
+    from PyQt6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+
+    def pump(ms=250):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+        for _ in range(3):
+            app.processEvents()
+
+    from app import document
+    from app.viewer import MarkdownViewer
+
+    # 測試文件用 join 組出來（NL 即換行），避免多行字面值在編輯過程被
+    # 跳脫層弄斷；內容本身要能同時觸發註腳、參考連結與程式碼區塊三種
+    # 會殘留在轉換器狀態裡的東西。
+    NL = chr(10)
+    doc_a = NL.join([
+        "# 文件 A", "", "有註腳[^a1] 與另一個[^a2]。", "",
+        "參考 [x][r1]。", "", "[r1]: https://example.com/one", "",
+        "```python", "def alpha():", "    return 1", "```", "",
+        "[^a1]: 註腳 A1", "[^a2]: 註腳 A2", "",
+    ])
+    doc_b = NL.join([
+        "# 文件 B", "", "不同註腳[^b1]。", "", "[y][rb]", "",
+        "[rb]: https://example.org/b", "",
+        "```javascript", "const beta = () => 2;", "```", "",
+        "[^b1]: 註腳 B1", "",
+    ])
+
+    def visible(markup: str) -> str:
+        # pygments 會把 def / alpha 拆進不同 span，比對可見文字才有意義
+        return re.sub(r"<[^>]+>", "", markup)
+
+    for theme in ("dark", "light"):
+        fresh_a = document._build_converter(theme).convert(doc_a)
+        fresh_b = document._build_converter(theme).convert(doc_b)
+        document._CONVERTERS.clear()
+        seq = [document.markdown_to_html(d, theme)
+               for d in (doc_a, doc_b, doc_a, doc_b, doc_a)]
+        check(f"[{theme}] 重用轉換器：A 與全新結果逐字元相同",
+              all(x == fresh_a for x in seq[0::2]))
+        check(f"[{theme}] 重用轉換器：B 與全新結果逐字元相同",
+              all(x == fresh_b for x in seq[1::2]))
+        check(f"[{theme}] 第二份文件沒沾到前一份的註腳", "註腳 A1" not in seq[1])
+        check(f"[{theme}] 第二份文件沒沾到前一份的參考連結",
+              "example.com/one" not in seq[1])
+        text_a, text_b = visible(seq[0]), visible(seq[1])
+        check(f"[{theme}] 程式碼區塊沒有跨文件錯位",
+              "def alpha():" in text_a and "const beta" in text_b
+              and "const beta" not in text_a)
+
+    document._CONVERTERS.clear()
+    dark_html = document.markdown_to_html(doc_a, "dark")
+    check("深淺色的高亮輸出不同（顏色寫死在 inline style）",
+          dark_html != document.markdown_to_html(doc_a, "light"))
+    check("換過主題後再轉回來仍與全新一致",
+          document.markdown_to_html(doc_a, "dark") == dark_html)
+
+    # --- HTML 快取 ---
+    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    big = os.path.join(PROJECT_ROOT, "tools", "CHANGELOG.md")
+    target = big if os.path.isfile(big) else README
+    viewer = MarkdownViewer(target)
+    viewer.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+    viewer.resize(1000, 700)
+    viewer.show()
+    pump(600)
+
+    tab = viewer._tab
+    check("渲染後留下該主題的快取", viewer._theme in tab._html_cache)
+    first_html = tab.build_html(viewer._theme)
+    check("同一主題再取是同一個物件（命中而非重算）",
+          tab.build_html(viewer._theme) is first_html)
+
+    other_theme = "light" if viewer._theme == "dark" else "dark"
+    check("換主題不會命中舊快取",
+          tab.build_html(other_theme) is not first_html)
+    check("兩個主題各留一份，切回原主題直接命中",
+          tab.build_html(viewer._theme) is first_html)
+
+    # 內容變了（重新載入）必須自動失效：鍵是文字物件的識別
+    tab.text = tab.text + NL + NL + "新增一段" + NL
+    check("內容改變後快取自動失效",
+          tab.build_html(viewer._theme) is not first_html)
+
+    # 字級縮放不該重跑 Markdown 轉換
+    conversions = {"n": 0}
+    original_convert = document.markdown_to_html
+
+    def counting_convert(text, theme):
+        conversions["n"] += 1
+        return original_convert(text, theme)
+
+    document.markdown_to_html = counting_convert
+    try:
+        viewer._render()          # 暖機，確保目前內容已進快取
+        conversions["n"] = 0
+        viewer.zoom_in()
+        pump(400)
+        viewer.zoom_out()
+        pump(400)
+    finally:
+        document.markdown_to_html = original_convert
+    check("字級縮放不重跑 Markdown 轉換（快取命中）",
+          conversions["n"] == 0, f"轉換了 {conversions['n']} 次")
+
+    viewer.close()
+    pump(300)
+    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+
+
+# ===========================================================================
 # 區塊：分頁操作
 # ===========================================================================
 def section_tabs(args) -> None:
@@ -937,7 +1064,7 @@ def section_teardown(args) -> None:
 
 # ===========================================================================
 def section_tab_dnd(args) -> None:
-    """Chrome 式分頁操作：拖曳排序、拆分成新視窗、合併回別的視窗。
+    """瀏覽器式分頁操作：拖曳排序、拆分成新視窗、合併回別的視窗。
 
     這些檢查走 viewer 層的 API（move_tab / _on_tab_detached / drop_target_at），
     拖曳手勢本身另以合成滑鼠事件驗證重排。座標的教訓：測「拖到空白處」時，
@@ -1204,6 +1331,11 @@ def section_tab_dnd(args) -> None:
     # 回報 3：兩窗相鄰（間距 20px < 容忍帶 48px）、分頁列同高，橫向拖過去
     # 放開在對方分頁列上。舊版撕下判定只看垂直、且放開點不重新判定，
     # 這個幾何下 torn 永遠是 False，放開什麼都不做。
+    #
+    # 建 neighbor 前再清一次工作階段：前段那些延遲關閉的視窗會在上面的
+    # pump 期間把 session 寫回登錄檔，neighbor 建構時吃到還原分頁的話，
+    # 這條會以「tabs=4」的樣子偽紅（實測 11 輪出現過 1 次）。
+    QSettings(config.ORG_NAME, config.APP_NAME).clear()
     neighbor = manager3.create_window(docs[1])
     pump(400)
     neighbor.move(solo.frameGeometry().right() + 20, 80)
@@ -1277,11 +1409,361 @@ def section_tab_dnd(args) -> None:
     for w in manager3.windows():
         w.close()
     pump(400)
+
+    # =====================================================================
+    # 幽靈相對抓取位置跟隨（2026-08-27）
+    # =====================================================================
+    # 舊行為是固定偏移（游標 +12,+12），抓在分頁哪裡都一樣；改成「按下時抓的
+    # 那一點永遠在游標底下」（瀏覽器行為）。副作用是幽靈從此蓋住游標，合併的
+    # 命中測試不能再用 QApplication.topLevelAt——最後那組測試就是在守這件事。
+    from PyQt6.QtCore import QRect
+
+    from app import window_manager as _wm
+
+    def press_at(button, local: QPoint) -> QPoint:
+        """在 button 的區域座標 local 按下，回傳對應的全域點。
+
+        直接 sendEvent 給 button（沿用本區塊既有手勢的作法），因此不經過
+        命中測試——關閉鈕不會把事件吃掉，可以測到靠近右緣的抓取點。
+        """
+        gp = button.mapToGlobal(local)
+        app.sendEvent(button, QMouseEvent(
+            QEvent.Type.MouseButtonPress, QPointF(local), QPointF(gp),
+            Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier))
+        app.processEvents()
+        return gp
+
+    def move_to(button, gp: QPoint) -> None:
+        app.sendEvent(button, QMouseEvent(
+            QEvent.Type.MouseMove, QPointF(button.mapFromGlobal(gp)), QPointF(gp),
+            Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier))
+        app.processEvents()
+
+    def release_at(button, gp: QPoint) -> None:
+        app.sendEvent(button, QMouseEvent(
+            QEvent.Type.MouseButtonRelease, QPointF(button.mapFromGlobal(gp)),
+            QPointF(gp), Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier))
+        app.processEvents()
+
+    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    manager4 = WindowManager()
+    host = manager4.create_window(docs[0])
+    host.move(120, 120)
+    host.open_path(docs[1], new_tab=True)
+    pump(400)
+    host.activate_tab(0)
+    pump(200)
+
+    bar = host.tab_bar
+    btn = bar._buttons[0]
+    bar_bottom = bar.mapToGlobal(bar.rect().bottomLeft()).y()
+
+    def tear_and_measure(local: QPoint, drop_y_offset: int):
+        """在 local 按下、往下拖出分頁列，回傳 (幽靈, 落點, 抓取點)。
+
+        至少走三步：第一步才跨過 startDragDistance 進入拖曳，第二步之後
+        幽靈才會被建立。全部走完再量，避免量到還沒定位的那一幀。
+        """
+        start = press_at(btn, local)
+        end = QPoint(start.x() + 30, bar_bottom + drop_y_offset)
+        for step in (1, 2, 3):
+            move_to(btn, QPoint(
+                start.x() + 10 * step,
+                start.y() + (end.y() - start.y()) * step // 3,
+            ))
+        move_to(btn, end)
+        return bar._ghost, end, local
+
+    # --- 抓在左上角 ---------------------------------------------------------
+    ghost, end, local = tear_and_measure(QPoint(5, 5), 200)
+    check("撕下後幽靈存在且可見", ghost is not None and ghost.isVisible())
+    delta_a = None
+    if ghost is not None:
+        top_left = ghost.frameGeometry().topLeft()
+        want = end - local
+        delta_a = top_left - end   # 幽靈相對游標的偏移，供第二段做差分比對
+        # 容許 1px：邏輯座標經由 dpr 換算成原生像素再換回來會有捨入
+        check("抓在 (5,5)：幽靈左上角＝游標−抓取點",
+              abs(top_left.x() - want.x()) <= 1 and abs(top_left.y() - want.y()) <= 1,
+              f"got={top_left} want={want}")
+        check("游標真的落在幽靈內（相對跟隨的必然結果）",
+              ghost.frameGeometry().contains(end), str(ghost.frameGeometry()))
+        check("縮影左上角＝幽靈左上角（相對跟隨的前提）",
+              ghost._snapshot.pos() == QPoint(0, 0), str(ghost._snapshot.pos()))
+    release_at(btn, QPoint(end.x(), bar.mapToGlobal(bar.rect().center()).y()))
+    pump(300)
+
+    # --- 抓在右下角：定點偏移下這兩組會量到一樣的偏移，相對跟隨才會不同 -----
+    host.activate_tab(0)
+    pump(200)
+    btn = bar._buttons[0]
+    corner = QPoint(btn.width() - 6, btn.height() - 6)
+    # 這個點目前離關閉鈕的下緣還有 2px。分頁或圖示的尺寸一改就可能壓上去，
+    # 屆時真人按這裡是按到關閉鈕、拖曳根本不會開始，而測試用 sendEvent 繞過
+    # 命中測試照樣綠——先用這條把「測試情境仍然真實」釘住。
+    check("前置：右下角抓取點沒有壓在關閉鈕上（真人按得到）",
+          not btn._close.geometry().contains(corner),
+          f"corner={corner} close={btn._close.geometry()}")
+    ghost, end, local = tear_and_measure(corner, 200)
+    check("右下角撕下後幽靈存在且可見", ghost is not None and ghost.isVisible())
+    if ghost is not None:
+        top_left = ghost.frameGeometry().topLeft()
+        want = end - local
+        check("抓在右下角：幽靈左上角＝游標−抓取點",
+              abs(top_left.x() - want.x()) <= 1 and abs(top_left.y() - want.y()) <= 1,
+              f"got={top_left} want={want} local={local}")
+        # 差分比對：兩段「幽靈相對游標的偏移」之差必須等於抓取點之差。
+        # 定點偏移（不管偏多少）會讓兩段偏移相同而在這裡紅——這才是
+        # 「抓哪裡就從哪裡拖」的可證版本。
+        if delta_a is not None:
+            delta_b = top_left - end
+            diff = delta_a - delta_b
+            expect = corner - QPoint(5, 5)
+            check("兩段偏移之差＝抓取點之差（定點偏移在此必紅）",
+                  abs(diff.x() - expect.x()) <= 2 and abs(diff.y() - expect.y()) <= 2,
+                  f"diff={diff} expect={expect}")
+
+        # 徽章換文案會 adjustSize；縮影原點不能跟著跑。set_intent 對相同 intent
+        # 會早退不重算，所以要先短再長，否則這個前置條件會靜默失效。
+        ghost.set_intent("none")
+        app.processEvents()
+        narrow = ghost._badge.width()
+        ghost.set_intent("detach")
+        app.processEvents()
+        wide = ghost._badge.width()
+        check("徽章文案變長後寬度確實變過（前置條件）", wide > narrow,
+              f"none={narrow} detach={wide}")
+        # 與變寬前「同一次拖曳、同一套捨入」的量測值比，理應完全相等；
+        # 拿 end-local 比會把捨入誤差混進來，兩種容差標準並存誰也說不清
+        ghost.follow(end)
+        check("徽章變寬後相對位置不變",
+              ghost._snapshot.pos() == QPoint(0, 0)
+              and ghost.frameGeometry().topLeft() == top_left,
+              f"snap={ghost._snapshot.pos()} tl={ghost.frameGeometry().topLeft()}")
+    release_at(btn, QPoint(end.x(), bar.mapToGlobal(bar.rect().center()).y()))
+    pump(300)
+
+    # --- 免手勢的單元式檢查：夾值與窄縮影 ------------------------------------
+    from app.tab_bar import DragGhost as _DragGhost
+
+    # 夾值：抓取點是按下當下量的、縮影是之後才 grab 的，中間分頁寬度變過的話
+    # 抓取點可能超出縮影——沒夾住的話幽靈會整個飛到游標外面去。
+    probe_pt = QPoint(600, 400)
+    wild = _DragGhost(btn.grab(), host._theme, QPoint(9999, 9999))
+    wild.set_intent("none")
+    wild.follow(probe_pt)
+    check("超出縮影的抓取點被夾回矩形內（游標仍在幽靈裡）",
+          wild.frameGeometry().contains(probe_pt), str(wild.frameGeometry()))
+    wild.deleteLater()
+    # 窄縮影：縮影比徽章窄時（TAB_MIN_WIDTH=92 < 「拆分為新視窗」徽章約 94），
+    # AlignHCenter 才真的會把縮影推離 (0,0)——寬縮影下那兩條原點檢查是常綠的
+    narrow_pix = btn.grab().copy(0, 0, 60, btn.height())
+    narrow_ghost = _DragGhost(narrow_pix, host._theme, QPoint(0, 0))
+    narrow_ghost.set_intent("detach")
+    app.processEvents()
+    check("縮影比徽章窄時仍貼齊左上角（AlignLeft 的真正考驗）",
+          narrow_ghost._snapshot.pos() == QPoint(0, 0),
+          str(narrow_ghost._snapshot.pos()))
+    narrow_ghost.deleteLater()
+
+    # --- 守門：游標壓在幽靈上時，命中測試仍要答出底下真正的視窗 -------------
+    # 把另一個視窗整個塞到 host 底下，讓它的分頁列落在 host 的內容區裡。
+    # 只改 follow()、不改命中測試的話，topLevelAt 會回傳幽靈 -> 堆疊判定失效
+    # -> 退回幾何掃描 -> 找到那個被完全遮住的視窗，分頁就併進使用者看不見的
+    # 地方。這一條就是逼出配套修正的那條。
+    under = manager4.create_window(docs[2])
+    host_geo = host.frameGeometry()
+    under.move(host_geo.left() + 30, host_geo.top() + 240)
+    pump(400)
+    host.raise_()
+    host.activateWindow()
+    # 從背景行程（agent、排程）跑時 raise_ 沒有前景權，視窗疊不上去，
+    # WindowFromPoint 會答出蓋在上面的「別的行程」的視窗——守門兩條會以
+    # 機制回歸的樣子偽紅。用專案現成的 AttachThreadInput 繞過前景鎖。
+    from app import win32 as _win32
+
+    _win32.force_foreground(int(host.winId()))
+    pump(400)          # Windows 的 z-order 變更不是同步反映到 WindowFromPoint
+
+    ux, uy, uw, uh = under.tab_bar.global_drop_rect()
+    probe = QPoint(ux + 40, uy + uh // 2)
+    # 不用放置區矩形驗 probe——probe 就是拿同一個矩形造的，那是恆真式；
+    # 改驗它落在 under 的框架內（放置區含容忍帶，可能超出框架）
+    check("守門前置：探測點落在底下視窗的框架內",
+          under.frameGeometry().contains(probe),
+          f"probe={probe} under={under.frameGeometry()}")
+    check("守門前置：探測點同時落在來源視窗的框架內",
+          host.frameGeometry().contains(probe),
+          f"probe={probe} host={host.frameGeometry()}")
+
+    # 環境前置：此刻幽靈還不存在，這條紅只可能是桌面環境——探測點被別的
+    # 視窗（含另一份併行測試）蓋住、或無前景權——不是機制回歸。
+    # 紅的話守門三條直接略過，免得跟著紅誤導成命中測試壞了。
+    env_ok = _wm.top_level_widget_at(probe) is host
+    check("守門前置：host 是探測點的最上層（紅＝環境遮擋，非機制回歸）",
+          env_ok, type(_wm.top_level_widget_at(probe)).__name__)
+    if env_ok:
+        host.activate_tab(0)
+        pump(200)
+        btn = bar._buttons[0]
+        start = press_at(btn, QPoint(8, 8))
+        for step in (1, 2, 3):
+            move_to(btn, QPoint(
+                start.x() + (probe.x() - start.x()) * step // 3,
+                start.y() + (probe.y() - start.y()) * step // 3,
+            ))
+        move_to(btn, probe)
+        ghost = bar._ghost
+        check("守門前置：幽靈確實蓋住探測點",
+              ghost is not None and ghost.isVisible()
+              and ghost.frameGeometry().contains(probe),
+              str(ghost.frameGeometry()) if ghost is not None else "無幽靈")
+        check("命中測試穿過幽靈，答出的是來源視窗而不是 DragGhost",
+              _wm.top_level_widget_at(probe) is host,
+              type(_wm.top_level_widget_at(probe)).__name__)
+        check("游標落在幽靈內時，放在自己視窗上仍判定為拆分（不被幽靈騙）",
+              manager4.drop_target_at(probe, exclude=host) is None,
+              repr(manager4.drop_target_at(probe, exclude=host)))
+        release_at(btn, QPoint(start.x(), bar.mapToGlobal(bar.rect().center()).y()))
+        pump(300)
+    else:
+        print("    [略過] 桌面環境遮住探測點，守門三條未執行")
+
+    # --- 對照組：底下的視窗露出來時，合併照樣要成立 -------------------------
+    under.move(host_geo.right() + 20, host_geo.top())
+    pump(400)
+    ux, uy, uw, uh = under.tab_bar.global_drop_rect()
+    exposed = QPoint(ux + 40, uy + uh // 2)
+    check("對照組前置：探測點已不在來源視窗框架內",
+          not host.frameGeometry().contains(exposed))
+    check("對照組：目標視窗露出來時仍判定為合併",
+          (manager4.drop_target_at(exposed, exclude=host) or (None,))[0] is under,
+          repr(manager4.drop_target_at(exposed, exclude=host)))
+
+    # --- 座標換算健檢 -------------------------------------------------------
+    # 命中測試把邏輯座標換成原生像素才能問 WindowFromPoint。換錯的話上面兩條
+    # 會一起紅，這條負責指出是換算壞了、還是命中測試壞了。
+    # 注意：單螢幕機器上原點是 (0,0)，「每螢幕原點守恆」與「天真全域乘 dpr」
+    # 輸出相同，這條只驗得到縮放係數；多螢幕的原點項只有多螢幕機器驗得到。
+    import ctypes as _ctypes
+    from ctypes import wintypes as _wintypes
+
+    from PyQt6.QtGui import QCursor as _QCursor
+
+    _u32 = _ctypes.windll.user32
+    _u32.GetCursorPos.argtypes = [_ctypes.POINTER(_wintypes.POINT)]
+    _u32.GetCursorPos.restype = _wintypes.BOOL
+    _pt = _wintypes.POINT()
+    _u32.GetCursorPos(_ctypes.byref(_pt))
+    _converted = _wm._native_point(_QCursor.pos())
+    check("邏輯座標換算與 GetCursorPos 一致（每軸誤差 ≤2px）",
+          _converted is not None
+          and abs(_converted[0] - _pt.x) <= 2 and abs(_converted[1] - _pt.y) <= 2,
+          f"converted={_converted} native={(_pt.x, _pt.y)}")
+
+    # --- 指示線殘留：拖去 B 畫了線、拖回自己列上放開 -------------------------
+    # 兩窗並排、列同高時，滑鼠可以一步從 B 的列跳回本列，中間點永遠不會落在
+    # 兩列之外——清線的機會不存在。少了「回到本列也探一次」與 drag_ended
+    # 收斂，B 的 accent 線會殘留到下一次拖曳。
+    under.move(host_geo.right() + 20, host_geo.top())
+    pump(300)
+    host.activate_tab(0)
+    pump(200)
+    btn = bar._buttons[0]
+    ux, uy, uw, uh = under.tab_bar.global_drop_rect()
+    on_b = QPoint(ux + 40, uy + uh // 2)
+    start = press_at(btn, QPoint(10, 10))
+    for step in (1, 2, 3):
+        move_to(btn, QPoint(
+            start.x() + (on_b.x() - start.x()) * step // 3,
+            start.y() + (on_b.y() - start.y()) * step // 3,
+        ))
+    move_to(btn, on_b)
+    check("前置：拖到 B 的列上時 B 顯示插入指示線",
+          under.tab_bar._insert_marker.isVisible())
+    back_home = bar.mapToGlobal(bar.rect().center())
+    move_to(btn, back_home)     # 一步跳回本列（並排視窗的真實事件步幅）
+    check("拖回本列時 B 的指示線即刻收起",
+          not under.tab_bar._insert_marker.isVisible())
+    release_at(btn, back_home)
+    pump(300)
+    check("放開後 B 的指示線沒有殘留",
+          not under.tab_bar._insert_marker.isVisible())
+
+    # --- 拖曳中換主題：幽靈不能死，手勢要活下來 -----------------------------
+    host.activate_tab(0)
+    pump(200)
+    btn = bar._buttons[0]
+    start = press_at(btn, QPoint(10, 10))
+    away = QPoint(start.x() + 40, bar.mapToGlobal(bar.rect().bottomLeft()).y() + 200)
+    for step in (1, 2, 3):
+        move_to(btn, QPoint(
+            start.x() + 10 * step,
+            start.y() + (away.y() - start.y()) * step // 3,
+        ))
+    move_to(btn, away)
+    other = "light" if host._theme == "dark" else "dark"
+    original = host._theme
+    host.apply_theme(other)
+    app.processEvents()
+    ghost = bar._ghost
+    check("拖曳中換主題：幽靈仍在且可見", ghost is not None and ghost.isVisible())
+    if ghost is not None:
+        before = ghost.frameGeometry().topLeft()
+        ghost.follow(away)
+        check("拖曳中換主題：相對跟隨不受影響",
+              ghost.frameGeometry().topLeft() == before)
+    host.apply_theme(original)
+    release_at(btn, QPoint(away.x(), bar.mapToGlobal(bar.rect().center()).y()))
+    pump(300)
+
+    # --- 拖曳中關窗：全域游標與幽靈不能殘留 ---------------------------------
+    # 中鍵按在被拖的分頁上、或拖曳中 Ctrl+W，都會在放開事件之前把視窗關掉。
+    # 少了 closeEvent 的 cancel_active_drag，全域拖曳游標永遠不會還原、
+    # 無父件的置頂幽靈會掛在畫面上等世代 GC。
+    from PyQt6.QtWidgets import QApplication as _QAppC
+
+    def _is_alive_and_visible(widget) -> bool:
+        # deleteLater 落地後 sip 包裝碰一下就 RuntimeError——那正代表已收掉
+        try:
+            return widget.isVisible()
+        except RuntimeError:
+            return False
+
+    closer = manager4.create_window(docs[1])
+    closer.move(host_geo.left(), host_geo.top() + 300)
+    pump(400)
+    cbtn = closer.tab_bar._buttons[0]
+    cstart = press_at(cbtn, QPoint(10, 10))
+    far_out = QPoint(cstart.x() + 60, cstart.y() + 260)
+    for step in (1, 2, 3):
+        move_to(cbtn, QPoint(
+            cstart.x() + 20 * step,
+            cstart.y() + (far_out.y() - cstart.y()) * step // 3,
+        ))
+    move_to(cbtn, far_out)
+    ghost_ref = closer.tab_bar._ghost
+    check("前置：關窗前拖曳已撕下（有幽靈、有覆蓋游標）",
+          ghost_ref is not None and ghost_ref.isVisible()
+          and _QAppC.overrideCursor() is not None)
+    closer.close()          # 拖曳中直接關（等同中鍵關最後一個分頁）
+    pump(400)
+    check("拖曳中關窗：全域覆蓋游標已還原", _QAppC.overrideCursor() is None)
+    check("拖曳中關窗：幽靈已收掉（不殘留在畫面最上層）",
+          ghost_ref is None or not _is_alive_and_visible(ghost_ref))
+
+    for w in manager4.windows():
+        w.close()
+    pump(400)
     QSettings(config.ORG_NAME, config.APP_NAME).clear()
 
 
 SECTIONS = [
     ("渲染與閱讀", section_rendering),
+    ("渲染快取", section_render_cache),
     ("分頁操作", section_tabs),
     ("分頁狀態還原", section_session),
     ("分頁拖曳（移動/拆分/合併）", section_tab_dnd),

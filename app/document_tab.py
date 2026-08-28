@@ -37,6 +37,8 @@ class DocumentTab:
         self.dirty: bool = True               # 是否需要重新渲染
         # 跨視窗搬移時暫存的捲動比例：take_tab 寫入、adopt_tab 讀走後清空
         self.transfer_scroll: float | None = None
+        # 主題 -> (產生它的文字物件, HTML)。見 build_html 的說明。
+        self._html_cache: dict[str, tuple[str, str]] = {}
         self.has_scalable_images: bool = False
         self.last_render_width: int = 0
 
@@ -80,11 +82,31 @@ class DocumentTab:
 
     # -- 產生 HTML -----------------------------------------------------------
     def build_html(self, theme: str) -> str:
+        """產生（或取用快取的）HTML。
+
+        【為什麼要快取】
+        字級縮放、內文寬度、視窗縮放都會重新渲染，但這些只影響 Qt 的排版，
+        Markdown→HTML 的結果完全一樣。實測 1MB 的文件光轉換就要 518 ms，
+        每按一次 Ctrl+加號都重付一次。
+
+        鍵用「文字物件的識別 + 主題」：
+        - 識別（is）而不是內容比對，避免每次都掃過整份文字。重新載入會產生
+          新的字串物件，識別自然不同 -> 自動失效，不需要另外清快取。
+        - 主題要入鍵：程式碼高亮的顏色是用 inline style 寫死在 HTML 裡的
+          （codehilite noclasses），換主題必須重新轉換。
+        兩個主題各留一份，切回上一個主題就是直接命中。
+        """
         if self.error is not None:
             return document.render_error(self.error, self.path or "")
-        if self.meta is not None:
-            return document.render_document(self.text, self.meta, theme)
-        return document.render_welcome()
+        if self.meta is None:
+            return document.render_welcome()
+
+        cached = self._html_cache.get(theme)
+        if cached is not None and cached[0] is self.text:
+            return cached[1]
+        rendered = document.render_document(self.text, self.meta, theme)
+        self._html_cache[theme] = (self.text, rendered)
+        return rendered
 
     # -- 捲動位置 ------------------------------------------------------------
     def scroll_ratio(self) -> float:
