@@ -41,6 +41,11 @@ class DocumentTab:
         self._html_cache: dict[str, tuple[str, str]] = {}
         self.has_scalable_images: bool = False
         self.last_render_width: int = 0
+        # 目前實際套在 root frame 上的左右邊距。setFrameFormat 會讓整份文件
+        # 重新排版，而拖曳視窗邊緣時每一幀都會重算一次邊距——把值記下來，
+        # 算出同一個值就能整個跳過。文件一重建（setHtml）邊距回到預設，
+        # 要設回 None 讓它重套一次。
+        self.applied_side_margin: float | None = None
 
     # -- 顯示用名稱 ----------------------------------------------------------
     @property

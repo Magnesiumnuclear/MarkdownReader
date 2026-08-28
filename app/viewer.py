@@ -920,9 +920,6 @@ class MarkdownViewer(QWidget):
         （上下也會跟著變超大）。root frame 的 frameFormat 可以分別指定四邊，
         因此用左右邊距把文字欄夾成固定寬度，效果等同置中的閱讀欄。
         """
-        doc = self.browser.document()
-        frame = doc.rootFrame()
-        fmt = frame.frameFormat()
         margin = styles.DOCUMENT_MARGIN
         viewport = self.browser.viewport().width()
 
@@ -931,11 +928,22 @@ class MarkdownViewer(QWidget):
         else:
             side = margin
 
+        # 【算出同一個邊距就不要碰 frameFormat】setFrameFormat 會讓整份文件
+        # 重新排版，而 resizeEvent 每一幀都會走到這裡。限制內文寬度時，只要
+        # 視窗還是比內文寬得多，side 一路都是同一個數字，重排純屬白工；
+        # 不限制寬度（side 恆等於 margin）時更是從頭到尾都不會變。
+        # 大文件上這是拖曳視窗邊緣最主要的卡頓來源。
+        if self._tab.applied_side_margin == side:
+            return
+
+        frame = self.browser.document().rootFrame()
+        fmt = frame.frameFormat()
         fmt.setLeftMargin(side)
         fmt.setRightMargin(side)
         fmt.setTopMargin(margin)
         fmt.setBottomMargin(margin)
         frame.setFrameFormat(fmt)
+        self._tab.applied_side_margin = side
 
     # -- 行為開關 ------------------------------------------------------------
     def set_auto_reload(self, enabled: bool) -> None:
@@ -1134,8 +1142,12 @@ class MarkdownViewer(QWidget):
         self._tab.last_render_width = self.browser.viewport().width()
 
         self.browser.setHtml(html)
-        # setHtml 會重建文件，root frame 的邊距必須重設
+        # setHtml 會重建文件，root frame 的邊距回到預設值——快取要跟著失效，
+        # 否則下面這次會誤判「和上次算出來的一樣」而跳過，邊距就套不上去
+        self._tab.applied_side_margin = None
         self._apply_content_width()
+        # 文件剛被清空再填回，搜尋列快取的比對位置與游標都已經失效
+        self.find_bar.refresh_for_new_document()
         if preserve_scroll and ratio > 0:
             QTimer.singleShot(0, lambda: self._apply_scroll_ratio(ratio))
 

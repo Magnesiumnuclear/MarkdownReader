@@ -163,7 +163,7 @@ def last_error(stderr: str) -> str:
 # ===========================================================================
 def section_rendering(args) -> None:
     from PyQt6.QtCore import QEventLoop, QSettings, Qt, QTimer, QUrl
-    from PyQt6.QtGui import QDesktopServices
+    from PyQt6.QtGui import QColor, QDesktopServices
     from PyQt6.QtWidgets import QApplication
 
     app = QApplication.instance() or QApplication([])
@@ -175,6 +175,7 @@ def section_rendering(args) -> None:
         for _ in range(3):
             app.processEvents()
 
+    from app import styles
     from app.viewer import MarkdownViewer
 
     QSettings(config.ORG_NAME, config.APP_NAME).clear()
@@ -341,6 +342,124 @@ def section_rendering(args) -> None:
         viewer.status_label.repaint = plain_repaint
         check("小檔不觸發忙碌回饋", calls["n"] == 0, str(calls["n"]))
 
+    # --- 搜尋：輸入防抖、上下一筆只換兩筆高亮、高亮上限 ----------------------
+    search_doc = os.path.join(tmp, "search_perf.md")
+    with open(search_doc, "w", encoding="utf-8") as handle:
+        handle.write("# 搜尋效能\n\n" + "\n\n".join(
+            f"第 {i} 段 zeta 內容。" for i in range(400)))
+    viewer.open_path(search_doc, new_tab=True)
+    pump(400)
+    bar = viewer.find_bar
+    bar.activate()
+    pump(200)
+    # activate() 會沿用上次留在輸入框裡的搜尋詞，先清乾淨再測防抖，
+    # 否則 setText 的值和原本一樣就不算變更、textChanged 根本不發
+    bar.input.setText("")
+    app.processEvents()
+
+    # 防抖：打完字的當下不該立刻掃整份文件
+    bar.input.setText("zeta")
+    app.processEvents()
+    check("輸入後未過防抖時尚未比對", not bar._matches, str(len(bar._matches)))
+    pump(bar.DEBOUNCE_MS + 250)
+    check("防抖過後才真的比對", len(bar._matches) == 400, str(len(bar._matches)))
+
+    # 清空是廉價操作，要立刻生效才跟手（不進防抖）
+    bar.input.setText("")
+    app.processEvents()
+    check("清空搜尋詞立刻生效，不必等防抖", not bar._matches)
+
+    # Enter 要先把還在等的防抖兌現，不能拿舊結果來跳
+    bar.input.setText("zeta")
+    app.processEvents()
+    bar.search(forward=True)
+    check("Enter 會先兌現防抖再跳（不是拿舊結果）",
+          len(bar._matches) == 400 and bar._current_index == 1,
+          f"matches={len(bar._matches)} index={bar._current_index}")
+
+    # 上/下一筆只換兩筆高亮：其餘 selection 物件必須是同一批被沿用
+    pump(200)
+    before_list = list(bar._selections)   # 複製一份，讓舊物件不會被回收
+    before_ids = [id(sel) for sel in before_list]
+    index_before = bar._current_index
+    bar.search(forward=True)
+    app.processEvents()
+    after_ids = [id(sel) for sel in bar._selections]
+    reused = sum(1 for a, b in zip(before_ids, after_ids) if a == b)
+    check("前置：高亮筆數與比對數一致（未達上限）",
+          len(before_ids) == 400 and len(after_ids) == 400,
+          f"{len(before_ids)} / {len(after_ids)}")
+    check("下一筆只換掉兩筆高亮，其餘沿用",
+          reused == len(before_ids) - 2,
+          f"沿用 {reused} / {len(before_ids)}，換掉 {len(before_ids) - reused}")
+    check("下一筆確實有前進，且記錄的已上色索引跟著更新",
+          bar._current_index == (index_before + 1) % 400
+          and bar._painted_current == bar._current_index,
+          f"index={bar._current_index} painted={bar._painted_current}")
+
+    # 回上一筆同樣只換兩筆
+    back_list = list(bar._selections)     # 同上，抓住參照才能安全比對 id
+    back_ids = [id(sel) for sel in back_list]
+    bar.search(forward=False)
+    app.processEvents()
+    reused_back = sum(1 for a, b in zip(back_ids, [id(x) for x in bar._selections])
+                      if a == b)
+    check("上一筆也只換掉兩筆高亮",
+          reused_back == len(back_ids) - 2,
+          f"沿用 {reused_back} / {len(back_ids)}")
+
+    # 換配色會連帶重新渲染（setHtml 把文件清空再填回），快取裡的 QTextCursor
+    # 會整批被折到位置 0。這兩條同時守住「配色有換新」與「位置沒有塌掉」。
+    theme_before = viewer._theme
+    other_theme = "light" if theme_before == "dark" else "dark"
+    viewer.apply_theme(other_theme)
+    pump(400)
+    positions = [sel.cursor.selectionStart() for sel in bar._selections]
+    check("換配色重新渲染後高亮位置沒有塌到文件開頭",
+          len(positions) > 2 and positions == sorted(positions)
+          and positions[:3] == bar._matches[:3],
+          f"前三筆 {positions[:3]} vs {bar._matches[:3]}")
+    others = [sel for i, sel in enumerate(bar._selections)
+              if i != bar._current_index - bar._window[0]]
+    expected_bg = QColor(styles.palette(other_theme)["find_match_bg"]).name()
+    check("換配色後高亮用的是新配色",
+          bool(others)
+          and others[0].format.background().color().name() == expected_bg,
+          others[0].format.background().color().name() if others else "無")
+    viewer.apply_theme(theme_before)
+    pump(400)
+
+    # 高亮上限：比對數不受限，但交給 Qt 的筆數要被夾住
+    original_cap = type(bar).MAX_HIGHLIGHTS
+    type(bar).MAX_HIGHLIGHTS = 50
+    try:
+        bar.input.setText("")
+        app.processEvents()
+        bar.input.setText("zeta")
+        pump(bar.DEBOUNCE_MS + 250)
+        check("超過上限時比對數仍是實數", len(bar._matches) == 400,
+              str(len(bar._matches)))
+        check("超過上限時交給 Qt 的高亮筆數被夾住",
+              len(bar._selections) == 50, str(len(bar._selections)))
+        check("超過上限時狀態列說明只高亮鄰近筆數",
+              "400" in bar.status.text() and "50" in bar.status.text(),
+              bar.status.text())
+        # 窗格要涵蓋目前這一筆，否則使用者所在位置看不到高亮
+        low, high = bar._window
+        check("高亮窗格涵蓋目前這一筆",
+              low <= bar._current_index < high,
+              f"index={bar._current_index} window={bar._window}")
+        # 窗格不該每跳一筆就滑動——否則快路徑永遠用不到
+        window_before = bar._window
+        bar.search(forward=True)
+        app.processEvents()
+        check("在窗格內前進時窗格不滑動（快路徑仍成立）",
+              bar._window == window_before, f"{window_before} -> {bar._window}")
+    finally:
+        type(bar).MAX_HIGHLIGHTS = original_cap
+    bar.deactivate()
+    pump(200)
+
     viewer.close()
     pump(300)
     QSettings(config.ORG_NAME, config.APP_NAME).clear()
@@ -371,7 +490,7 @@ def section_render_cache(args) -> None:
         for _ in range(3):
             app.processEvents()
 
-    from app import document
+    from app import document, styles
     from app.viewer import MarkdownViewer
 
     # 測試文件用 join 組出來（NL 即換行），避免多行字面值在編輯過程被
@@ -467,6 +586,69 @@ def section_render_cache(args) -> None:
         document.markdown_to_html = original_convert
     check("字級縮放不重跑 Markdown 轉換（快取命中）",
           conversions["n"] == 0, f"轉換了 {conversions['n']} 次")
+
+    # --- 內文寬度未變時跳過整份重排 -----------------------------------------
+    # _apply_content_width 每個 resize 事件都會被呼叫，而 setFrameFormat 會讓
+    # 整份文件重新排版。算出來的邊距沒變就該直接跳過。
+    # 用文件的 revision 來數「真的動到文件幾次」：setFrameFormat 每呼叫一次
+    # revision 就 +1，連設成同一個值也算——它數的正是實際發生的重排，而不是
+    # 「算出來的邊距變了幾次」（後者拿掉守門也一樣，根本測不出差別）。
+    def count_reflows(action):
+        doc = viewer.browser.document()
+        before = doc.revision()
+        action()
+        return doc.revision() - before
+
+    viewer.set_content_width(720)
+    viewer.resize(1100, 700)
+    pump(400)
+    check("前置：限寬後邊距已套上（不等於預設邊距）",
+          viewer._tab.applied_side_margin != styles.DOCUMENT_MARGIN,
+          str(viewer._tab.applied_side_margin))
+
+    def resize_height_only():
+        for step in range(12):
+            viewer.resize(1100, 700 - step * 6)
+            app.processEvents()
+
+    check("限寬時只改高度不觸發重排",
+          count_reflows(resize_height_only) == 0)
+
+    viewer.resize(1100, 700)
+    pump(300)
+
+    def resize_width_only():
+        for step in range(12):
+            viewer.resize(1100 - step * 10, 700)
+            app.processEvents()
+
+    # 限寬時左右邊距是依可視寬度算的，改寬度就真的得重排——這條是對照組，
+    # 確認守門不是「一律跳過」那種假優化
+    check("限寬時改寬度仍會重排（守門沒有蓋掉必要的重算）",
+          count_reflows(resize_width_only) > 0)
+
+    # 不限寬時邊距恆等於預設值，連改寬度都不該重排
+    viewer.set_content_width(0)
+    viewer.resize(1100, 700)
+    pump(400)
+    check("不限寬時改寬度也不觸發重排",
+          count_reflows(resize_width_only) == 0)
+
+    # 文件重建（setHtml）會把邊距打回預設，快取必須跟著失效
+    viewer.set_content_width(720)
+    viewer.resize(1100, 700)
+    pump(400)
+    applied = viewer._tab.applied_side_margin
+    viewer._mark_all_dirty()
+    viewer._render()
+    pump(300)
+    check("重新渲染後邊距重新套上（快取沒有誤判為未變）",
+          viewer._tab.applied_side_margin == applied,
+          f"{viewer._tab.applied_side_margin} vs {applied}")
+    frame_fmt = viewer.browser.document().rootFrame().frameFormat()
+    check("重新渲染後 root frame 的左邊距確實是算出來的值",
+          abs(frame_fmt.leftMargin() - applied) < 0.5,
+          f"frame={frame_fmt.leftMargin()} applied={applied}")
 
     viewer.close()
     pump(300)
