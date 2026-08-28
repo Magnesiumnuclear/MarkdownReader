@@ -650,6 +650,135 @@ def section_render_cache(args) -> None:
           abs(frame_fmt.leftMargin() - applied) < 0.5,
           f"frame={frame_fmt.leftMargin()} applied={applied}")
 
+    # --- 分段渲染（先見首屏）------------------------------------------------
+    # 大文件一次 setHtml 會整份排完版才回來，那段時間介面完全凍結。改成先把
+    # 首屏交出去、其餘分批補上。最要緊的性質是「補完後的內容和一次到底完全
+    # 一樣」——分段是效能手段，不能改變任何看得到的結果。
+    tmp = tempfile.mkdtemp()
+    big_doc = os.path.join(tmp, "progressive.md")
+    with open(big_doc, "w", encoding="utf-8") as handle:
+        handle.write("# 分段渲染" + NL * 2 + (NL * 2).join(
+            f"第 {i} 段內容，帶 **粗體** 與 `程式碼`。" for i in range(1300)))
+
+    # 同一個檔案不會重複開（已開著時直接切過去、不重新渲染），
+    # 因此每個需要「剛渲染完、還有待補片段」的子測試都要用不同的檔案
+    big_doc2 = os.path.join(tmp, "progressive2.md")
+    big_doc3 = os.path.join(tmp, "progressive3.md")
+    big_doc4 = os.path.join(tmp, "progressive4.md")
+    for extra in (big_doc2, big_doc3, big_doc4):
+        with open(extra, "w", encoding="utf-8") as handle:
+            handle.write("# 分段渲染" + NL * 2 + (NL * 2).join(
+                f"第 {i} 段內容，帶 **粗體** 與 `程式碼`。" for i in range(1300)))
+
+    small_doc = os.path.join(tmp, "not_progressive.md")
+    with open(small_doc, "w", encoding="utf-8") as handle:
+        handle.write((NL * 2).join(f"短文第 {i} 段。" for i in range(20)))
+
+    viewer2 = MarkdownViewer()
+    viewer2.resize(1000, 700)
+    viewer2.show()
+    pump(400)
+    # 這裡故意不 pump：片段是靠事件迴圈補的，一 pump 就補完了，
+    # 「首屏先出來」這件事只有在 open_path 回來的當下量得到
+    viewer2.open_path(big_doc, push_history=False)
+    check("大文件開啟後有待補的片段（分段生效）",
+          len(viewer2._tab.pending_chunks) > 0,
+          str(len(viewer2._tab.pending_chunks)))
+    partial_len = len(viewer2.browser.toPlainText())
+
+    # 一次到底的對照組：把門檻調高到不可能達到，等於關掉分段
+    saved_min = config.PROGRESSIVE_MIN_ELEMENTS
+    config.PROGRESSIVE_MIN_ELEMENTS = 10 ** 9
+    try:
+        viewer3 = MarkdownViewer(big_doc)
+        viewer3.resize(1000, 700)
+        viewer3.show()
+        pump(400)
+        check("對照組：門檻調高後不分段", not viewer3._tab.pending_chunks)
+        oneshot_text = viewer3.browser.toPlainText()
+        viewer3.close()
+        pump(200)
+    finally:
+        config.PROGRESSIVE_MIN_ELEMENTS = saved_min
+
+    viewer2.flush_pending_chunks()
+    pump(200)
+    check("補完後不再有待補片段", not viewer2._tab.pending_chunks)
+    check("首屏確實只是一部分（補完後內容變多）",
+          len(viewer2.browser.toPlainText()) > partial_len,
+          f"首屏 {partial_len} -> 補完 {len(viewer2.browser.toPlainText())}")
+    check("分段補完的內容與一次到底逐字元相同",
+          viewer2.browser.toPlainText() == oneshot_text,
+          f"分段 {len(viewer2.browser.toPlainText())} vs 一次 {len(oneshot_text)}")
+
+    # 小文件不該被分段：本來就快，繞路只是多花力氣
+    viewer2.open_path(small_doc, new_tab=True)
+    pump(400)
+    check("小文件不分段", not viewer2._tab.pending_chunks)
+    viewer2.close_tab_at(viewer2._active)
+    pump(300)
+
+    # 切分頁時要先把離開中的分頁補完，否則它會永遠停在只有首屏的狀態，
+    # 而計時器接下來讀的是新分頁的 pending_chunks，舊的再也沒人管。
+    # 這裡刻意完全不 pump：片段是靠事件迴圈補的，一 pump 就補完了，
+    # 「切走的當下有沒有補完」只有在不回事件迴圈的情況下量得到。
+    other_doc2 = os.path.join(tmp, "other_for_switch.md")
+    with open(other_doc2, "w", encoding="utf-8") as handle:
+        handle.write("# 另一份" + NL * 2 + "只有這一行。")
+
+    viewer2.open_path(big_doc2, new_tab=True)
+    big_tab = viewer2._tab
+    check("前置：新開的大文件分頁確實有多塊待補",
+          len(big_tab.pending_chunks) > 1, str(len(big_tab.pending_chunks)))
+    viewer2.open_path(other_doc2, new_tab=True)      # 直接切走，不回事件迴圈
+    check("開新分頁切走時，原分頁已被補完（不會停在只有首屏）",
+          not big_tab.pending_chunks, str(len(big_tab.pending_chunks)))
+    check("切走後原分頁的內容是完整的",
+          "第 1299 段" in big_tab.browser.toPlainText())
+    pump(300)
+    check("切分頁後新分頁的內容沒有被前一個分頁的片段污染",
+          "第 1299 段" not in viewer2.browser.toPlainText()
+          and "另一份" in viewer2.browser.toPlainText())
+    big_index = next(i for i, t in enumerate(viewer2._tabs)
+                     if t.path == os.path.abspath(big_doc))
+    viewer2.activate_tab(big_index)
+    pump(400)
+    viewer2.flush_pending_chunks()
+    check("切回原分頁時內容仍然完整",
+          "第 1299 段" in viewer2.browser.toPlainText())
+
+    # 用分頁列切換走的是 activate_tab，和上面 open_path 開新分頁那條不同，
+    # 兩條都要補完（實測拿掉任一條，另一條的測試都不會紅）
+    viewer2.open_path(big_doc4, new_tab=True)
+    bar_tab = viewer2._tab
+    check("前置：分頁列切換前有多塊待補",
+          len(bar_tab.pending_chunks) > 1, str(len(bar_tab.pending_chunks)))
+    viewer2.activate_tab(0)                          # 中間不回事件迴圈
+    check("用分頁列切走時，原分頁也會被補完",
+          not bar_tab.pending_chunks, str(len(bar_tab.pending_chunks)))
+    check("分頁列切走後原分頁內容完整",
+          "第 1299 段" in bar_tab.browser.toPlainText())
+    pump(200)
+
+    # 搜尋要掃整份文件：show_find 之前必須補完，否則比對數是錯的
+    viewer2.open_path(big_doc3, new_tab=True)
+    check("前置：搜尋前確實還有待補片段",
+          len(viewer2._tab.pending_chunks) > 1)
+    viewer2.show_find()                              # 中間不回事件迴圈
+    check("show_find 會先把片段補完", not viewer2._tab.pending_chunks,
+          str(len(viewer2._tab.pending_chunks)))
+    viewer2.find_bar.input.setText("")
+    app.processEvents()
+    viewer2.find_bar.input.setText("段內容")
+    pump(viewer2.find_bar.DEBOUNCE_MS + 300)
+    check("分段渲染的文件搜尋得到全部相符項",
+          len(viewer2.find_bar._matches) == 1300,
+          str(len(viewer2.find_bar._matches)))
+    viewer2.find_bar.deactivate()
+
+    viewer2.close()
+    pump(300)
+
     viewer.close()
     pump(300)
     QSettings(config.ORG_NAME, config.APP_NAME).clear()

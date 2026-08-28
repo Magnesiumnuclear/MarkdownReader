@@ -46,6 +46,12 @@ class DocumentTab:
         # 算出同一個值就能整個跳過。文件一重建（setHtml）邊距回到預設，
         # 要設回 None 讓它重套一次。
         self.applied_side_margin: float | None = None
+        # 分段渲染還沒補上的 HTML 片段（見 viewer._append_next_chunk）。
+        # 非空就代表這份文件目前只有首屏，任何需要完整內容的操作都要先補完。
+        self.pending_chunks: list[str] = []
+        # 分段補完之後要還原的捲動比例。不能在首屏就還原——那時文件才幾十個
+        # 元素，算出來的位置和補完後完全對不上。
+        self.pending_scroll_ratio: float = 0.0
 
     # -- 顯示用名稱 ----------------------------------------------------------
     @property

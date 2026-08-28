@@ -156,20 +156,48 @@ class QtRichTextTreeprocessor(Treeprocessor):
 
     # -- 區塊改寫 ------------------------------------------------------------
     def _convert_blocks(self, root: ET.Element, parents: dict) -> None:
-        # 先蒐集再改寫，避免一邊迭代一邊變動樹狀結構
-        targets: list[tuple[ET.Element, str, str]] = []
-        for element in root.iter():
-            if element.tag == "blockquote":
-                targets.append((element, "bq", "quotecell"))
-            elif element.tag == "pre":
-                targets.append((element, "code", "codecell"))
+        """把 blockquote / pre / hr / h1 / h2 換成 Qt 認得的單格表格。
 
-        for element, table_class, cell_class in targets:
+        【為什麼是「先排計畫、再依父節點一次換完」】
+        直覺寫法是走到一個就 `list(parent).index(e)` 找位置、`remove` 再
+        `insert`。這三個操作每一個都要掃過父節點的整份子清單，而 Markdown
+        文件的區塊多半都是 root 的直接子節點——一份 N 個區塊、其中 M 個要換
+        的文件就是 O(N x M)。標題很多的文件（每個 h1/h2 都要換）M 逼近 N，
+        直接退化成 O(n^2)：實測 3000 個標題的文件，光這一段就要好幾秒。
+
+        改法是把「哪個節點要換成哪個表格」先蒐集起來，再對每個父節點走一次
+        子清單、用 `parent[index] = table` 就地替換（O(1)，不必 remove/insert
+        搬動後面的元素）。總成本降到 O(N)。
+        """
+        # 蒐集階段完全不動樹：先走一次就把四種目標都收齊，也省下原本的四趟遍歷
+        specs: list[tuple[ET.Element, str, str, bool]] = []
+        for element in root.iter():
+            tag = element.tag
+            if tag == "blockquote":
+                specs.append((element, "bq", "quotecell", True))
+            elif tag == "pre":
+                specs.append((element, "code", "codecell", True))
+            elif tag == "hr":
+                # hr 本身丟棄，只留下那條細橫線表格
+                specs.append((element, "rule hrule", "rulecell", False))
+            elif tag in ("h1", "h2"):
+                # 包進單格表格，靠儲存格的 border-bottom 做出 GitHub 風格底線。
+                # 不是「在標題後面另插一條橫線」，因為 Qt 會讓獨立的橫線區塊帶上
+                # 整行行高，和標題之間出現一大段空白；包進儲存格才能用 padding
+                # 精準控制底線與文字的距離。
+                specs.append((element, "headrule", "headcell", True))
+
+        # parent -> {要被換掉的子節點: 換上去的表格}
+        replacements: dict[ET.Element, dict[ET.Element, ET.Element]] = {}
+
+        for element, table_class, cell_class, wrap in specs:
             parent = parents.get(element)
             if parent is None:
                 continue
+            node = element
             # codehilite 會在 <pre> 外再包一層 <div class="codehilite">，
-            # 且把背景色直接寫在 inline style 上，會和儲存格底色打架，故移除。
+            # 且把背景色直接寫在 inline style 上，會和儲存格底色打架，故移除；
+            # 這種情況要換掉的是那層 div，不是 pre 本身。
             if element.tag == "pre":
                 element.attrib.pop("style", None)
                 if parent.tag == "div" and "codehilite" in (parent.get("class") or ""):
@@ -177,42 +205,23 @@ class QtRichTextTreeprocessor(Treeprocessor):
                     if grandparent is not None:
                         parent.attrib.pop("style", None)
                         parent.attrib.pop("class", None)
-                        element, parent = parent, grandparent
+                        node, parent = parent, grandparent
 
-            index = list(parent).index(element)
             table, cell = _new_table(table_class, cell_class)
-            parent.remove(element)
-            cell.append(element)
-            parent.insert(index, table)
+            if wrap:
+                # 此刻 node 同時掛在 cell 與 parent 底下；下面的就地替換會把它
+                # 從 parent 拿掉。ElementTree 沒有 parent 指標，這樣是安全的。
+                cell.append(node)
+            replacements.setdefault(parent, {})[node] = table
             parents[table] = parent
 
-        # <hr> 換成一列細橫線表格
-        for element in list(root.iter("hr")):
-            parent = parents.get(element)
-            if parent is None:
-                continue
-            index = list(parent).index(element)
-            table, _cell = _new_table("rule hrule", "rulecell")
-            parent.remove(element)
-            parent.insert(index, table)
-            parents[table] = parent
-
-        # h1 / h2 包進單格表格，靠儲存格的 border-bottom 做出 GitHub 風格底線。
-        # 之所以不是「在標題後面另插一條橫線」，是因為 Qt 會讓獨立的橫線區塊
-        # 帶上整行行高，和標題之間出現一大段空白；包進儲存格則能用 padding
-        # 精準控制底線與文字的距離。
-        for element in list(root.iter()):
-            if element.tag not in ("h1", "h2"):
-                continue
-            parent = parents.get(element)
-            if parent is None:
-                continue
-            index = list(parent).index(element)
-            table, cell = _new_table("headrule", "headcell")
-            parent.remove(element)
-            cell.append(element)
-            parent.insert(index, table)
-            parents[table] = parent
+        # 套用階段：每個父節點只走一次子清單，就地替換不搬動其他元素。
+        # 只做替換、不增刪，所以 index 在整趟迴圈中都保持有效。
+        for parent, mapping in replacements.items():
+            for index, child in enumerate(list(parent)):
+                table = mapping.get(child)
+                if table is not None:
+                    parent[index] = table
 
     # -- 資料表格 ------------------------------------------------------------
     def _mark_data_tables(self, root: ET.Element) -> None:

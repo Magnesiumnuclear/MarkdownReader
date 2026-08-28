@@ -33,6 +33,7 @@ from PyQt6.QtGui import (
     QDesktopServices,
     QGuiApplication,
     QImage,
+    QTextCursor,
     QKeySequence,
     QPixmap,
     QShortcut,
@@ -312,6 +313,10 @@ class MarkdownViewer(QWidget):
         self._resize_timer = QTimer(self)
         self._resize_timer.setSingleShot(True)
         self._resize_timer.timeout.connect(self._on_resize_settled)
+        # 分段渲染：每塊之間回到事件迴圈，介面才有機會重繪與回應輸入
+        self._chunk_timer = QTimer(self)
+        self._chunk_timer.setSingleShot(True)
+        self._chunk_timer.timeout.connect(self._append_next_chunk)
 
         self._resizer = FramelessResizer(self)
 
@@ -377,6 +382,11 @@ class MarkdownViewer(QWidget):
 
     def _add_tab(self, tab: DocumentTab, activate: bool) -> None:
         """把分頁加進堆疊。"""
+        if activate and self._tabs:
+            # 這條路徑會直接換掉 self._active，不經過 activate_tab，所以補完
+            # 也要在這裡做一次。少了它，「分段載入到一半又開一個新檔」會讓
+            # 舊分頁的片段永遠停在半途——那個分頁從此只剩首屏。
+            self.flush_pending_chunks()
         tab.browser.setParent(self.stack)
         tab.browser.set_theme(self._theme)
         tab.browser.anchorClicked.connect(self._on_anchor_clicked)
@@ -606,6 +616,10 @@ class MarkdownViewer(QWidget):
             if 0 <= index < len(self._tabs):
                 self._sync_tab_bar()
             return
+
+        # 先把離開中的這個分頁補完：這樣「還沒補完的片段」永遠屬於作用中的
+        # 分頁，計時器就不可能把 A 的片段塞進 B 的文件裡
+        self.flush_pending_chunks()
 
         if self.find_bar.isVisible():
             self.find_bar.deactivate()
@@ -1060,7 +1074,8 @@ class MarkdownViewer(QWidget):
             if existing is not None:
                 self.activate_tab(existing)
                 if anchor:
-                    QTimer.singleShot(0, lambda: self.browser.scrollToAnchor(anchor))
+                    # 錨點可能落在還沒補上的片段裡，跳之前先補完
+                    QTimer.singleShot(0, lambda: self._scroll_to_anchor(anchor))
                 return
             self._add_tab(DocumentTab(), activate=True)
 
@@ -1097,7 +1112,7 @@ class MarkdownViewer(QWidget):
         self._sync_tab_bar()
         self._watch_files()
         if anchor:
-            QTimer.singleShot(0, lambda: self.browser.scrollToAnchor(anchor))
+            QTimer.singleShot(0, lambda: self._scroll_to_anchor(anchor))
 
     def _show_welcome(self) -> None:
         self._tab.path = None
@@ -1120,6 +1135,12 @@ class MarkdownViewer(QWidget):
             self._render_now(preserve_scroll)
 
     def _render_now(self, preserve_scroll: bool) -> None:
+        # 上一輪的分段還沒補完就重新渲染（換主題、換字級）：停掉計時器。
+        # 真正讓舊片段作廢的是下面那行重新指派 pending_chunks，這裡停計時器
+        # 只是把意圖寫明白，並省下一次無謂的喚醒。
+        # 這時算出來的捲動比例是對著只有首屏的文件算的，但正在分段載入
+        # 代表使用者根本還沒來得及捲動，實務上就是 0。
+        self._chunk_timer.stop()
         ratio = self._scroll_ratio() if preserve_scroll else 0.0
         font = self.browser.font()
         font.setPointSize(self._font_point_size)
@@ -1141,14 +1162,87 @@ class MarkdownViewer(QWidget):
         )
         self._tab.last_render_width = self.browser.viewport().width()
 
-        self.browser.setHtml(html)
+        # 【分段渲染】大文件一次 setHtml 會整份排完版才回來，那段時間介面
+        # 完全凍結。改成先把首屏交出去、其餘分批在事件迴圈的空檔補上。
+        # 不適合分段時 chunks 是空的，行為與從前完全相同。
+        head, chunks = document.split_for_progressive_render(html)
+        self._tab.pending_chunks = chunks
+        self._tab.pending_scroll_ratio = ratio if preserve_scroll else 0.0
+
+        self.browser.setHtml(head)
         # setHtml 會重建文件，root frame 的邊距回到預設值——快取要跟著失效，
         # 否則下面這次會誤判「和上次算出來的一樣」而跳過，邊距就套不上去
         self._tab.applied_side_margin = None
         self._apply_content_width()
+        if chunks:
+            # 首屏已經在文件裡了；把控制權交回事件迴圈讓它畫出來，再補其餘的
+            self._chunk_timer.start(0)
+        else:
+            self._finish_render()
+
+    # -- 分段渲染 ------------------------------------------------------------
+    def _append_next_chunk(self) -> None:
+        """補上一塊，然後把控制權還給事件迴圈。
+
+        每塊之間都回到事件迴圈，介面才有機會重繪與回應輸入。實測最壞情況
+        （3000 個標題）每塊約 83ms，而一次補完是 1.9 秒。
+        """
+        tab = self._tab
+        if not tab.pending_chunks:
+            return
+        self._insert_chunk(tab.pending_chunks.pop(0))
+        if tab.pending_chunks:
+            self._chunk_timer.start(0)
+        else:
+            self._finish_render()
+
+    def _insert_chunk(self, chunk: str) -> None:
+        # 用獨立的 QTextCursor 而不是 browser 的文字游標：後者是使用者的選取，
+        # 動到它會把選取範圍與捲動位置一起弄掉
+        cursor = QTextCursor(self.browser.document())
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        # 【接合處要不要先開一個新區塊，看片段的第一個元素是什麼】
+        # insertHtml 會把片段的第一個區塊併進游標所在的那個區塊。片段以
+        # <p>、<h3>、清單等開頭時就會和前一段黏成一段（實測少掉一個換行）；
+        # 而表格在 Qt 裡自成一個 frame，不會併——這時多開一個區塊反而會留下
+        # 一個空段落。實測九種文件輪廓（純段落／純 h3／清單／表格／引言／
+        # 程式碼／混合／標題／隨機），只有這個條件式的版本每一種都與
+        # 一次到底逐字元相同。
+        if not chunk.lstrip()[:6].lower().startswith("<table"):
+            cursor.insertBlock()
+        cursor.insertHtml(chunk)
+
+    def flush_pending_chunks(self) -> None:
+        """把還沒補上的片段立刻補完。
+
+        任何需要「完整文件」的操作——搜尋、捲動比例、切分頁、存工作階段——
+        在動作之前都要先呼叫，否則會對著只有首屏的文件下判斷。
+        """
+        if not self._tabs:
+            return
+        tab = self._tab
+        if not tab.pending_chunks:
+            return
+        self._chunk_timer.stop()
+        while tab.pending_chunks:
+            self._insert_chunk(tab.pending_chunks.pop(0))
+        self._finish_render()
+
+    def _scroll_to_anchor(self, anchor: str) -> None:
+        """跳到錨點。分段渲染時錨點可能還在沒補上的片段裡，先補完再跳。"""
+        self.flush_pending_chunks()
+        self.browser.scrollToAnchor(anchor)
+
+    def _finish_render(self) -> None:
+        """整份文件都進去之後的收尾（一次到底與分段補完共用）。"""
+        tab = self._tab
+        # 內容長高了，限寬時的左右邊距要依最終的可視寬度再算一次
+        self._apply_content_width()
         # 文件剛被清空再填回，搜尋列快取的比對位置與游標都已經失效
         self.find_bar.refresh_for_new_document()
-        if preserve_scroll and ratio > 0:
+        ratio = tab.pending_scroll_ratio
+        tab.pending_scroll_ratio = 0.0
+        if ratio > 0:
             QTimer.singleShot(0, lambda: self._apply_scroll_ratio(ratio))
 
     def reload(self) -> None:
@@ -1357,7 +1451,7 @@ class MarkdownViewer(QWidget):
 
         # 純 #錨點：在本文件內捲動
         if not url.path() and url.fragment():
-            self.browser.scrollToAnchor(url.fragment())
+            self._scroll_to_anchor(url.fragment())
             return
 
         if url.isRelative() and self._tab.path:
@@ -1447,6 +1541,8 @@ class MarkdownViewer(QWidget):
     def show_find(self) -> None:
         if self.settings_panel.isVisible():
             self.settings_panel.deactivate()
+        # 搜尋要掃整份文件，只有首屏的話比對數會是錯的
+        self.flush_pending_chunks()
         self.find_bar.activate()
 
     def _on_escape(self) -> None:
@@ -1597,6 +1693,7 @@ class MarkdownViewer(QWidget):
         # 實測分頁功能加進來之後，關閉時約有四成機率發生存取違規；先停掉還會回頭
         # 存取分頁的計時器與監看器，再清空清單，就不再重現。
         self._reload_timer.stop()
+        self._chunk_timer.stop()
         self._resize_timer.stop()
         self._watcher.blockSignals(True)
         self._tabs.clear()

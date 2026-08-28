@@ -12,6 +12,7 @@ from __future__ import annotations
 import codecs
 import html
 import os
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -229,6 +230,69 @@ def render_document(text: str, meta: DocumentMeta, theme: str) -> str:
             + body
         )
     return _page(body)
+
+
+# --- 分段渲染 ---------------------------------------------------------------
+# 頂層元素掃描用。self-closing 與這些 void 元素不會產生巢狀深度。
+_VOID_TAGS = frozenset(
+    ("img", "br", "hr", "meta", "input", "link", "col", "area", "base", "wbr")
+)
+_TAG_RE = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9]*)([^>]*?)(/?)>")
+
+
+def _top_level_ends(body: str) -> list[int]:
+    """回傳 body 裡每個頂層元素結束後的位移（巢狀深度回到 0 的位置）。
+
+    只認標籤的巢狀深度，不解析屬性內容——產生這份 HTML 的是 python-markdown
+    的序列化器，屬性值裡的 `<` `>` 都已經轉義，程式碼區塊的內容也是。
+    只要掃到深度為負或收尾不為 0（代表這份 HTML 不如預期）就回空清單，
+    呼叫端會退回「一次到底」，寧可不分段也不要切出壞掉的片段。
+    """
+    depth = 0
+    ends: list[int] = []
+    for match in _TAG_RE.finditer(body):
+        closing, name, _attrs, self_closing = match.groups()
+        if self_closing or name.lower() in _VOID_TAGS:
+            continue
+        depth += -1 if closing else 1
+        if depth == 0:
+            ends.append(match.end())
+        elif depth < 0:
+            return []
+    return [] if depth else ends
+
+
+def split_for_progressive_render(page: str) -> tuple[str, list[str]]:
+    """把整頁 HTML 拆成「首屏」與之後要逐塊附加的片段。
+
+    回傳 (首屏整頁 HTML, [片段, ...])。片段是裸的 body 片段，交給
+    QTextCursor.insertHtml 附加。不適合分段時回傳 (原樣, []),
+    呼叫端照舊一次 setHtml 到底。
+
+    不分段的情況：找不到 body、掃描結果不平衡、頂層元素太少。
+    """
+    start = page.find("<body>")
+    end = page.rfind("</body>")
+    if start < 0 or end < 0 or end <= start:
+        return page, []
+    start += len("<body>")
+
+    body = page[start:end]
+    ends = _top_level_ends(body)
+    if len(ends) < config.PROGRESSIVE_MIN_ELEMENTS:
+        return page, []
+
+    first = config.PROGRESSIVE_FIRST_ELEMENTS
+    step = config.PROGRESSIVE_CHUNK_ELEMENTS
+    cuts = [ends[min(first, len(ends)) - 1]]
+    index = first
+    while index < len(ends):
+        index = min(index + step, len(ends))
+        cuts.append(ends[index - 1])
+
+    head = page[:start] + body[: cuts[0]] + page[end:]
+    chunks = [body[a:b] for a, b in zip(cuts, cuts[1:]) if b > a]
+    return head, chunks
 
 
 def render_error(error: DocumentError, path: str = "") -> str:
