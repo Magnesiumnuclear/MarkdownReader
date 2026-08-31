@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import os
 
-from . import document
+from . import config, document
 from .browser import MarkdownBrowser
+from .language import t
 
 
 class DocumentTab:
@@ -58,11 +59,7 @@ class DocumentTab:
     def display_name(self) -> str:
         if self.path:
             return os.path.basename(self.path) or self.path
-        return "新分頁"
-
-    @property
-    def tooltip(self) -> str:
-        return self.path or "尚未開啟檔案"
+        return t("tab.newTab")
 
     # -- 讀檔 ----------------------------------------------------------------
     def load(self) -> None:
@@ -92,6 +89,19 @@ class DocumentTab:
             return None
 
     # -- 產生 HTML -----------------------------------------------------------
+    def on_language_changed(self) -> None:
+        """語言換了之後，這個分頁的 HTML 快取還能不能用。
+
+        快取鍵是「主題」，不含語言，而且刻意維持這樣：一般文件的 HTML 完全
+        不含介面字串（歡迎頁與錯誤頁根本不進快取，見 build_html），唯一的例外
+        是 render_document 對超過 LARGE_FILE_BYTES 的檔案插在頁首的那條警告。
+        把語言加進鍵，等於每次切語言都讓兩個主題的快取一起作廢，1MB 的文件
+        要再付一次 518ms 的 Markdown 轉換——為了一條警告不值得。
+        """
+        self.dirty = True
+        if self.meta is not None and self.meta.size_bytes > config.LARGE_FILE_BYTES:
+            self._html_cache.clear()
+
     def build_html(self, theme: str) -> str:
         """產生（或取用快取的）HTML。
 

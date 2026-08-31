@@ -53,7 +53,17 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from . import config, document, icons, qt_html, styles, theme as theme_utils, win32
+from . import (
+    config,
+    document,
+    icons,
+    language,
+    qt_html,
+    styles,
+    theme as theme_utils,
+    win32,
+)
+from .language import t
 from .browser import MarkdownBrowser
 from .document_tab import DocumentTab
 from .find_bar import FindBar
@@ -87,7 +97,10 @@ class StatusPathLabel(QLabel):
         super().__init__("", parent)
         self.setObjectName("statusPathLabel")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip("在檔案總管中顯示")
+        self.setToolTip(t("status.revealTip"))
+
+    def apply_language(self) -> None:
+        self.setToolTip(t("status.revealTip"))
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         if (event.button() == Qt.MouseButton.LeftButton
@@ -256,6 +269,18 @@ class MarkdownViewer(QWidget):
         self.setAcceptDrops(True)
 
         self._settings = QSettings(config.ORG_NAME, config.APP_NAME)
+
+        # 【一定要在 _build_ui 之前】標題列與設定面板是建構當下就把文字塞進
+        # 元件的，目錄還沒載入的話整個介面會是一堆翻譯鍵。也因為如此，建構子
+        # 不需要（也不該）再呼叫一次 apply_language——那和 apply_theme 的處境
+        # 不同：QSS 沒辦法在建構時套，文字可以。
+        self._language_mode = language.mode_from_settings(self._settings)
+        self._language = language.resolve(self._language_mode)
+        language.set_current(self._language)
+
+        # 狀態列目前顯示的是不是「正在載入」。用旗標而不是比對文案：
+        # 文案會隨語言變，拿它當程式邏輯用一翻譯就壞（見 _set_status）。
+        self._status_is_busy = False
 
         # 主題模式預設為 system：首次啟動就會採用 Windows 目前的深淺色設定，
         # 之後系統切換時也會即時跟著變，直到使用者手動鎖定淺色或深色。
@@ -706,8 +731,10 @@ class MarkdownViewer(QWidget):
             tab.dirty = True
 
     def _sync_tab_bar(self) -> None:
+        # 傳路徑而不是 tooltip：tooltip 是翻譯過的字串，拿它當「結構有沒有變」
+        # 的依據會讓語言一換就整列重建（見 TabButton.matches）
         self.tab_bar.set_tabs(
-            [(tab.display_name, tab.tooltip) for tab in self._tabs], self._active
+            [(tab.display_name, tab.path) for tab in self._tabs], self._active
         )
 
     # -- 外部開檔（單一實例） ------------------------------------------------
@@ -812,6 +839,7 @@ class MarkdownViewer(QWidget):
         self.tab_bar.drag_ended = self._clear_insert_markers
         self.tab_bar.newTabRequested.connect(self.open_dialog)
 
+        self.settings_panel.languageModeChanged.connect(self.set_language_mode)
         self.settings_panel.themeModeChanged.connect(self.set_theme_mode)
         self.settings_panel.lineHeightChanged.connect(self.set_line_height)
         self.settings_panel.contentWidthChanged.connect(self.set_content_width)
@@ -862,7 +890,7 @@ class MarkdownViewer(QWidget):
         緊接著就會被 open_path 蓋掉，等於白做一次 Markdown 轉換與版面計算。
         """
         self._theme = theme
-        self.setStyleSheet(styles.build_qss(theme))
+        self.setStyleSheet(styles.build_qss(theme, self._language))
         self.title_bar.apply_theme(theme)
         self.tab_bar.apply_theme(theme)
         self.find_bar.apply_theme(theme)
@@ -920,6 +948,67 @@ class MarkdownViewer(QWidget):
         self._mark_all_dirty()
         self._apply_content_width()
         self._sync_settings_panel()
+
+    # -- 語言 ----------------------------------------------------------------
+    def apply_language(self, code: str, render: bool = True) -> None:
+        """套用語言：介面文字、tooltip、視窗標題、狀態列與歡迎／錯誤頁一次同步。
+
+        刻意比照 apply_theme 手寫呼叫四個頂層元件，而不是 findChildren 自動
+        走訪：自動走訪碰不到「文字是算出來的」那些地方（狀態列、視窗標題、
+        拖曳徽章、applicationDisplayName），而漏掉時完全沒有徵兆。名單寫在
+        這裡，日後多一個元件會在 code review 上看得到。
+        """
+        language.set_current(code)          # 行程全域，含 Qt 內建翻譯的掛載
+        self._language = code
+
+        # 和 main.py 的 setApplicationDisplayName 必須同源，否則 Windows 會在
+        # 標題後面自動補一段舊語言的後綴（見 _update_titles 的說明）
+        app = QApplication.instance()
+        if app is not None:
+            app.setApplicationDisplayName(t("app.displayName"))
+
+        self.title_bar.apply_language()
+        self.tab_bar.apply_language()
+        self.find_bar.apply_language()
+        self.settings_panel.apply_language()
+        self.status_path_label.apply_language()
+
+        for tab in self._tabs:
+            tab.on_language_changed()
+        self._sync_tab_bar()
+        self._sync_settings_panel()
+        self._update_titles(
+            os.path.basename(self._tab.path) if self._tab.path else None
+        )
+        self._refresh_status_text()
+
+        # 介面字型隨語言換（styles.FONT_UI_BY_LANGUAGE），QSS 與文件 CSS 都要
+        # 重算。借道 apply_theme 而不是自己 setStyleSheet：「全專案只有一次
+        # setStyleSheet」的規範就在那個函式裡，在這裡再開一次就破功了。
+        # 它順帶把所有分頁標記 dirty 並重繪看得到的那個——正是語言切換需要的。
+        self.apply_theme(self._theme, render=render)
+
+    def set_language_mode(self, mode: str) -> None:
+        """設定語言模式："zh_TW" / "en" / "system"。"""
+        if mode not in {code for code, _key in config.LANGUAGE_MODES}:
+            return
+        self._language_mode = mode
+        self._settings.setValue(config.KEY_LANGUAGE_MODE, mode)
+        self.apply_language(language.resolve(mode))
+        if self._manager is not None:
+            self._manager.broadcast_language(mode, origin=self)
+
+    def adopt_language_mode(self, mode: str) -> None:
+        """別的視窗改了語言，這裡跟著套用。
+
+        刻意不重用 set_language_mode：那會再寫一次 QSettings（多餘）並再廣播
+        一次（無窮迴圈）。名字說明了「這是外面傳進來的」，和 note_activated
+        同一個路數。
+        """
+        if mode == self._language_mode:
+            return
+        self._language_mode = mode
+        self.apply_language(language.resolve(mode))
 
     def _line_height_percent(self) -> int:
         for key, _label, percent in config.LINE_HEIGHT_OPTIONS:
@@ -1009,6 +1098,7 @@ class MarkdownViewer(QWidget):
 
     def _sync_settings_panel(self) -> None:
         self.settings_panel.sync(
+            language_mode=self._language_mode,
             theme_mode=self._theme_mode,
             font_point_size=self._font_point_size,
             line_height=self._line_height,
@@ -1040,19 +1130,22 @@ class MarkdownViewer(QWidget):
             (config.KEY_CONFIRM_LINKS, self._confirm_links),
             (config.KEY_RESTORE_TABS, self._restore_tabs),
             (config.KEY_STATUS_VISIBLE, self._status_visible),
+            (config.KEY_LANGUAGE_MODE, config.DEFAULT_LANGUAGE_MODE),
         ):
             self._settings.setValue(key, value)
 
         self._watch_files()
+        # 語言要先切回預設，最後那則訊息才會是新語言的
+        self.set_language_mode(config.DEFAULT_LANGUAGE_MODE)
         self.set_theme_mode(config.DEFAULT_THEME_MODE)
         self.status_path_label.setText("")
-        self.status_label.setText("已恢復預設設定")
+        self._set_status(t("status.resetDone"))
 
     # -- 開檔與渲染 ----------------------------------------------------------
     def open_dialog(self) -> None:
         start_dir = os.path.dirname(self._tab.path) if self._tab.path else ""
         path, _selected = QFileDialog.getOpenFileName(
-            self, "開啟 Markdown 檔案", start_dir, config.OPEN_DIALOG_FILTER
+            self, t("dialog.openTitle"), start_dir, t("dialog.openFilter")
         )
         if path:
             self.open_path(path, new_tab=True)
@@ -1098,7 +1191,7 @@ class MarkdownViewer(QWidget):
             self._render(preserve_scroll=False)
             self._update_titles(os.path.basename(path) or path)
             self.status_path_label.setText("")
-            self.status_label.setText(f"無法讀取：{path}")
+            self._set_status(t("status.readFailed", path=path))
             self._sync_tab_bar()
             self._watch_files()
             return
@@ -1121,9 +1214,9 @@ class MarkdownViewer(QWidget):
         self._tab.error = None
         self._tab.loaded = True
         self._render(preserve_scroll=False)
-        self._update_titles(config.APP_DISPLAY_NAME)
+        self._update_titles(None)
         self.status_path_label.setText("")
-        self.status_label.setText("尚未開啟檔案 — 按 Ctrl+O 或直接拖放 .md 檔到視窗")
+        self._set_status(t("status.noFile"))
 
     def _render(self, preserve_scroll: bool = True) -> None:
         """重新產生 HTML 並套用，預設保留閱讀位置。
@@ -1149,7 +1242,10 @@ class MarkdownViewer(QWidget):
         # 因為 h6 的字級只能用絕對單位指定（詳見 styles.py 的說明）。
         self.browser.document().setDefaultStyleSheet(
             styles.build_doc_css(
-                self._theme, self._font_point_size, self._line_height_percent()
+                self._theme,
+                self._font_point_size,
+                self._line_height_percent(),
+                self._language,
             )
         )
 
@@ -1267,13 +1363,25 @@ class MarkdownViewer(QWidget):
         bar.setValue(int(round(ratio * bar.maximum())))
 
     # -- 標題與狀態列 --------------------------------------------------------
-    def _update_titles(self, name: str) -> None:
-        self.title_bar.set_title(name)
+    def _update_titles(self, name: str | None) -> None:
+        """更新標題列與視窗標題。name 為 None 代表歡迎頁（目前沒有開檔）。
+
+        原本是拿 name 和產品名稱做字串相等來判斷歡迎頁。產品名稱一旦隨語言
+        改變，那個判斷會在切語言的瞬間失效，標題會變成
+        「Markdown Reader — Markdown Reader」。改由呼叫端明講。
+        """
+        self.title_bar.set_title(name if name is not None else t("app.displayName"))
         # 歡迎頁的名稱就是程式名稱，避免標題出現重複的「閱讀器 — 閱讀器」
-        if name == config.APP_DISPLAY_NAME:
-            self.setWindowTitle(config.APP_DISPLAY_NAME)
-        else:
-            self.setWindowTitle(f"{name} — {config.APP_DISPLAY_NAME}")
+        app_name = t("app.displayName")
+        # 【windowTitle 一定要以 applicationDisplayName 結尾】
+        # Qt 在 Windows 上若發現 windowTitle 沒有以 applicationDisplayName 收尾，
+        # 會自動補一段 " - <displayName>"。兩邊來源不一致時實測會得到
+        # 「note.md — Markdown Reader - Markdown 閱讀器」。因此這裡的後綴與
+        # main.py 的 setApplicationDisplayName 必須是同一個 t("app.displayName")，
+        # 語言切換時兩邊也要同時更新（apply_language 有一行專門做這件事）。
+        self.setWindowTitle(
+            app_name if name is None else t("window.title", name=name, app=app_name)
+        )
 
     def _on_link_hovered(self, url: QUrl) -> None:
         """滑鼠移到連結上：在狀態列顯示目標，移開就恢復原本的檔案資訊。
@@ -1311,7 +1419,9 @@ class MarkdownViewer(QWidget):
             name = os.path.basename(path) if path else ""
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             previous = self.status_label.text()
-            self.status_label.setText(f"　·　正在載入 {name}…")
+            was_busy = self._status_is_busy
+            self._set_status(t("status.separator") + t("status.loading", name=name),
+                             busy=True)
             # 這一段會同步凍結，訊息必須在凍結前就畫出來；repaint() 直接重繪，
             # 不像 processEvents 會重入事件迴圈（重入會在載入途中處理別的
             # 訊號，本專案已經為此付過代價，見 single_instance 的註解）。
@@ -1322,8 +1432,10 @@ class MarkdownViewer(QWidget):
                 # 一定要用 finally：例外路徑若沒還原，等待游標會永遠卡住。
                 # FramelessResizer 也在用覆蓋游標，這裡必須成對還原不能清空堆疊。
                 QApplication.restoreOverrideCursor()
-                if self.status_label.text().startswith("　·　正在載入"):
-                    self.status_label.setText(previous)
+                # 只有「訊息還是我貼的那一則」才還原——中途被別人蓋掉就別動它。
+                # 判斷用旗標而不是比對文案（見 _set_status）。
+                if self._status_is_busy:
+                    self._set_status(previous, busy=was_busy)
 
         try:
             large = path and os.path.getsize(path) >= config.BUSY_FEEDBACK_BYTES
@@ -1331,19 +1443,48 @@ class MarkdownViewer(QWidget):
             large = False
         return _busy() if large else _noop()
 
+    def _set_status(self, text: str, *, busy: bool = False) -> None:
+        """狀態列訊息的唯一入口。
+
+        busy 旗標取代原本的「text().startswith(\"　·　正在載入\")」——那是拿
+        翻譯過的文案當程式邏輯用，切到英文之後永遠不成立，忙碌訊息會永久
+        卡在狀態列。旗標和語言無關，怎麼翻都不會壞。
+        """
+        self._status_is_busy = busy
+        self.status_label.setText(text)
+
     def _update_status(self) -> None:
         if self._tab.meta is None:
             return
         meta = self._tab.meta
+        # 千分位交給 format：中英文都用逗號，5,272 行遠比 5272 行好讀。
+        # 修改時間刻意維持 ISO：無歧義、可排序、寬度固定，不隨語言變。
         parts = [
             meta.encoding,
             meta.size_text,
-            f"{meta.line_count} 行",
-            f"{meta.char_count} 字",
+            t("status.lines", count=f"{meta.line_count:,}"),
+            t("status.chars", count=f"{meta.char_count:,}"),
             meta.modified.strftime("%Y-%m-%d %H:%M:%S"),
         ]
+        separator = t("status.separator")
         self.status_path_label.setText(meta.path)
-        self.status_label.setText("　·　" + "　·　".join(parts))
+        self._set_status(separator + separator.join(parts))
+
+    def _refresh_status_text(self) -> None:
+        """依目前分頁狀態重畫狀態列（開檔成功／失敗／歡迎頁三種）。
+
+        語言切換之後要重跑一次：狀態列的內容是算出來的，不是掛在某個
+        元件上的靜態文字，登記表那一套抓不到它。
+        """
+        tab = self._tab
+        if tab.error is not None and tab.path:
+            self.status_path_label.setText("")
+            self._set_status(t("status.readFailed", path=tab.path))
+        elif tab.meta is not None:
+            self._update_status()
+        else:
+            self.status_path_label.setText("")
+            self._set_status(t("status.noFile"))
 
     def _on_status_path_clicked(self) -> None:
         """點狀態列的路徑：在檔案總管中開啟所在資料夾並選取該檔。"""
@@ -1469,7 +1610,7 @@ class MarkdownViewer(QWidget):
             if os.path.exists(local_path):
                 QDesktopServices.openUrl(QUrl.fromLocalFile(local_path))
                 return
-            self.status_label.setText(f"找不到連結目標：{local_path}")
+            self._set_status(t("status.linkNotFound", path=local_path))
             return
 
         self._open_external(url)
@@ -1481,15 +1622,13 @@ class MarkdownViewer(QWidget):
             display = target if len(target) <= 90 else target[:87] + "..."
             answer = QMessageBox.question(
                 self,
-                "開啟外部連結",
-                f"""要用預設瀏覽器開啟這個連結嗎？
-
-{display}""",
+                t("dialog.externalLink.title"),
+                t("dialog.externalLink.body", target=display),
                 QMessageBox.StandardButton.Open | QMessageBox.StandardButton.Cancel,
                 QMessageBox.StandardButton.Open,
             )
             if answer != QMessageBox.StandardButton.Open:
-                self.status_label.setText(f"已取消開啟連結：{target}")
+                self._set_status(t("status.linkCancelled", target=target))
                 return
         QDesktopServices.openUrl(url)
 
@@ -1672,17 +1811,15 @@ class MarkdownViewer(QWidget):
         # 要在這裡收掉手勢，否則全域拖曳游標與置頂的幽靈視窗會殘留
         # （詳見 tab_bar.cancel_active_drag 的說明）
         self.tab_bar.cancel_active_drag()
+        # 【這裡刻意不回寫各項設定】
+        # 每個設定在被改動的當下就由它自己的 setter 寫進 QSettings 了，關窗再
+        # 寫一次純屬多餘——而且有害：多視窗時，先開的那個視窗握著的是它「開啟
+        # 當下」的值，別的視窗之後改過的設定會在它關閉時被舊值蓋回去。實際症狀
+        # 是「在 B 視窗調大字級，關掉 A 視窗，下次啟動又變回原樣」。
+        # 只有幾何、最大化與工作階段是「關閉當下才知道」的，留在這裡。
         self._settings.setValue(config.KEY_MAXIMIZED, self.isMaximized())
         if not self.isMaximized():
             self._settings.setValue(config.KEY_GEOMETRY, self.saveGeometry())
-        self._settings.setValue(config.KEY_THEME_MODE, self._theme_mode)
-        self._settings.setValue(config.KEY_FONT_SIZE, self._font_point_size)
-        self._settings.setValue(config.KEY_LINE_HEIGHT, self._line_height)
-        self._settings.setValue(config.KEY_CONTENT_WIDTH, self._content_width)
-        self._settings.setValue(config.KEY_ALWAYS_ON_TOP, self._always_on_top)
-        self._settings.setValue(config.KEY_AUTO_RELOAD, self._auto_reload)
-        self._settings.setValue(config.KEY_CONFIRM_LINKS, self._confirm_links)
-        self._settings.setValue(config.KEY_RESTORE_TABS, self._restore_tabs)
         self._save_session()
         self._settings.sync()
 

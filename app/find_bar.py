@@ -19,6 +19,7 @@ from PyQt6.QtGui import QColor, QTextCursor
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QTextBrowser, QTextEdit, QWidget
 
 from . import config, styles
+from .language import t
 from .title_bar import IconButton
 
 
@@ -53,16 +54,16 @@ class FindBar(QWidget):
 
         self.input = QLineEdit(self)
         self.input.setObjectName("findInput")
-        self.input.setPlaceholderText("搜尋文件內容…")
+        self.input.setPlaceholderText(t("find.placeholder"))
         self.input.setClearButtonEnabled(False)
         self.input.installEventFilter(self)
 
         self.status = QLabel("", self)
         self.status.setObjectName("findStatus")
 
-        self.prev_button = IconButton("arrow_up", "上一個 (Shift+Enter)", self, size=tool_size)
-        self.next_button = IconButton("arrow_down", "下一個 (Enter)", self, size=tool_size)
-        self.close_button = IconButton("close", "關閉搜尋 (Esc)", self, size=tool_size)
+        self.prev_button = IconButton("arrow_up", "find.prev", self, size=tool_size)
+        self.next_button = IconButton("arrow_down", "find.next", self, size=tool_size)
+        self.close_button = IconButton("close", "find.close", self, size=tool_size)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(10, 5, 8, 5)
@@ -102,6 +103,16 @@ class FindBar(QWidget):
         self._invalidate_highlights()
         if self.isVisible():
             self._sync_highlights()
+
+    def apply_language(self) -> None:
+        """語言切換：靜態文字重設，狀態文字交給既有的重算路徑。"""
+        self.input.setPlaceholderText(t("find.placeholder"))
+        for button in (self.prev_button, self.next_button, self.close_button):
+            button.apply_language()
+        if self.isVisible():
+            # 「N / M」與「無相符」是狀態衍生的，refresh_for_new_document 本來
+            # 就是為了「狀態衍生文字要重算」而存在，直接重用
+            self.refresh_for_new_document()
 
     def refresh_for_new_document(self) -> None:
         """文件被重建（重新渲染、換主題、換字級）之後重新比對。
@@ -181,7 +192,7 @@ class FindBar(QWidget):
 
         if not self._matches:
             self._clear_highlights()
-            self.status.setText("無相符")
+            self.status.setText(t("find.noMatch"))
             return
 
         anchor = self._browser.textCursor().selectionStart()
@@ -215,11 +226,12 @@ class FindBar(QWidget):
         self._browser.setTextCursor(cursor)
         self._browser.ensureCursorVisible()
         total = len(self._matches)
-        text = f"{self._current_index + 1} / {total}"
-        if total > self.MAX_HIGHLIGHTS:
-            # 沒有全部畫出來就要講：捲到遠處看見沒上色的相符字會像是壞掉
-            text += f"（高亮鄰近 {self.MAX_HIGHLIGHTS} 筆）"
-        self.status.setText(text)
+        # 沒有全部畫出來就要講：捲到遠處看見沒上色的相符字會像是壞掉。
+        # 整句一個鍵而不是拼接——英文的括號是半形，那是翻譯的一部分。
+        key = "find.countCapped" if total > self.MAX_HIGHLIGHTS else "find.count"
+        self.status.setText(t(
+            key, current=self._current_index + 1, total=total, cap=self.MAX_HIGHLIGHTS
+        ))
         self._sync_highlights()
 
     # -- 高亮 ----------------------------------------------------------------

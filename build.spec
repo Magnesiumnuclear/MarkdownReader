@@ -88,7 +88,8 @@ a = Analysis(
     binaries=[],
     # SVG 圖示是外部檔案，一定要打包進去；程式端一律透過
     # app.resources.resource_path() 讀取，會自動處理 sys._MEIPASS
-    datas=[("assets", "assets")],
+    # languages/*.json 同理，透過 app.resources.resource_path() 讀取
+    datas=[("assets", "assets"), ("languages", "languages")],
     # 搭配 main.py 頂端的顯式 import，確保 Qt 的 SVG 插件
     # （qsvg.dll / qsvgicon.dll）一併被收錄。
     # QtNetwork 供單一實例的具名管道使用，寫在這裡避免日後被誤判成沒用到。

@@ -37,6 +37,7 @@ from PyQt6.QtWidgets import (
 )
 
 from . import config, styles
+from .language import t
 from .title_bar import IconButton
 
 # 離開分頁列矩形四周多少邏輯像素才算「撕下來」。太小會誤觸，
@@ -62,11 +63,11 @@ class DragGhost(QWidget):
     - ShowWithoutActivating：不能搶焦點，搶了拖曳手勢就斷了。
     """
 
-    # 下一步預告的文案。key 與 viewer 的 _drag_intent_at 回傳值對應。
-    INTENT_TEXT = {
-        "merge": "合併",
-        "detach": "拆分為新視窗",
-        "none": "無動作",
+    # 下一步預告的翻譯鍵。key 與 viewer 的 _drag_intent_at 回傳值對應。
+    INTENT_KEYS = {
+        "merge": "tab.drag.merge",
+        "detach": "tab.drag.detach",
+        "none": "tab.drag.none",
     }
 
     def __init__(self, pixmap, theme: str, grab_offset: QPoint) -> None:
@@ -113,22 +114,34 @@ class DragGhost(QWidget):
         if intent == self._intent:
             return
         self._intent = intent
-        self._badge.setText(self.INTENT_TEXT.get(intent, ""))
-        self._badge.setProperty("intent", intent)
-        # 動態屬性變了要重跑 QSS 選擇器
-        self._badge.style().unpolish(self._badge)
-        self._badge.style().polish(self._badge)
-        self.adjustSize()
+        self._paint_intent()
         # 【合併時幽靈要讓路】相對跟隨後幽靈蓋在游標正下方，而合併瞄準的唯一
         # 落點回饋——目標分頁列上的插入指示線——就在游標底下。實測抓分頁中央
         # 拖去合併時，0.9 的不透明度會把指示線 100% 蓋掉，使用者根本瞄不了。
         # 合併時降到 0.45：指示線與目標分頁列透出來、徽章仍看得清。
         self.setWindowOpacity(0.45 if intent == "merge" else 0.9)
 
+    def _paint_intent(self) -> None:
+        """把目前的 intent 畫成徽章。
+
+        從 set_intent 抽出來，是因為 set_intent 對相同 intent 會早退——
+        語言切換時 intent 沒變、但文字要換，早退會把它擋掉。
+        """
+        self._badge.setText(t(self.INTENT_KEYS.get(self._intent, "tab.drag.none")))
+        self._badge.setProperty("intent", self._intent)
+        # 動態屬性變了要重跑 QSS 選擇器
+        self._badge.style().unpolish(self._badge)
+        self._badge.style().polish(self._badge)
+        self.adjustSize()
+
     def apply_theme(self, theme: str) -> None:
         """拖曳途中主題被切換（例如 Windows 排程的自動深色模式）時重套樣式，
         否則徽章配色會停在舊主題直到放開。"""
         self.setStyleSheet(styles.build_ghost_qss(theme))
+
+    def apply_language(self) -> None:
+        """拖曳途中換語言：徽章文字跟著換。"""
+        self._paint_intent()
 
     def follow(self, global_pos: QPoint) -> None:
         """讓按下時抓的那一點一直待在游標底下（瀏覽器的行為）。
@@ -151,12 +164,13 @@ class TabButton(QFrame):
     def __init__(
         self,
         name: str,
-        tooltip: str,
+        path: str | None,
         active: bool,
         theme: str,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        self._path = path
         self._active = active
         self._theme = theme
         self._press_pos: QPoint | None = None
@@ -168,7 +182,7 @@ class TabButton(QFrame):
         self.setMaximumWidth(config.TAB_MAX_WIDTH)
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self.setCursor(Qt.CursorShape.ArrowCursor)
-        self.setToolTip(tooltip)
+        self.setToolTip(path or t("tab.noFile"))
 
         row = QHBoxLayout(self)
         row.setContentsMargins(12, 0, 5, 0)
@@ -184,7 +198,7 @@ class TabButton(QFrame):
         )
         row.addWidget(self._label, 1)
 
-        self._close = IconButton("close", "關閉分頁", self, size=(18, 18))
+        self._close = IconButton("close", "tab.close", self, size=(18, 18))
         self._close.setObjectName("tabClose")
         self._close.setIconSize(QSize(10, 10))
         self._close.apply_theme(theme)
@@ -194,8 +208,15 @@ class TabButton(QFrame):
         row.addWidget(self._close)
 
     # -- 樣式 ----------------------------------------------------------------
-    def matches(self, name: str, tooltip: str) -> bool:
-        return self._name == name and self.toolTip() == tooltip
+    def matches(self, name: str, path: str | None) -> bool:
+        """結構是否相同。
+
+        比對的是**路徑**而不是 tooltip：沒有路徑的空白分頁，tooltip 是翻譯過的
+        「尚未開啟檔案」，拿它來比會讓語言一換就判定成結構改變而重建按鈕——
+        而「拖曳期間重建按鈕」正是本模組開頭警告的那個崩潰類別。
+        路徑是穩定身分，翻譯字串不是。
+        """
+        return self._name == name and self._path == path
 
     def set_active(self, active: bool) -> None:
         """就地切換選取樣式，不重建元件（拖曳中換 objectName 也安全）。"""
@@ -213,6 +234,10 @@ class TabButton(QFrame):
     def apply_theme(self, theme: str) -> None:
         self._theme = theme
         self._close.apply_theme(theme)
+
+    def apply_language(self) -> None:
+        self._close.apply_language()
+        self.setToolTip(self._path or t("tab.noFile"))
 
     # -- 滑鼠 ----------------------------------------------------------------
     def enterEvent(self, event) -> None:  # noqa: N802
@@ -346,7 +371,7 @@ class TabBar(QFrame):
         self._insert_marker.hide()
 
         self.new_button = IconButton(
-            "plus", "開新分頁 (Ctrl+T)", self, size=(30, config.TAB_HEIGHT)
+            "plus", "tab.new", self, size=(30, config.TAB_HEIGHT)
         )
         self.new_button.setObjectName("tabNew")
         self.new_button.clicked.connect(self.newTabRequested)
@@ -358,13 +383,13 @@ class TabBar(QFrame):
     def set_tabs(self, entries: list[tuple[str, str]], active: int) -> None:
         """更新整列。entries 是 (顯示名稱, 完整路徑) 的清單。
 
-        結構相同（同數量、同名稱與 tooltip、同順序）時只就地更新選取樣式。
+        結構相同（同數量、同名稱與路徑、同順序）時只就地更新選取樣式。
         這不只是效能：按下分頁會觸發 activate -> set_tabs，若在這裡重建，
         被按住的按鈕會在拖曳手勢中被銷毀（見模組開頭）。
         """
         same_structure = len(entries) == len(self._buttons) and all(
-            button.matches(name, tooltip)
-            for button, (name, tooltip) in zip(self._buttons, entries)
+            button.matches(name, path)
+            for button, (name, path) in zip(self._buttons, entries)
         )
         if same_structure:
             for index, button in enumerate(self._buttons):
@@ -375,8 +400,8 @@ class TabBar(QFrame):
                 button.setParent(None)
                 button.deleteLater()
             self._buttons.clear()
-            for index, (name, tooltip) in enumerate(entries):
-                button = TabButton(name, tooltip, index == active, self._theme, self._strip)
+            for index, (name, path) in enumerate(entries):
+                button = TabButton(name, path, index == active, self._theme, self._strip)
                 self._connect_button(button)
                 self._row.insertWidget(index, button)
                 self._buttons.append(button)
@@ -410,6 +435,14 @@ class TabBar(QFrame):
         # 拖曳進行中主題可能被系統切換（自動深色模式），幽靈也要跟上
         if self._ghost is not None:
             self._ghost.apply_theme(theme)
+
+    def apply_language(self) -> None:
+        self.new_button.apply_language()
+        for button in self._buttons:
+            button.apply_language()
+        # 比照上面的 apply_theme：拖曳途中換語言，幽靈的徽章也要跟上
+        if self._ghost is not None:
+            self._ghost.apply_language()
 
     # -- 拖曳 ----------------------------------------------------------------
     def _on_drag_started(self, button: TabButton) -> None:

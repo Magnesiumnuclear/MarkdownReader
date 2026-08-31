@@ -16,9 +16,23 @@ from __future__ import annotations
 
 from string import Template
 
+from . import config
+
 # --- 字型（QSS 與文件 CSS 共用同一份定義） ----------------------------------
-FONT_UI = '"Microsoft JhengHei", "微軟正黑體", sans-serif'
+# 介面字型隨語言換 fallback 順序：微軟正黑體的西文字母字距偏鬆，英文介面下
+# 讀起來不俐落；反過來 Segoe UI 沒有完整的中日韓字符。兩邊都把對方列為次選，
+# 缺字時仍有東西可退。
+FONT_UI_BY_LANGUAGE = {
+    "zh_TW": '"Microsoft JhengHei", "微軟正黑體", "Segoe UI", sans-serif',
+    "en": '"Segoe UI", "Microsoft JhengHei", sans-serif',
+}
 FONT_CODE = '"Cascadia Code", "Consolas", monospace'
+
+
+def font_ui(language_code: str) -> str:
+    return FONT_UI_BY_LANGUAGE.get(
+        language_code, FONT_UI_BY_LANGUAGE[config.DEFAULT_LANGUAGE]
+    )
 
 # QTextDocument 的內文留白（由 viewer 套用到 document margin）
 DOCUMENT_MARGIN = 30
@@ -95,9 +109,15 @@ def other_theme(theme: str) -> str:
     return "dark" if theme == "light" else "light"
 
 
-def _values(theme: str) -> dict[str, str]:
+def _values(theme: str, language_code: str) -> dict[str, str]:
+    """樣板替換值。
+
+    語言是明確傳進來的，不讓這個模組去讀 language.current()：本專案從頭到尾
+    把 theme 一路傳下來、不依賴環境狀態，語言照辦。代價只有四個呼叫端，
+    換來的是這裡維持純函式、可以獨立測試。
+    """
     values = dict(palette(theme))
-    values["font_ui"] = FONT_UI
+    values["font_ui"] = font_ui(language_code)
     values["font_code"] = FONT_CODE
     return values
 
@@ -480,9 +500,9 @@ QToolTip {
 )
 
 
-def build_qss(theme: str) -> str:
+def build_qss(theme: str, language_code: str = config.DEFAULT_LANGUAGE) -> str:
     """產生整個視窗的 QSS（全專案唯一一次 setStyleSheet 就是套用這份字串）。"""
-    return _QSS.substitute(_values(theme))
+    return _QSS.substitute(_values(theme, language_code))
 
 
 # 拖曳幽靈是獨立的頂層小視窗，吃不到主視窗的 QSS，要自己套一份。
@@ -516,9 +536,9 @@ QLabel#dragGhostBadge[intent="detach"] {
 """)
 
 
-def build_ghost_qss(theme: str) -> str:
+def build_ghost_qss(theme: str, language_code: str = config.DEFAULT_LANGUAGE) -> str:
     """拖曳幽靈（分頁縮影＋下一步徽章）的 QSS。"""
-    return _GHOST_QSS.substitute(_values(theme))
+    return _GHOST_QSS.substitute(_values(theme, language_code))
 
 
 # --- Markdown 文件樣式（QTextDocument CSS） ---------------------------------
@@ -667,6 +687,7 @@ def build_doc_css(
     theme: str,
     base_point_size: float = 11.0,
     line_height: int = 160,
+    language_code: str = config.DEFAULT_LANGUAGE,
 ) -> str:
     """產生 QTextDocument 用的 Markdown 樣式表。
 
@@ -674,7 +695,7 @@ def build_doc_css(
     字級只能用絕對單位指定（見樣式表中的說明），必須隨縮放一起重算。
     line_height 是內文行高百分比，由設定列控制。
     """
-    values = _values(theme)
+    values = _values(theme, language_code)
     values["h6_size"] = f"{max(1.0, base_point_size * 0.72):.1f}pt"
     values["line_height"] = str(int(line_height))
     return _DOC_CSS.substitute(values)

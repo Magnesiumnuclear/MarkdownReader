@@ -149,6 +149,24 @@ class WindowManager(QObject):
         if self._last_active is viewer:
             self._last_active = self._windows[-1] if self._windows else None
 
+    def broadcast_language(self, mode: str, origin=None) -> None:
+        """把語言變更推到所有視窗。
+
+        每次都重新向 windows() 要一份清單、不快取視窗參照——沿用
+        viewer._update_insert_markers 的安全範式：期間視窗可能被關閉，
+        留著參照去用就是碰到已銷毀的 sip 包裝（本專案在捲軸快照上吃過這個虧）。
+
+        傳的是「模式」而不是解析後的語言碼：這樣每個視窗記住的 _language_mode
+        才會一致。只同步解析結果的話，其他視窗的模式會留在舊值，設定面板打開
+        來會顯示錯的選取項。
+
+        origin 是發起的那個視窗，它自己已經套過了，跳過以免多跑一次渲染。
+        """
+        for window in self.windows():
+            if window is origin:
+                continue
+            window.adopt_language_mode(mode)
+
     def note_activated(self, viewer: MarkdownViewer) -> None:
         """視窗被啟用時呼叫（viewer 的 changeEvent 轉進來）。"""
         if viewer in self._windows:

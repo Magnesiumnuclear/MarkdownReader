@@ -20,6 +20,7 @@ from datetime import datetime
 import markdown
 
 from . import config, styles
+from .language import t
 from .qt_html import QtRichTextExtension
 
 try:  # Pygments 只影響程式碼高亮，缺少時自動降級為純文字區塊
@@ -31,13 +32,33 @@ except ImportError:  # pragma: no cover - 視安裝環境而定
 
 
 class DocumentError(Exception):
-    """讀取文件失敗，附帶可直接顯示給使用者的說明。"""
+    """讀取文件失敗，附帶可顯示給使用者的說明。
 
-    def __init__(self, title: str, detail: str, hint: str = "") -> None:
-        super().__init__(f"{title}: {detail}")
-        self.title = title
-        self.detail = detail
-        self.hint = hint
+    【存的是翻譯鍵，不是翻好的字串】
+    錯誤物件會被分頁一直留著（DocumentTab.error），語言切換後 render_error
+    會拿它重畫一次。存翻好的字串的話，那一頁會永遠停在出錯當下的語言。
+    存鍵 + 參數，翻譯延到真的要顯示時才做。
+
+    exception message（給 log 用）仍在建構當下組出來——那是寫進 error.log 的
+    開發者訊息，不需要跟著介面語言跑。
+    """
+
+    def __init__(self, key: str, **args) -> None:
+        self.key = key
+        self.args_map = args
+        super().__init__(f"{key}: {args.get('path', '')}")
+
+    @property
+    def title(self) -> str:
+        return t(f"{self.key}.title", **self.args_map)
+
+    @property
+    def detail(self) -> str:
+        return t(f"{self.key}.detail", **self.args_map)
+
+    @property
+    def hint(self) -> str:
+        return t(f"{self.key}.hint", **self.args_map)
 
 
 @dataclass(frozen=True)
@@ -117,37 +138,26 @@ def _decode(raw: bytes) -> tuple[str, str]:
             continue
 
     # 保底：latin-1 不會失敗，但可能出現亂碼，因此在編碼名稱標註出來
-    return raw.decode("latin-1", errors="replace"), "latin-1（可能不正確）"
+    return raw.decode("latin-1", errors="replace"), t("encoding.latin1Uncertain")
 
 
 def read_text_file(path: str) -> tuple[str, DocumentMeta]:
     """讀取文字檔並回傳內容與附帶資訊；失敗時拋出 DocumentError。"""
     if os.path.isdir(path):
-        raise DocumentError(
-            "無法開啟資料夾",
-            f"指定的路徑是一個資料夾，而不是檔案：\n{path}",
-            "請改為指定一個 Markdown 檔案，或按 Ctrl+O 選擇檔案。",
-        )
+        raise DocumentError("error.isDir", path=path)
 
     try:
         raw = _read_bytes(path)
     except FileNotFoundError:
-        raise DocumentError(
-            "找不到檔案",
-            f"這個路徑不存在，或檔案已被移動、刪除、更名：\n{path}",
-            "請確認路徑是否正確，或按 Ctrl+O 重新選擇檔案。",
-        ) from None
+        raise DocumentError("error.notFound", path=path) from None
     except PermissionError:
-        raise DocumentError(
-            "沒有讀取權限",
-            f"系統拒絕存取這個檔案：\n{path}",
-            "檔案可能正被其他程式獨占，或需要較高權限才能讀取。",
-        ) from None
+        raise DocumentError("error.denied", path=path) from None
     except OSError as error:
+        # 例外訊息本身是 OS 給的，語系由作業系統決定，我們管不到
         raise DocumentError(
-            "讀取檔案時發生錯誤",
-            f"{path}\n\n{error.__class__.__name__}: {error}",
-            "請確認磁碟或網路位置是否正常。",
+            "error.readFailed",
+            path=path,
+            error=f"{error.__class__.__name__}: {error}",
         ) from None
 
     text, encoding = _decode(raw)
@@ -222,11 +232,7 @@ def render_document(text: str, meta: DocumentMeta, theme: str) -> str:
     body = markdown_to_html(text, theme)
     if meta.size_bytes > config.LARGE_FILE_BYTES:
         body = (
-            _notice(
-                "warncell",
-                f"<b>大型文件（{html.escape(meta.size_text)}）</b>"
-                "<br>內容較多，排版與捲動可能較慢。",
-            )
+            _notice("warncell", t("doc.largeFile", size=html.escape(meta.size_text)))
             + body
         )
     return _page(body)
@@ -303,32 +309,30 @@ def render_error(error: DocumentError, path: str = "") -> str:
     body.append(_notice("noticecell", f'<span class="mono">{detail}</span>'))
     if hint:
         body.append(f'<p class="muted">{hint}</p>')
-    body.append(
-        '<p class="muted">可用按鍵：<b>Ctrl+O</b> 開啟其他檔案、'
-        "<b>F5</b> 重新載入、<b>Ctrl+W</b> 關閉視窗。</p>"
-    )
+    body.append('<p class="muted">' + t("error.keys") + "</p>")
     return _page("".join(body))
+
+
+# 歡迎頁的快速鍵列。兩欄都進語言檔：按鍵名稱多半兩種語言相同，
+# 但「Alt + 左方向鍵」在英文是 "Alt + Left"，不能只翻說明那一欄。
+_WELCOME_SHORTCUTS = (
+    "open", "newTab", "closeTab", "switchTab", "reload", "find",
+    "settings", "theme", "pin", "zoom", "back", "maximize", "escape",
+)
 
 
 def render_welcome() -> str:
     """未指定檔案時顯示的歡迎頁。"""
     rows = [
-        ("Ctrl + O", "開啟 Markdown 檔案（開在新分頁）"),
-        ("Ctrl + T", "開一個空白分頁"),
-        ("Ctrl + W", "關閉目前分頁；只剩一個時關閉視窗"),
-        ("Ctrl + Tab / Ctrl + Shift + Tab", "切換到下一個／上一個分頁"),
-        ("F5 / Ctrl + R", "重新載入目前檔案"),
-        ("Ctrl + F", "在文件中搜尋"),
-        ("Ctrl + ,", "開啟設定列"),
-        ("Ctrl + D", "切換深色／淺色主題（會鎖定，不再跟隨系統）"),
-        ("Ctrl + P", "切換視窗釘選最上層"),
-        ("Ctrl + + / - / 0", "放大／縮小／重設字級"),
-        ("Alt + 左方向鍵", "回到上一篇文件"),
-        ("F11", "切換最大化"),
-        ("Esc", "關閉視窗"),
+        (t(f"welcome.sc.{name}"), t(f"welcome.scDesc.{name}"))
+        for name in _WELCOME_SHORTCUTS
     ]
     table = [
-        '<table class="data"><thead><tr><th>快速鍵</th><th>功能</th></tr></thead><tbody>'
+        '<table class="data"><thead><tr><th>'
+        + html.escape(t("welcome.table.key"))
+        + "</th><th>"
+        + html.escape(t("welcome.table.action"))
+        + "</th></tr></thead><tbody>"
     ]
     for key, description in rows:
         table.append(
@@ -338,21 +342,11 @@ def render_welcome() -> str:
     table.append("</tbody></table>")
 
     body = [
-        "<h1>Markdown 閱讀器</h1>",
-        _notice(
-            "noticecell",
-            "把 <b>.md</b> 檔案拖曳到這個視窗，或按 <b>Ctrl+O</b> 選擇檔案即可開始閱讀。"
-            "<br>設定成 <b>.md</b> 的預設開啟程式後，直接雙擊檔案就會用本程式開啟。",
-        ),
-        "<h2>快速鍵</h2>",
+        "<h1>" + html.escape(t("app.displayName")) + "</h1>",
+        _notice("noticecell", t("welcome.dropHint")),
+        "<h2>" + html.escape(t("welcome.shortcuts")) + "</h2>",
         "".join(table),
     ]
     if not PYGMENTS_AVAILABLE:
-        body.append(
-            _notice(
-                "warncell",
-                "目前環境沒有安裝 <span class='mono'>Pygments</span>，"
-                "程式碼區塊會以純文字顯示。",
-            )
-        )
+        body.append(_notice("warncell", t("doc.noPygments")))
     return _page("".join(body))

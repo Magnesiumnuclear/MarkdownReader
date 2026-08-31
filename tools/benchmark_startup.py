@@ -53,7 +53,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app import config  # noqa: E402
+from app import config, language  # noqa: E402
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASELINE_PATH = os.path.join(PROJECT_ROOT, "tools", "startup_baseline.json")
@@ -85,6 +85,9 @@ BENCHMARK_SETTINGS = {
     config.KEY_AUTO_RELOAD: True,
     config.KEY_CONFIRM_LINKS: False,
     config.KEY_MAXIMIZED: False,
+    # 釘住介面語言：視窗標題含產品名稱，而產品名稱隨語言變——
+    # 不釘的話在英文設定下 find_window 會找不到視窗，整批量測逾時。
+    config.KEY_LANGUAGE_MODE: config.DEFAULT_LANGUAGE,
 }
 
 
@@ -172,6 +175,8 @@ def restore_settings(saved: dict) -> None:
 
 # --- 量測：打包後的 exe -----------------------------------------------------
 def measure_exe(exe_path: str, runs: int) -> list[float]:
+    # 父行程也要用同一種語言解讀標題（子行程吃的是上面釘好的設定）
+    language.set_current(config.DEFAULT_LANGUAGE)
     """回傳每次「啟動到視窗出現」的毫秒數（不含暖機那次）。"""
     image_name = os.path.basename(exe_path)
     samples: list[float] = []
@@ -188,7 +193,7 @@ def measure_exe(exe_path: str, runs: int) -> list[float]:
 
         hwnd = None
         while time.perf_counter() - started < LAUNCH_TIMEOUT_S:
-            hwnd = find_window(config.APP_DISPLAY_NAME)
+            hwnd = find_window(language.t("app.displayName"))
             if hwnd:
                 break
             time.sleep(0.005)

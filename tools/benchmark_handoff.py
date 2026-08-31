@@ -37,7 +37,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app import config  # noqa: E402
+from app import config, language  # noqa: E402
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SAMPLE = os.path.join(PROJECT_ROOT, "sample.md")
@@ -176,7 +176,7 @@ def measure_cold(command: list[str], runs: int) -> list[float]:
         subprocess.Popen(command, creationflags=DETACHED)
         hwnd = None
         while time.perf_counter() - started < LAUNCH_TIMEOUT_S:
-            hwnd = find_window(config.APP_DISPLAY_NAME)
+            hwnd = find_window(language.t("app.displayName"))
             if hwnd:
                 break
             time.sleep(0.005)

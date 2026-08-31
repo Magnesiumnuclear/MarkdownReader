@@ -14,6 +14,7 @@ from PyQt6.QtGui import QFontMetrics, QMouseEvent
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QToolButton, QWidget
 
 from . import config, icons, styles
+from .language import t
 
 
 class IconButton(QToolButton):
@@ -25,7 +26,7 @@ class IconButton(QToolButton):
     def __init__(
         self,
         icon_name: str,
-        tooltip: str,
+        tooltip_key: str,
         parent: QWidget | None = None,
         *,
         danger: bool = False,
@@ -41,9 +42,14 @@ class IconButton(QToolButton):
         self._color_active = "#000000"
         self._color_checked = "#000000"
         self._color_on_danger = "#ffffff"
+        # 存的是翻譯鍵不是字串：tooltip 原本只在這裡 setToolTip 一次、來源沒留下，
+        # 語言一換十七顆按鈕的提示會全部停在舊語言。作法比照下面的 apply_theme
+        # ——保留來源（那裡是主題色，這裡是翻譯鍵），要換的時候重算。
+        self._tooltip_key = tooltip_key
+        self._tooltip_args: dict = {}
 
         self.setObjectName("closeBtn" if danger else "navBtn")
-        self.setToolTip(tooltip)
+        self.setToolTip(t(tooltip_key))
         self.setFixedSize(QSize(*(size or config.TITLE_BUTTON_SIZE)))
         self.setIconSize(QSize(config.ICON_PIXEL_SIZE, config.ICON_PIXEL_SIZE))
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -59,6 +65,16 @@ class IconButton(QToolButton):
         self._color_checked = colors["accent"]
         self._color_on_danger = colors["icon_on_accent"]
         self.refresh_icon()
+
+    def set_tooltip_key(self, key: str, **kwargs) -> None:
+        """換掉 tooltip 的來源鍵。狀態相依的按鈕（主題、最大化）用這個。"""
+        self._tooltip_key = key
+        self._tooltip_args = kwargs
+        self.setToolTip(t(key, **kwargs))
+
+    def apply_language(self) -> None:
+        """就地重設 tooltip（語言切換）。"""
+        self.setToolTip(t(self._tooltip_key, **self._tooltip_args))
 
     def set_icon_name(self, name: str) -> None:
         self._icon_name = name
@@ -106,7 +122,9 @@ class CustomTitleBar(QWidget):
         self.setObjectName("titleBar")
         self.setFixedHeight(config.TITLE_BAR_HEIGHT)
 
-        self._full_title = config.APP_DISPLAY_NAME
+        self._theme = config.DEFAULT_THEME
+        self._maximized = False
+        self._full_title = t("app.displayName")
         self._drag_offset = None
 
         tool_size = config.TOOL_BUTTON_SIZE
@@ -121,17 +139,17 @@ class CustomTitleBar(QWidget):
         self._title_label.setObjectName("titleLabel")
         self._title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
-        self.back_button = IconButton("back", "回到上一篇 (Alt+左方向鍵)", self, size=tool_size)
-        self.open_button = IconButton("open", "開啟檔案 (Ctrl+O)", self, size=tool_size)
-        self.find_button = IconButton("search", "搜尋 (Ctrl+F)", self, size=tool_size)
-        self.settings_button = IconButton("settings", "設定 (Ctrl+,)", self, size=tool_size)
-        self.theme_button = IconButton("theme_dark", "切換主題 (Ctrl+D)", self, size=tool_size)
+        self.back_button = IconButton("back", "titleBar.back", self, size=tool_size)
+        self.open_button = IconButton("open", "titleBar.open", self, size=tool_size)
+        self.find_button = IconButton("search", "titleBar.find", self, size=tool_size)
+        self.settings_button = IconButton("settings", "titleBar.settings", self, size=tool_size)
+        self.theme_button = IconButton("theme_dark", "titleBar.theme", self, size=tool_size)
         self.pin_button = IconButton(
-            "pin_off", "釘選在最上層 (Ctrl+P)", self, checked_icon="pin_on", size=tool_size
+            "pin_off", "titleBar.pin", self, checked_icon="pin_on", size=tool_size
         )
-        self.minimize_button = IconButton("minimize", "最小化", self)
-        self.maximize_button = IconButton("maximize", "最大化 (F11)", self)
-        self.close_button = IconButton("close", "關閉 (Ctrl+W)", self, danger=True)
+        self.minimize_button = IconButton("minimize", "titleBar.minimize", self)
+        self.maximize_button = IconButton("maximize", "titleBar.maximize", self)
+        self.close_button = IconButton("close", "titleBar.close", self, danger=True)
 
         self.back_button.setEnabled(False)
 
@@ -178,18 +196,46 @@ class CustomTitleBar(QWidget):
 
     def apply_theme(self, theme: str) -> None:
         """套用主題色到所有圖示，並讓主題按鈕顯示「將切換到的」樣貌。"""
+        # 記下來給 apply_language 用：那時要重算主題按鈕的 tooltip，而它依主題而定
+        self._theme = theme
         # 目前是淺色 -> 顯示月亮（點下去會變深色），反之亦然
         self.theme_button.set_icon_name(
             "theme_dark" if theme == "light" else "theme_light"
         )
-        target = "深色" if theme == "light" else "淺色"
-        self.theme_button.setToolTip(f"切換到{target}主題 (Ctrl+D)")
+        self._apply_theme_button_tooltip()
         for button in self._buttons:
             button.apply_theme(theme)
 
+    def _apply_theme_button_tooltip(self) -> None:
+        """「切換到深色主題」——整句一個鍵、把「深色」當參數代入。
+
+        不在程式碼裡拼接：英文是 "Switch to dark theme"，語序和中文不同，
+        拼接出來的順序永遠會是錯的。
+        """
+        target_key = (
+            "titleBar.themeTarget.dark" if self._theme == "light"
+            else "titleBar.themeTarget.light"
+        )
+        self.theme_button.set_tooltip_key(
+            "titleBar.themeToggle", target=t(target_key)
+        )
+
+    def apply_language(self) -> None:
+        """語言切換：所有按鈕的 tooltip 與標題重設一次。"""
+        for button in self._buttons:
+            button.apply_language()
+        # 這兩顆依狀態而定，而且主題那顆是「翻譯字串裡再套一個翻譯過的詞」，
+        # 參數不能凍在按鈕裡，得重跑產生它的邏輯
+        self._apply_theme_button_tooltip()
+        self.set_maximized(self._maximized)
+        self._update_elided_title()
+
     def set_maximized(self, maximized: bool) -> None:
+        self._maximized = maximized
         self.maximize_button.set_icon_name("restore" if maximized else "maximize")
-        self.maximize_button.setToolTip("還原 (F11)" if maximized else "最大化 (F11)")
+        self.maximize_button.set_tooltip_key(
+            "titleBar.restore" if maximized else "titleBar.maximize"
+        )
 
     def set_pinned(self, pinned: bool) -> None:
         if self.pin_button.isChecked() != pinned:

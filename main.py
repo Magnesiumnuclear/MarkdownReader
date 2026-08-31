@@ -65,10 +65,14 @@ def _install_exception_hook() -> None:
 
             if QApplication.instance() is not None:
                 box = QMessageBox()
-                box.setWindowTitle(f"{config.APP_DISPLAY_NAME} — 發生未預期的錯誤")
+                from app.language import t
+
+                box.setWindowTitle(
+                    t("dialog.crash.title", app=t("app.displayName"))
+                )
                 box.setIcon(QMessageBox.Icon.Critical)
-                box.setText("程式發生未預期的錯誤，但已被攔截。")
-                box.setInformativeText(f"錯誤紀錄已寫入：\n{_log_path()}")
+                box.setText(t("dialog.crash.text"))
+                box.setInformativeText(t("dialog.crash.detail", path=_log_path()))
                 box.setDetailedText(detail)
                 box.exec()
                 return
@@ -117,7 +121,17 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     app.setApplicationName(config.APP_NAME)
-    app.setApplicationDisplayName(config.APP_DISPLAY_NAME)
+    # 語言要在 setApplicationDisplayName 之前解析：產品名稱本身會隨語言變。
+    # 【windowTitle 一定要以 applicationDisplayName 結尾】Qt 在 Windows 上
+    # 若發現視窗標題沒有以 displayName 收尾，會自動補一段 " - <displayName>"。
+    # 這裡與 viewer._update_titles 的後綴必須是同一個 t("app.displayName")，
+    # 否則工作列會出現「note.md — Markdown Reader - Markdown 閱讀器」。
+    from app import language
+
+    from PyQt6.QtCore import QSettings
+
+    language.init_from_settings(QSettings(config.ORG_NAME, config.APP_NAME))
+    app.setApplicationDisplayName(language.t("app.displayName"))
     app.setOrganizationName(config.ORG_NAME)
     app.setWindowIcon(icons.app_icon())
 

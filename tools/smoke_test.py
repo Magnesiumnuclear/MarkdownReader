@@ -80,6 +80,33 @@ def _settings_handle():
     return QSettings(config.ORG_NAME, config.APP_NAME)
 
 
+def _expected_title(file_name: str) -> str:
+    """組出視窗標題，來源和程式本身完全相同。
+
+    測試不寫死標題字串：產品名稱會隨介面語言變，寫死等於把測試綁在中文上。
+    """
+    from app import language
+
+    return language.t(
+        "window.title", name=file_name, app=language.t("app.displayName")
+    )
+
+
+def pin_language() -> None:
+    """把量測／測試期間的介面語言釘成預設語言。
+
+    測試對 UI 文字的斷言必須有一個確定的語言可比對，否則在英文 Windows 上
+    整批紅。用的是既有的 QSettings 快照／還原機制（見 snapshot_settings），
+    和 benchmark_startup.BENCHMARK_SETTINGS 同一個路數。
+    """
+    from app import config, language
+
+    settings = _settings_handle()
+    settings.setValue(config.KEY_LANGUAGE_MODE, config.DEFAULT_LANGUAGE)
+    settings.sync()
+    language.set_current(config.DEFAULT_LANGUAGE)
+
+
 def snapshot_settings() -> dict:
     settings = _settings_handle()
     return {key: settings.value(key) for key in settings.allKeys()}
@@ -316,6 +343,7 @@ def section_rendering(args) -> None:
             if cursor is not None and cursor.shape() == Qt.CursorShape.WaitCursor:
                 observed["cursor"] = True
             observed["text"] = viewer.status_label.text()
+            observed["busy"] = viewer._status_is_busy
             return original_repaint(*args, **kwargs)
 
         viewer.status_label.repaint = sampling_repaint
@@ -323,8 +351,11 @@ def section_rendering(args) -> None:
         pump(700)
         viewer.status_label.repaint = original_repaint
         check("大檔渲染前就設好等待游標", observed["cursor"])
-        check("大檔渲染前就顯示「正在載入」",
-              "正在載入" in observed["text"], observed["text"])
+        # 測旗標而不是文案：文案會隨語言變，_status_is_busy 不會。
+        # 這條因此比原本更強——它問的是「忙碌狀態有沒有被正確標記」，
+        # 而那正是 _busy_feedback 的 finally 還原邏輯所依賴的東西。
+        check("大檔渲染前就標記為忙碌並顯示訊息",
+              observed["busy"] and observed["text"], str(observed))
         check("渲染結束後游標已還原（try/finally）",
               QApplication.overrideCursor() is None)
 
@@ -785,6 +816,231 @@ def section_render_cache(args) -> None:
 
 
 # ===========================================================================
+# 區塊：介面語言
+# ===========================================================================
+def section_language(args) -> None:
+    """語言檔的完整性與一致性。
+
+    這些檢查不需要開視窗，成本極低，但擋掉的是最惱人的一類錯誤：翻譯漏一條、
+    佔位符打錯名字。前者會讓英文介面夾雜中文，後者會讓那一句永遠格式化失敗、
+    默默顯示成未代入的樣板。兩者都不會當掉，只會靜靜地錯。
+    """
+    import json
+    import re
+
+    from app import config, language, resources
+
+    codes = [code for code, _key in config.LANGUAGE_MODES if code != "system"]
+    check("語言模式清單裡有具體語言", len(codes) >= 2, str(codes))
+
+    catalogs = {}
+    for code in codes:
+        target = resources.resource_path(config.LANGUAGE_DIR, code + ".json")
+        exists = os.path.isfile(target)
+        check("語言檔存在：" + code, exists, target)
+        if not exists:
+            return
+        with open(target, "r", encoding="utf-8") as handle:
+            catalogs[code] = json.load(handle)
+
+    base_code = config.DEFAULT_LANGUAGE
+    base = catalogs[base_code]
+    check("預設語言的字串表不是空的", len(base) > 100, str(len(base)))
+
+    for code, catalog in catalogs.items():
+        if code == base_code:
+            continue
+        # 扁平結構的回報：對齊與否一句話就驗得完
+        check("鍵集合與預設語言完全相同：" + code,
+              sorted(catalog) == sorted(base),
+              "缺少 " + str(sorted(set(base) - set(catalog))[:5])
+              + " / 多出 " + str(sorted(set(catalog) - set(base))[:5]))
+        check("鍵順序與預設語言一致（方便並排比對）：" + code,
+              list(catalog) == list(base))
+
+    placeholder = re.compile("{(" + chr(92) + "w+)}")
+    for code, catalog in catalogs.items():
+        empty = [key for key, value in catalog.items() if not str(value).strip()]
+        check("沒有空字串：" + code, not empty, str(empty[:5]))
+        if code == base_code:
+            continue
+        mismatched = [
+            key for key in base
+            if key in catalog
+            and set(placeholder.findall(base[key])) != set(placeholder.findall(catalog[key]))
+        ]
+        # 佔位符對不上時 t() 會靜默回傳未格式化的樣板（見 language.t 的說明），
+        # 畫面上就是活生生的 "{count} lines"
+        check("佔位符與預設語言一致：" + code, not mismatched, str(mismatched[:5]))
+
+    # t() 的三段 fallback：命中 -> 退回預設語言 -> 回傳鍵本身
+    language.set_current(base_code)
+    check("t() 取得預設語言的字串",
+          language.t("app.displayName") == base[("app.displayName")])
+    check("t() 會代入具名參數",
+          "5" in language.t("settings.font.value", size=5))
+    check("t() 找不到鍵時回傳鍵本身",
+          language.t("no.such.key.exists") == "no.such.key.exists")
+    check("t() 對佔位符打錯不拋例外，回未格式化的樣板",
+          "{" in language.t("settings.font.value", wrong_name=5))
+
+    for code in codes:
+        language.set_current(code)
+        check("resolve 對具體語言原樣回傳：" + code,
+              language.resolve(code) == code)
+    check("resolve 對 system 會解析成具體語言",
+          language.resolve("system") in codes)
+    language.set_current(base_code)
+
+    # --- 切換行為（需要開視窗）---------------------------------------------
+    import tempfile
+
+    from PyQt6.QtCore import QEventLoop, QSettings, Qt, QTimer
+    from PyQt6.QtWidgets import QApplication, QWidget
+
+    from app.viewer import MarkdownViewer
+    from app.window_manager import WindowManager
+
+    app = QApplication.instance() or QApplication([])
+
+    def pump(ms=300):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+        for _ in range(3):
+            app.processEvents()
+
+    # CJK 判定：不用跳脫序列寫，避免在各層編輯中被吃掉
+    han_lo, han_hi = chr(0x4E00), chr(0x9FFF)
+
+    def has_cjk(text: str) -> bool:
+        return any(han_lo <= ch <= han_hi for ch in text)
+
+    other = next(code for code in codes if code != base_code)
+
+    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    tmp = tempfile.mkdtemp()
+    doc = os.path.join(tmp, "lang.md")
+    with open(doc, "w", encoding="utf-8") as handle:
+        handle.write("# 標題" + chr(10) * 2
+                     + (chr(10) * 2).join(f"第 {i} 段。" for i in range(1200)))
+
+    viewer = MarkdownViewer(doc)
+    viewer.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+    viewer.resize(1000, 720)
+    viewer.show()
+    pump(600)
+
+    viewer.set_language_mode(other)
+    pump(400)
+    check("切換後標題列按鈕的 tooltip 換成新語言",
+          viewer.title_bar.open_button.toolTip() == language.t("titleBar.open"),
+          viewer.title_bar.open_button.toolTip())
+
+    # 一條斷言掃掉整個面板。走的是**實際的子元件**而不是登記表——
+    # 掃登記表的話，漏登記的那個 widget 根本不在清單裡，反而永遠掃不到
+    # （實測拿掉 _add_row 對 hint 的登記，掃登記表的版本照樣全綠）。
+    # 掃子元件才問得出「畫面上還有沒有舊語言的字」這個真正的問題。
+    panel = viewer.settings_panel
+    self_named = language.t("settings.language.zhTW")   # 語言選擇器顯示各語言自稱
+    leftover = [
+        widget.text()
+        for widget in panel.findChildren(QWidget)
+        if hasattr(widget, "text") and isinstance(widget.text(), str)
+        and has_cjk(widget.text()) and widget.text() != self_named
+    ]
+    check("設定面板沒有殘留舊語言的文字", not leftover, str(leftover[:4]))
+    tips = [b.toolTip() for b in viewer.title_bar._buttons if has_cjk(b.toolTip())]
+    check("標題列沒有殘留舊語言的 tooltip", not tips, str(tips[:4]))
+
+    check("視窗標題以 applicationDisplayName 結尾（Qt 不會再自動補後綴）",
+          viewer.windowTitle().endswith(language.t("app.displayName")),
+          viewer.windowTitle())
+    check("applicationDisplayName 與標題後綴同源",
+          app.applicationDisplayName() == language.t("app.displayName"),
+          app.applicationDisplayName())
+
+    status = viewer.status_label.text()
+    check("狀態列用新語言的分隔符",
+          language.t("status.separator") in status, repr(status[:40]))
+    check("行數與字數帶千分位",
+          re.search(r"\d,\d{3}", status) is not None,
+          repr(status[:80]))
+    check("修改時間維持 ISO 格式（不隨語言變）",
+          re.search(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", status) is not None,
+          repr(status[:80]))
+
+    # 大檔警告要跟著換，小檔不該被清快取（快取鍵不含語言，只有大檔例外）
+    small_tab = viewer._tab
+    cached_before = dict(small_tab._html_cache)
+    viewer.set_language_mode(base_code)
+    pump(400)
+    check("切回原語言後標題也跟著回來",
+          viewer.windowTitle().endswith(language.t("app.displayName")),
+          viewer.windowTitle())
+    check("一般文件切語言不會清掉 HTML 快取（避免重付轉換成本）",
+          set(small_tab._html_cache) == set(cached_before),
+          f"{sorted(small_tab._html_cache)} vs {sorted(cached_before)}")
+
+    viewer.close()
+    pump(300)
+
+    # 建構期就要是對的語言：驗 set_current 發生在 _build_ui 之前
+    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    handle = QSettings(config.ORG_NAME, config.APP_NAME)
+    handle.setValue(config.KEY_LANGUAGE_MODE, other)
+    handle.sync()
+    fresh = MarkdownViewer(None)
+    fresh.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+    fresh.resize(800, 600)
+    fresh.show()
+    pump(500)
+    language.set_current(other)
+    check("建構當下就是設定裡的語言（不是建好才補套）",
+          fresh.title_bar.open_button.toolTip() == language.t("titleBar.open"),
+          fresh.title_bar.open_button.toolTip())
+    check("歡迎頁也是新語言",
+          language.t("app.displayName") in fresh.browser.toPlainText()
+          and not has_cjk(fresh.browser.toPlainText()),
+          fresh.browser.toPlainText()[:60])
+    fresh.close()
+    pump(300)
+
+    # 廣播：一個視窗改語言，其他視窗跟著換
+    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    manager = WindowManager()
+    first = manager.create_window(doc)
+    first.resize(900, 640)
+    first.show()
+    second = manager.create_window(None)
+    second.resize(700, 520)
+    second.show()
+    pump(600)
+
+    first.set_language_mode(other)
+    pump(500)
+    check("廣播：另一個視窗的模式跟著變",
+          second._language_mode == other, second._language_mode)
+    check("廣播：另一個視窗的文字跟著變",
+          second.title_bar.open_button.toolTip() == language.t("titleBar.open"),
+          second.title_bar.open_button.toolTip())
+
+    # 關掉一個再切一次：驗「每次重新取 windows()、不快取視窗參照」
+    second.close()
+    pump(400)
+    first.set_language_mode(base_code)
+    pump(400)
+    check("廣播對象消失後再切語言不會出事",
+          first._language_mode == base_code, first._language_mode)
+
+    for window in list(manager.windows()):
+        window.close()
+    pump(400)
+    language.set_current(base_code)
+    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+
+
+# ===========================================================================
 # 區塊：分頁操作
 # ===========================================================================
 def section_tabs(args) -> None:
@@ -965,6 +1221,32 @@ def section_session(args) -> None:
     viewer.close()
     pump(350)
     check("關掉設定後清除分頁紀錄", not settings().value(config.KEY_OPEN_TABS))
+    settings().clear()
+
+    # --- 回歸：先開的視窗關閉時，不可以把後來改過的設定蓋回舊值 -------------
+    # closeEvent 原本會把「自己記憶體裡的」每一項設定回寫一次。每個 setter
+    # 在改動當下就已經寫過了，那次回寫純屬多餘——而且有害：A 視窗握著的是它
+    # 開啟當下的值，B 視窗之後改的設定會在 A 關閉時被舊值蓋回去。
+    # 實際症狀是「在 B 視窗調大字級，關掉 A 視窗，下次啟動又變回原樣」。
+    settings().clear()
+    window_a = new_viewer(files[0])
+    window_b = new_viewer(files[1])
+    default_width = window_a._content_width
+    other_width = next(
+        w for w, _key in config.CONTENT_WIDTH_OPTIONS if w != default_width
+    )
+    window_b.set_content_width(other_width)
+    pump(200)
+    check("前置：B 視窗改過的設定已經落地",
+          settings().value(config.KEY_CONTENT_WIDTH, type=int) == other_width,
+          str(settings().value(config.KEY_CONTENT_WIDTH)))
+    window_a.close()          # A 還握著舊值
+    pump(350)
+    check("關閉先開的視窗不會把別的視窗改過的設定蓋回去",
+          settings().value(config.KEY_CONTENT_WIDTH, type=int) == other_width,
+          str(settings().value(config.KEY_CONTENT_WIDTH)))
+    window_b.close()
+    pump(350)
     settings().clear()
 
 
@@ -1274,7 +1556,12 @@ def section_single_instance(args) -> None:
         window = None
         _u32 = _ct.windll.user32
         while _t.perf_counter() < deadline:
-            window = _u32.FindWindowW(None, "sample.md — Markdown 閱讀器")
+            # 用和程式同一個翻譯來源組標題，而不是寫死字串。
+            # 【這同時是「標題後綴陷阱」的回歸測試】Qt 在 Windows 上若發現
+            # windowTitle 沒有以 applicationDisplayName 結尾，會自動補一段
+            # " - <displayName>"。main.py 與 viewer._update_titles 的來源一旦
+            # 分家，實際標題就會多出後綴，這裡的精確比對立刻紅燈。
+            window = _u32.FindWindowW(None, _expected_title("sample.md"))
             if window:
                 break
             _t.sleep(0.05)
@@ -1296,7 +1583,7 @@ def section_single_instance(args) -> None:
                     proc.kill()
             _t.sleep(2.0)
             alive = app_proc.poll() is None
-            got_tab = bool(_u32.FindWindowW(None, "README.md — Markdown 閱讀器"))
+            got_tab = bool(_u32.FindWindowW(None, _expected_title("README.md")))
             check("本體忙碌時三連發轉交不會讓它崩潰", alive,
                   "" if alive else f"結束碼 {app_proc.poll() & 0xFFFFFFFF:#x}")
             check("忙碌解除後轉交的檔案有開出來", got_tab)
@@ -1694,8 +1981,10 @@ def section_tab_dnd(args) -> None:
     from PyQt6.QtWidgets import QApplication as _QAppG
     check("撕下期間幽靈分頁跟著游標", ghost_seen)
     # 幽靈下方的徽章要預告放開的結果；拖向遠處空白的路徑上應出現「拆分」
-    check("徽章預告下一步（拆分為新視窗）", "拆分為新視窗" in badge_texts,
-          str(badge_texts))
+    from app import language
+
+    check("徽章預告下一步（拆分為新視窗）",
+          language.t("tab.drag.detach") in badge_texts, str(badge_texts))
     check("放開後幽靈與覆蓋游標清乾淨",
           neighbor.tab_bar._ghost is None and _QAppG.overrideCursor() is None)
     check("拖到遠處仍能拆分", len(manager3.windows()) == 2)
@@ -2075,6 +2364,7 @@ def section_tab_dnd(args) -> None:
 SECTIONS = [
     ("渲染與閱讀", section_rendering),
     ("渲染快取", section_render_cache),
+    ("介面語言", section_language),
     ("分頁操作", section_tabs),
     ("分頁狀態還原", section_session),
     ("分頁拖曳（移動/拆分/合併）", section_tab_dnd),
@@ -2087,6 +2377,9 @@ SECTIONS = [
 def _run_sections_in_process(selected, args) -> int:
     """在本行程內跑指定區塊（--only 與子行程模式走這裡）。"""
     saved = snapshot_settings()
+    # 所有區塊統一釘住介面語言：對 UI 文字的斷言需要一個確定的語言可比對，
+    # 否則在英文 Windows 上會整批紅。設定在 finally 裡還原。
+    pin_language()
     try:
         for name, func in selected:
             print(f"[{name}]")

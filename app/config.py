@@ -7,18 +7,17 @@
 from __future__ import annotations
 
 # --- 應用程式識別 -----------------------------------------------------------
-APP_NAME = "MarkdownReader"
-APP_DISPLAY_NAME = "Markdown 閱讀器"
+APP_NAME = "MarkdownReader"          # QSettings 路徑用，不隨語言變
+# 產品名稱刻意不放在這裡：它會隨語言變，來源一律是 language.t("app.displayName")。
+# 留一個常數在這裡的話，遲早有人繼續引用它，然後在英文介面下冒出中文。
 ORG_NAME = "SamHo"
 APP_USER_MODEL_ID = "SamHo.MarkdownReader.Viewer.1"
 
 # --- 支援的檔案類型 ---------------------------------------------------------
 MARKDOWN_SUFFIXES = (".md", ".markdown", ".mdown", ".mkd", ".mkdn", ".mdtxt")
 SUPPORTED_SUFFIXES = MARKDOWN_SUFFIXES + (".txt",)
-OPEN_DIALOG_FILTER = (
-    "Markdown 文件 (*.md *.markdown *.mdown *.mkd *.mkdn *.mdtxt);;"
-    "純文字檔 (*.txt);;所有檔案 (*.*)"
-)
+# 開檔對話框的篩選字串在語言檔的 dialog.openFilter（型別名稱要翻譯）。
+# 那條字串裡的副檔名 pattern 必須和上面的 MARKDOWN_SUFFIXES 保持一致。
 
 # --- 視窗尺寸 ---------------------------------------------------------------
 DEFAULT_WINDOW_SIZE = (980, 760)
@@ -78,10 +77,11 @@ PROGRESSIVE_MIN_ELEMENTS = 200
 
 # --- 閱讀版面選項 -----------------------------------------------------------
 # 行高（百分比）。Qt 的 line-height 用 % 才會隨字級等比縮放。
+# 中間那欄是翻譯鍵而不是可直接顯示的字串，顯示前一定要過 language.t()。
 LINE_HEIGHT_OPTIONS = (
-    ("compact", "緊湊", 142),
-    ("normal", "標準", 160),
-    ("relaxed", "寬鬆", 188),
+    ("compact", "settings.lineHeight.compact", 142),
+    ("normal", "settings.lineHeight.standard", 160),
+    ("relaxed", "settings.lineHeight.relaxed", 188),
 )
 DEFAULT_LINE_HEIGHT = "normal"
 
@@ -89,19 +89,35 @@ DEFAULT_LINE_HEIGHT = "normal"
 # QTextDocument 不支援 max-width，實作方式是調整 root frame 的左右邊距，
 # 讓文字欄固定寬度並置中（詳見 viewer._apply_content_width）。
 CONTENT_WIDTH_OPTIONS = (
-    (720, "窄"),
-    (900, "中"),
-    (0, "不限"),
+    (720, "settings.width.narrow"),
+    (900, "settings.width.medium"),
+    (0, "settings.width.unlimited"),
 )
 DEFAULT_CONTENT_WIDTH = 900
 
 # 主題模式：system 會跟著 Windows 的深淺色設定即時變動
 THEME_MODES = (
-    ("light", "淺色"),
-    ("dark", "深色"),
-    ("system", "跟隨系統"),
+    ("light", "settings.theme.light"),
+    ("dark", "settings.theme.dark"),
+    ("system", "settings.theme.system"),
 )
 DEFAULT_THEME_MODE = "system"
+
+# --- 介面語言 ---------------------------------------------------------------
+# 第一欄是存進 QSettings 的值，最後一欄是「翻譯鍵」而不是可直接顯示的字串
+# ——顯示前一定要過 language.t()，直接印會看到 settings.language.zhTW。
+#
+# settings.language.zhTW 在兩份語言檔裡都是「繁體中文」、settings.language.en
+# 在兩份裡都是「English」：語言選擇器要顯示各語言的自稱，這是刻意的兩檔同值，
+# 不是漏翻。只有「跟隨系統」那條真的需要翻。
+LANGUAGE_MODES = (
+    ("zh_TW", "settings.language.zhTW"),
+    ("en", "settings.language.en"),
+    ("system", "settings.language.system"),
+)
+DEFAULT_LANGUAGE_MODE = "system"
+DEFAULT_LANGUAGE = "zh_TW"       # 系統偵測失敗時的保底值（比照 DEFAULT_THEME）
+LANGUAGE_DIR = "languages"       # 相對於 resources.base_path()
 
 # --- QSettings 鍵名 ---------------------------------------------------------
 KEY_GEOMETRY = "window/geometry"
@@ -114,6 +130,7 @@ KEY_ALWAYS_ON_TOP = "window/alwaysOnTop"
 KEY_STATUS_VISIBLE = "view/statusBarVisible"
 KEY_AUTO_RELOAD = "behavior/autoReload"
 KEY_CONFIRM_LINKS = "behavior/confirmExternalLinks"
+KEY_LANGUAGE_MODE = "view/languageMode"
 
 DEFAULT_THEME = "light"          # 系統偵測失敗時的保底值
 DEFAULT_AUTO_RELOAD = True
