@@ -321,6 +321,16 @@ class MarkdownViewer(QWidget):
         self._restore_tabs = self._settings.value(
             config.KEY_RESTORE_TABS, config.DEFAULT_RESTORE_TABS, type=bool
         )
+        # 搜尋列的比對選項。和語言一樣要在 _build_ui 之前讀好：搜尋列一建出來
+        # 就要把兩顆按鈕的勾選狀態擺對，不然開 Ctrl+F 的第一眼會是全部沒亮，
+        # 按下去才「跳」成上次的設定。
+        self._find_case_sensitive = self._settings.value(
+            config.KEY_FIND_CASE_SENSITIVE,
+            config.DEFAULT_FIND_CASE_SENSITIVE, type=bool
+        )
+        self._find_whole_words = self._settings.value(
+            config.KEY_FIND_WHOLE_WORDS, config.DEFAULT_FIND_WHOLE_WORDS, type=bool
+        )
         # 分頁清單。至少永遠有一個，_tab 屬性指向作用中的那個。
         self._tabs: list[DocumentTab] = []
         self._active = 0
@@ -794,6 +804,7 @@ class MarkdownViewer(QWidget):
         # 每個分頁一個閱讀區，用堆疊切換，各自保有捲動位置與文件物件
         self.stack = QStackedWidget(self.root_frame)
         self.find_bar = FindBar(self.root_frame)
+        self.find_bar.set_options(self._find_case_sensitive, self._find_whole_words)
         # 設定面板是覆蓋層，不放進版面，改由 _position_settings_panel 手動定位，
         # 這樣它才能整片蓋住標題列以下的區域（含搜尋列與狀態列）
         self.settings_panel = SettingsPanel(self.root_frame)
@@ -817,6 +828,7 @@ class MarkdownViewer(QWidget):
         inner.addWidget(self.find_bar)
         inner.addWidget(self.status_bar)
 
+        self.find_bar.optionsChanged.connect(self.set_find_options)
         self.title_bar.openRequested.connect(self.open_dialog)
         self.title_bar.backRequested.connect(self.go_back)
         self.title_bar.findRequested.connect(self.show_find)
@@ -1069,6 +1081,24 @@ class MarkdownViewer(QWidget):
         self._settings.setValue(config.KEY_CONFIRM_LINKS, self._confirm_links)
         self._sync_settings_panel()
 
+    def set_find_options(self, case_sensitive: bool, whole_words: bool) -> None:
+        """搜尋列的比對選項改變時落盤。
+
+        刻意不廣播到其他視窗：其餘視窗可能正開著自己的搜尋，被外部改掉比對
+        規則會讓畫面上的高亮無故變動。存下來的值只影響「下一個開啟的視窗」。
+
+        兩個鍵是**成對**寫的，不是各寫各的——多視窗時最後一個動過的視窗整組
+        覆蓋（同 _save_session 對分頁清單的作法）。這樣存下來的一定是某個視窗
+        真的呈現過的組合；改成逐鍵合併的話，會存出一個「A 的大小寫 + B 的全字」
+        這種沒有任何視窗顯示過的狀態，下一個開的視窗跟誰都對不上。
+        """
+        self._find_case_sensitive = bool(case_sensitive)
+        self._find_whole_words = bool(whole_words)
+        self._settings.setValue(
+            config.KEY_FIND_CASE_SENSITIVE, self._find_case_sensitive
+        )
+        self._settings.setValue(config.KEY_FIND_WHOLE_WORDS, self._find_whole_words)
+
     # -- 設定列 --------------------------------------------------------------
     def toggle_settings(self) -> None:
         if self.settings_panel.isVisible():
@@ -1118,6 +1148,10 @@ class MarkdownViewer(QWidget):
         self._auto_reload = config.DEFAULT_AUTO_RELOAD
         self._confirm_links = config.DEFAULT_CONFIRM_LINKS
         self._restore_tabs = config.DEFAULT_RESTORE_TABS
+        self._find_case_sensitive = config.DEFAULT_FIND_CASE_SENSITIVE
+        self._find_whole_words = config.DEFAULT_FIND_WHOLE_WORDS
+        # set_options 不會反向送出訊號，下面那圈迴圈才是真正寫進 QSettings 的地方
+        self.find_bar.set_options(self._find_case_sensitive, self._find_whole_words)
         self._status_visible = True
         self.status_bar.setVisible(True)
         self.set_always_on_top(False)
@@ -1130,6 +1164,8 @@ class MarkdownViewer(QWidget):
             (config.KEY_CONFIRM_LINKS, self._confirm_links),
             (config.KEY_RESTORE_TABS, self._restore_tabs),
             (config.KEY_STATUS_VISIBLE, self._status_visible),
+            (config.KEY_FIND_CASE_SENSITIVE, self._find_case_sensitive),
+            (config.KEY_FIND_WHOLE_WORDS, self._find_whole_words),
             (config.KEY_LANGUAGE_MODE, config.DEFAULT_LANGUAGE_MODE),
         ):
             self._settings.setValue(key, value)

@@ -25,6 +25,8 @@
   "tab.drag.none": "無動作",
 
   "find.placeholder": "搜尋文件內容…",
+  "find.caseSensitive": "區分大小寫 (Alt+C)",
+  "find.wholeWords": "全字拼寫相符 (Alt+W)",
   "find.prev": "上一個 (Shift+Enter)",
   "find.next": "下一個 (Enter)",
   "find.close": "關閉搜尋 (Esc)",

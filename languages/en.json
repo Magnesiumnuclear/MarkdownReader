@@ -25,6 +25,8 @@
   "tab.drag.none": "No action",
 
   "find.placeholder": "Search in document…",
+  "find.caseSensitive": "Match case (Alt+C)",
+  "find.wholeWords": "Match whole word (Alt+W)",
   "find.prev": "Previous (Shift+Enter)",
   "find.next": "Next (Enter)",
   "find.close": "Close search (Esc)",

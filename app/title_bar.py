@@ -31,6 +31,7 @@ class IconButton(QToolButton):
         *,
         danger: bool = False,
         checked_icon: str | None = None,
+        checkable: bool = False,
         size: tuple[int, int] | None = None,
     ) -> None:
         super().__init__(parent)
@@ -54,7 +55,10 @@ class IconButton(QToolButton):
         self.setIconSize(QSize(config.ICON_PIXEL_SIZE, config.ICON_PIXEL_SIZE))
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setCursor(Qt.CursorShape.ArrowCursor)
-        if checked_icon is not None:
+        # checked_icon 是「勾選時換一張圖」（釘選：pin_off／pin_on）；
+        # checkable 是「勾選時同一張圖改用強調色」（搜尋選項）。兩者都要可勾選，
+        # 也都要在狀態變動時重新著色。
+        if checked_icon is not None or checkable:
             self.setCheckable(True)
             self.toggled.connect(lambda _checked: self.refresh_icon())
 
@@ -75,6 +79,18 @@ class IconButton(QToolButton):
     def apply_language(self) -> None:
         """就地重設 tooltip（語言切換）。"""
         self.setToolTip(t(self._tooltip_key, **self._tooltip_args))
+
+    def set_checked_silently(self, checked: bool) -> None:
+        """設定勾選狀態但不送出 toggled（用於「依現有設定同步外觀」）。
+
+        blockSignals 會把 toggled 整條擋掉，而圖示重新著色正是掛在 toggled 上的
+        ——只 setChecked 的話按鈕會勾起來卻停在未勾選的顏色。所以這裡自己補一次
+        refresh_icon。settings_panel.sync 不必這麼做，那邊的 chip 外觀純由 QSS 決定。
+        """
+        self.blockSignals(True)
+        self.setChecked(checked)
+        self.blockSignals(False)
+        self.refresh_icon()
 
     def set_icon_name(self, name: str) -> None:
         self._icon_name = name

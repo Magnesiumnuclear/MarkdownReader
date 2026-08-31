@@ -131,10 +131,18 @@ KEY_STATUS_VISIBLE = "view/statusBarVisible"
 KEY_AUTO_RELOAD = "behavior/autoReload"
 KEY_CONFIRM_LINKS = "behavior/confirmExternalLinks"
 KEY_LANGUAGE_MODE = "view/languageMode"
+KEY_FIND_CASE_SENSITIVE = "find/caseSensitive"
+KEY_FIND_WHOLE_WORDS = "find/wholeWords"
 
 DEFAULT_THEME = "light"          # 系統偵測失敗時的保底值
 DEFAULT_AUTO_RELOAD = True
 DEFAULT_CONFIRM_LINKS = False
+
+# --- 文件內搜尋的比對選項 ---------------------------------------------------
+# 兩個都預設關閉：不區分大小寫、不限全字，是「隨手找一下」最不會落空的組合。
+# 選項會留存到下次啟動（搜尋列上的按鈕會亮著，看得出目前是開的）。
+DEFAULT_FIND_CASE_SENSITIVE = False
+DEFAULT_FIND_WHOLE_WORDS = False
 
 # --- 分頁 -------------------------------------------------------------------
 TAB_HEIGHT = 34

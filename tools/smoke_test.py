@@ -567,6 +567,155 @@ def section_rendering(args) -> None:
     bar.deactivate()
     pump(200)
 
+    # --- 搜尋比對選項：區分大小寫（Alt+C）、全字（Alt+W）---------------------
+    check("預設不區分大小寫、不限全字",
+          not bar.case_button.isChecked() and not bar.word_button.isChecked(),
+          f"case={bar.case_button.isChecked()} whole={bar.word_button.isChecked()}")
+
+    opt_doc = os.path.join(tmp, "find_options.md")
+    with open(opt_doc, "w", encoding="utf-8") as handle:
+        handle.write("# Cat\n\ncat category concat cat.\n\n"
+                     "The the THE theme\n\n搜尋 搜尋列 全文搜尋\n")
+    viewer.open_path(opt_doc, new_tab=True)
+    pump(400)
+    bar.activate()
+    pump(200)
+
+    def scan(text, case, whole):
+        """把兩個選項擺好、搜一次，回傳比對數。"""
+        bar.case_button.setChecked(case)
+        bar.word_button.setChecked(whole)
+        # 先清空再填：值和上次一樣的話 textChanged 根本不發（同 §防抖 那段）
+        bar.input.setText("")
+        app.processEvents()
+        bar.input.setText(text)
+        pump(bar.DEBOUNCE_MS + 250)
+        return len(bar._matches)
+
+    plain_the = scan("the", False, False)
+    cased_the = scan("the", True, False)
+    check("區分大小寫會濾掉 The / THE",
+          plain_the == 4 and cased_the == 2, f"{plain_the} -> {cased_the}")
+    check("兩個選項可以同時生效",
+          scan("the", True, True) == 1, str(len(bar._matches)))
+
+    plain_cat = scan("cat", False, False)
+    whole_cat = scan("cat", False, True)
+    check("全字會濾掉 category / concat（標點結尾仍算全字）",
+          plain_cat == 5 and whole_cat == 3, f"{plain_cat} -> {whole_cat}")
+
+    # 中文沒有空白斷詞，Qt 會把一整串中文當成同一個詞：這是 FindWholeWords
+    # 的既定語意（和其他編輯器一致），刻意不做中文特例。寫成測試是為了讓
+    # 「有人哪天覺得這是 bug 而去加特例」時，先看見這條說明。
+    plain_cjk = scan("搜尋", False, False)
+    whole_cjk = scan("搜尋", False, True)
+    check("全字對中文以空白斷詞：「全文搜尋」內的「搜尋」不算相符",
+          plain_cjk == 3 and whole_cjk == 1, f"{plain_cjk} -> {whole_cjk}")
+
+    # 高亮的範圍要跟著選項走，不是只有計數變
+    scan("the", True, False)
+    cased_texts = {sel.cursor.selectedText() for sel in bar._selections}
+    check("區分大小寫時高亮到的文字與搜尋詞完全相同",
+          cased_texts == {"the"}, str(cased_texts))
+    scan("the", False, False)
+    plain_texts = {sel.cursor.selectedText() for sel in bar._selections}
+    check("不區分大小寫時高亮涵蓋不同大小寫的寫法",
+          len(plain_texts) > 1, str(plain_texts))
+
+    # 點按鈕是一次明確的操作，不該還要等防抖才看到結果
+    bar.case_button.setChecked(True)
+    app.processEvents()
+    check("切換選項立刻重算，不進防抖",
+          len(bar._matches) == 2, str(len(bar._matches)))
+
+    # 選項要落盤（比照設定面板：元件送訊號、viewer 寫 QSettings）
+    bar.case_button.setChecked(True)
+    bar.word_button.setChecked(False)
+    app.processEvents()
+    stored = QSettings(config.ORG_NAME, config.APP_NAME)
+    check("選項變動會寫進 QSettings",
+          stored.value(config.KEY_FIND_CASE_SENSITIVE, type=bool) is True
+          and stored.value(config.KEY_FIND_WHOLE_WORDS, type=bool) is False,
+          f"case={stored.value(config.KEY_FIND_CASE_SENSITIVE)} "
+          f"whole={stored.value(config.KEY_FIND_WHOLE_WORDS)}")
+
+    # set_options 是「載入時把外觀對上設定」，不是使用者操作，不該反向寫回去
+    stored.setValue(config.KEY_FIND_WHOLE_WORDS, "哨兵")
+    bar.set_options(True, True)
+    app.processEvents()
+    check("set_options 不會反向送出訊號（不覆寫設定）",
+          stored.value(config.KEY_FIND_WHOLE_WORDS) == "哨兵",
+          str(stored.value(config.KEY_FIND_WHOLE_WORDS)))
+    check("set_options 有把按鈕的勾選狀態擺對",
+          bar.case_button.isChecked() and bar.word_button.isChecked())
+
+    # 比對規則變了就得重掃，否則按鈕亮著、高亮卻還是舊規則算出來的
+    scan("the", False, False)
+    bar.set_options(True, False)
+    app.processEvents()
+    check("搜尋列開著時 set_options 會重掃",
+          len(bar._matches) == 2, str(len(bar._matches)))
+
+    # blockSignals 會把 toggled 一起擋掉，而圖示重新著色正是掛在 toggled 上的：
+    # 少了 set_checked_silently 裡那次 refresh_icon，按鈕會勾起來卻停在灰色。
+    lit = bar.case_button.icon().pixmap(config.ICON_PIXEL_SIZE).toImage()
+    bar.set_options(False, False)
+    app.processEvents()
+    dim = bar.case_button.icon().pixmap(config.ICON_PIXEL_SIZE).toImage()
+    check("勾選狀態下圖示改用強調色（set_checked_silently 有補畫）",
+          lit != dim)
+
+    # Alt+C／Alt+W：tooltip 上就是這樣寫的，焦點不在輸入框時也必須生效
+    from PyQt6.QtTest import QTest
+
+    viewer.activateWindow()
+    viewer.raise_()
+    pump(300)
+    viewer.browser.setFocus()
+    pump(150)
+    QTest.keyClick(viewer, Qt.Key.Key_C, Qt.KeyboardModifier.AltModifier)
+    QTest.keyClick(viewer, Qt.Key.Key_W, Qt.KeyboardModifier.AltModifier)
+    pump(200)
+    check("焦點在閱讀區時 Alt+C／Alt+W 仍能切換選項",
+          bar.case_button.isChecked() and bar.word_button.isChecked(),
+          f"case={bar.case_button.isChecked()} whole={bar.word_button.isChecked()}")
+    typed = bar.input.text()
+    check("Alt+W 不會把 w 打進搜尋框", "w" not in typed, repr(typed))
+
+    # 收起來的搜尋列不該還吃這兩個快捷鍵
+    bar.set_options(False, False)
+    bar.deactivate()
+    pump(200)
+    QTest.keyClick(viewer, Qt.Key.Key_C, Qt.KeyboardModifier.AltModifier)
+    pump(150)
+    check("搜尋列收起時 Alt+C 不生效",
+          not bar.case_button.isChecked())
+
+    # 開啟新視窗要沿用上次的選項（讀取發生在 _build_ui 之前）
+    stored.setValue(config.KEY_FIND_CASE_SENSITIVE, True)
+    stored.setValue(config.KEY_FIND_WHOLE_WORDS, True)
+    stored.sync()
+    fresh = MarkdownViewer()
+    check("新視窗建構時就套用上次的搜尋選項",
+          fresh.find_bar.case_button.isChecked()
+          and fresh.find_bar.word_button.isChecked(),
+          f"case={fresh.find_bar.case_button.isChecked()} "
+          f"whole={fresh.find_bar.word_button.isChecked()}")
+    fresh.close()
+    pump(250)
+
+    # 恢復預設要把這兩項也一起帶回去
+    viewer.find_bar.set_options(True, True)
+    viewer.reset_settings()
+    pump(300)
+    check("恢復預設會把搜尋選項一起關掉",
+          not bar.case_button.isChecked() and not bar.word_button.isChecked()
+          and stored.value(config.KEY_FIND_CASE_SENSITIVE, type=bool) is False
+          and stored.value(config.KEY_FIND_WHOLE_WORDS, type=bool) is False,
+          f"case={bar.case_button.isChecked()} whole={bar.word_button.isChecked()} "
+          f"stored={stored.value(config.KEY_FIND_CASE_SENSITIVE)}/"
+          f"{stored.value(config.KEY_FIND_WHOLE_WORDS)}")
+
     viewer.close()
     pump(300)
     QSettings(config.ORG_NAME, config.APP_NAME).clear()
@@ -1028,6 +1177,16 @@ def section_language(args) -> None:
     check("設定面板沒有殘留舊語言的文字", not leftover, str(leftover[:4]))
     tips = [b.toolTip() for b in viewer.title_bar._buttons if has_cjk(b.toolTip())]
     check("標題列沒有殘留舊語言的 tooltip", not tips, str(tips[:4]))
+    # 搜尋列走**實際的子元件**而不是 _buttons：漏加進 _buttons 的那顆按鈕不在
+    # 清單裡，掃清單反而永遠掃不到（實測把兩顆選項鈕從 _buttons 拿掉，掃清單的
+    # 版本照樣全綠）。這和上面設定面板那條是同一個理由。
+    # 只掃 tooltip 不掃 text：狀態標籤的「無相符」本來就是中文，掃 text 會假紅。
+    find_tips = [w.toolTip() for w in viewer.find_bar.findChildren(QWidget)
+                 if has_cjk(w.toolTip())]
+    check("搜尋列沒有殘留舊語言的 tooltip", not find_tips, str(find_tips[:4]))
+    check("搜尋列的輸入提示也換了語言",
+          viewer.find_bar.input.placeholderText() == language.t("find.placeholder"),
+          viewer.find_bar.input.placeholderText())
 
     check("視窗標題以 applicationDisplayName 結尾（Qt 不會再自動補後綴）",
           viewer.windowTitle().endswith(language.t("app.displayName")),
