@@ -1258,6 +1258,10 @@ class MarkdownViewer(QWidget):
         )
         self._tab.last_render_width = self.browser.viewport().width()
 
+        # 圖片的 alt 文字要在 setHtml 之前交給閱讀區：Qt 解析 HTML 時會把 alt
+        # 丟掉，而破圖佔位要靠它顯示「這裡本來是什麼」（見 browser.set_image_alts）
+        self.browser.set_image_alts(document.image_alts(html))
+
         # 【分段渲染】大文件一次 setHtml 會整份排完版才回來，那段時間介面
         # 完全凍結。改成先把首屏交出去、其餘分批在事件迴圈的空檔補上。
         # 不適合分段時 chunks 是空的，行為與從前完全相同。

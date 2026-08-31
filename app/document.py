@@ -301,6 +301,22 @@ def split_for_progressive_render(page: str) -> tuple[str, list[str]]:
     return head, chunks
 
 
+# 從產生的 HTML 抽出圖片的 alt 文字。
+# Qt 解析 HTML 時會把 alt 屬性整個丟掉（實測 charFormat 與 toolTip 裡都沒有），
+# 而 browser.loadResource 只拿得到 url——圖片壞掉時想顯示「這裡本來是什麼」，
+# 只能在交給 Qt 之前先自己記下來。
+# python-markdown 產生的順序固定是 alt 在前、src 在後。
+_IMG_ALT_RE = re.compile(r'<img\b[^>]*?alt="([^"]*)"[^>]*?src="([^"]*)"', re.IGNORECASE)
+
+
+def image_alts(html: str) -> dict[str, str]:
+    """回傳 {src: alt}。同一個 src 出現多次時保留第一個 alt。"""
+    found: dict[str, str] = {}
+    for alt, src in _IMG_ALT_RE.findall(html):
+        found.setdefault(src, alt)
+    return found
+
+
 def render_error(error: DocumentError, path: str = "") -> str:
     """產生錯誤頁面（顯示在閱讀區內，而不是彈出對話框）。"""
     detail = html.escape(error.detail).replace("\n", "<br>")

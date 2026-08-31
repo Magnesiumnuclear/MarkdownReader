@@ -104,6 +104,7 @@
   "status.linkCancelled": "Cancelled opening link: {target}",
 
   "encoding.latin1Uncertain": "latin-1 (may be incorrect)",
+  "image.notFound": "Image not found",
 
   "dialog.openTitle": "Open Markdown file",
   "dialog.openFilter": "Markdown documents (*.md *.markdown *.mdown *.mkd *.mkdn *.mdtxt);;Plain text (*.txt);;All files (*.*)",

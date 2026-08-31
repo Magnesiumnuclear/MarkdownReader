@@ -190,7 +190,7 @@ def last_error(stderr: str) -> str:
 # ===========================================================================
 def section_rendering(args) -> None:
     from PyQt6.QtCore import QEventLoop, QSettings, Qt, QTimer, QUrl
-    from PyQt6.QtGui import QColor, QDesktopServices
+    from PyQt6.QtGui import QColor, QDesktopServices, QImage
     from PyQt6.QtWidgets import QApplication
 
     app = QApplication.instance() or QApplication([])
@@ -372,6 +372,82 @@ def section_rendering(args) -> None:
         pump(300)
         viewer.status_label.repaint = plain_repaint
         check("小檔不觸發忙碌回饋", calls["n"] == 0, str(calls["n"]))
+
+    # --- 破圖佔位：圖示 + alt 文字 + 作者寫的路徑 ----------------------------
+    # Qt 內建的破圖是 :/qt-project.org/styles/commonstyle/images/file-16.png，
+    # 一張 16x16 的灰色小檔案圖，既不顯示 alt、也不說是哪個路徑壞了。
+    from PyQt6.QtCore import QUrl as _QUrl
+    from PyQt6.QtGui import QTextDocument as _QTextDocument
+
+    from app import document as _document
+
+    broken_doc = os.path.join(tmp, "broken_images.md")
+    with open(broken_doc, "w", encoding="utf-8") as handle:
+        handle.write(chr(10).join([
+            "# 破圖", "",
+            "![系統架構資料流圖](docs/nope.png)", "",
+            "![](assets/no-alt.png)", "",
+            "結尾。",
+        ]))
+    viewer.open_path(broken_doc, new_tab=True)
+    pump(500)
+
+    alts = _document.image_alts(viewer._tab.build_html(viewer._theme))
+    check("alt 文字有從 HTML 抽出來",
+          alts.get("docs/nope.png") == "系統架構資料流圖", str(alts))
+    check("沒有 alt 的圖也會被收進對照表（值為空字串）",
+          alts.get("assets/no-alt.png") == "", str(alts))
+
+    # 【這條專門守鍵值解析】loadResource 收到的是 Qt 用 baseUrl 解析過的絕對
+    # url，不是 HTML 裡的原始 src。用原始 src 當鍵一定查不到，alt 就會失效。
+    base = viewer.browser.document().baseUrl()
+    resolved = base.resolved(_QUrl("docs/nope.png")).toString()
+    check("前置：解析後的 url 和原始 src 不同（否則這條沒在測東西）",
+          resolved != "docs/nope.png", resolved)
+    check("alt 對照表以解析後的 url 為鍵",
+          viewer.browser._image_alts.get(resolved, ("", ""))[0] == "系統架構資料流圖",
+          str(list(viewer.browser._image_alts)[:2]))
+
+    image_type = _QTextDocument.ResourceType.ImageResource.value
+    placeholder = viewer.browser.loadResource(image_type, _QUrl(resolved))
+    check("載不到的圖片回傳自己畫的替代圖，而不是 null",
+          placeholder is not None and not placeholder.isNull())
+    # Qt 的預設是 16x16；我們畫的一定比它大得多（要放得下圖示與兩行字）。
+    # 先確認拿得到東西才量尺寸：上一條紅的時候 placeholder 可能是 None，
+    # 直接 .width() 會讓整個區塊當掉而不是乾淨地報一條失敗。
+    have = placeholder is not None and hasattr(placeholder, "width")
+    check("替代圖不是 Qt 內建的 16x16 小圖示",
+          have and placeholder.width() > 120 and placeholder.height() > 40,
+          f"{placeholder.width()}x{placeholder.height()}" if have else "沒有拿到圖")
+
+    # 【高 DPI】替代圖要以實體像素繪製並標上 devicePixelRatio，否則會以 1x
+    # 畫好再被放大，文字糊掉。
+    expected_dpr = viewer.browser.devicePixelRatioF() or 1.0
+    check("替代圖標上了正確的裝置像素比",
+          have and abs(placeholder.devicePixelRatio() - expected_dpr) < 0.01,
+          str(placeholder.devicePixelRatio()) if have else "沒有拿到圖")
+
+    # 【不能重複套用 DPR】設定 devicePixelRatio 的時機若在 QPainter 之前，
+    # Qt 會自己套一次縮放、程式再套一次，內容就會被畫成 1.5 倍大而溢出圖片邊界。
+    # 虛線圓角框畫在 (1,1)-(w-3,h-3)，所以最右一整欄像素必定是透明的；
+    # 一旦重複縮放，那一欄會被內容佔滿。
+    if have:
+        edge = [placeholder.pixelColor(placeholder.width() - 1, y).alpha()
+                for y in range(placeholder.height())]
+        check("替代圖的內容沒有溢出邊界（沒有重複套用 DPR）",
+              max(edge) == 0, f"最右欄最大 alpha={max(edge)}")
+
+    ok_png = os.path.join(tmp, "real.png")
+    _QImage_ok = QImage(120, 40, QImage.Format.Format_ARGB32)
+    _QImage_ok.fill(Qt.GlobalColor.green)
+    _QImage_ok.save(ok_png)
+    real = viewer.browser.loadResource(image_type, _QUrl.fromLocalFile(ok_png))
+    check("正常的圖片不受影響（沒有被換成替代圖）",
+          real is not None and not real.isNull() and real.width() == 120,
+          str(real.width()) if real is not None else "None")
+
+    viewer.close_tab_at(viewer._active)
+    pump(300)
 
     # --- 搜尋：輸入防抖、上下一筆只換兩筆高亮、高亮上限 ----------------------
     search_doc = os.path.join(tmp, "search_perf.md")

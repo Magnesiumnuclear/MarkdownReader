@@ -104,6 +104,7 @@
   "status.linkCancelled": "已取消開啟連結：{target}",
 
   "encoding.latin1Uncertain": "latin-1（可能不正確）",
+  "image.notFound": "找不到圖片",
 
   "dialog.openTitle": "開啟 Markdown 檔案",
   "dialog.openFilter": "Markdown 文件 (*.md *.markdown *.mdown *.mkd *.mkdn *.mdtxt);;純文字檔 (*.txt);;所有檔案 (*.*)",
