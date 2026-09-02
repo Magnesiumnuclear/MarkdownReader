@@ -331,6 +331,21 @@ class MarkdownViewer(QWidget):
         self._find_whole_words = self._settings.value(
             config.KEY_FIND_WHOLE_WORDS, config.DEFAULT_FIND_WHOLE_WORDS, type=bool
         )
+        # 搜尋列的浮動位置（角落 + 位移）。非法角落退回預設，位移交給
+        # find_bar.set_placement 夾成非負。
+        self._find_bar_corner = str(self._settings.value(
+            config.KEY_FIND_BAR_CORNER, config.DEFAULT_FIND_BAR_CORNER
+        ))
+        if self._find_bar_corner not in config.FIND_BAR_CORNERS:
+            self._find_bar_corner = config.DEFAULT_FIND_BAR_CORNER
+        self._find_bar_offset = (
+            int(self._settings.value(
+                config.KEY_FIND_BAR_OFFSET_X, config.DEFAULT_FIND_BAR_OFFSET[0]
+            )),
+            int(self._settings.value(
+                config.KEY_FIND_BAR_OFFSET_Y, config.DEFAULT_FIND_BAR_OFFSET[1]
+            )),
+        )
         # 分頁清單。至少永遠有一個，_tab 屬性指向作用中的那個。
         self._tabs: list[DocumentTab] = []
         self._active = 0
@@ -803,10 +818,12 @@ class MarkdownViewer(QWidget):
         self.tab_bar = TabBar(self.root_frame)
         # 每個分頁一個閱讀區，用堆疊切換，各自保有捲動位置與文件物件
         self.stack = QStackedWidget(self.root_frame)
+        # 搜尋列和設定面板都是覆蓋層，不放進版面：搜尋列浮在內文上、可拖曳，
+        # 由 _position_find_bar 餵入允許範圍（內文區）；設定面板則由
+        # _position_settings_panel 手動定位，才能整片蓋住標題列以下的區域。
         self.find_bar = FindBar(self.root_frame)
         self.find_bar.set_options(self._find_case_sensitive, self._find_whole_words)
-        # 設定面板是覆蓋層，不放進版面，改由 _position_settings_panel 手動定位，
-        # 這樣它才能整片蓋住標題列以下的區域（含搜尋列與狀態列）
+        self.find_bar.set_placement(self._find_bar_corner, *self._find_bar_offset)
         self.settings_panel = SettingsPanel(self.root_frame)
 
         self.status_bar = QFrame(self.root_frame)
@@ -825,10 +842,10 @@ class MarkdownViewer(QWidget):
         inner.addWidget(self.title_bar)
         inner.addWidget(self.tab_bar)
         inner.addWidget(self.stack, 1)
-        inner.addWidget(self.find_bar)
         inner.addWidget(self.status_bar)
 
         self.find_bar.optionsChanged.connect(self.set_find_options)
+        self.find_bar.placementChanged.connect(self.set_find_bar_placement)
         self.title_bar.openRequested.connect(self.open_dialog)
         self.title_bar.backRequested.connect(self.go_back)
         self.title_bar.findRequested.connect(self.show_find)
@@ -1075,6 +1092,10 @@ class MarkdownViewer(QWidget):
         self.status_bar.setVisible(self._status_visible)
         self._settings.setValue(config.KEY_STATUS_VISIBLE, self._status_visible)
         self._sync_settings_panel()
+        # 內文區的高度變了，錨在底部的搜尋列要跟著移。版面要等事件迴圈跑過
+        # 才會重新配置，這時 stack.geometry() 還是舊的，所以延到下一輪。
+        if self.find_bar.isVisible():
+            QTimer.singleShot(0, self._position_find_bar)
 
     def set_confirm_links(self, enabled: bool) -> None:
         self._confirm_links = bool(enabled)
@@ -1098,6 +1119,20 @@ class MarkdownViewer(QWidget):
             config.KEY_FIND_CASE_SENSITIVE, self._find_case_sensitive
         )
         self._settings.setValue(config.KEY_FIND_WHOLE_WORDS, self._find_whole_words)
+
+    # -- 搜尋列（浮動）------------------------------------------------------
+    def _position_find_bar(self) -> None:
+        """搜尋列的活動範圍就是內文區：不蓋標題列與分頁列（那裡有視窗控制鈕），
+        也不蓋狀態列。狀態列收起時範圍自然變大。"""
+        self.find_bar.reposition(self.stack.geometry())
+
+    def set_find_bar_placement(self, corner: str, dx: int, dy: int) -> None:
+        """搜尋列拖到新位置時落盤。和 set_find_options 一樣不廣播：三個鍵成組寫。"""
+        self._find_bar_corner = corner
+        self._find_bar_offset = (int(dx), int(dy))
+        self._settings.setValue(config.KEY_FIND_BAR_CORNER, corner)
+        self._settings.setValue(config.KEY_FIND_BAR_OFFSET_X, int(dx))
+        self._settings.setValue(config.KEY_FIND_BAR_OFFSET_Y, int(dy))
 
     # -- 設定列 --------------------------------------------------------------
     def toggle_settings(self) -> None:
@@ -1150,8 +1185,12 @@ class MarkdownViewer(QWidget):
         self._restore_tabs = config.DEFAULT_RESTORE_TABS
         self._find_case_sensitive = config.DEFAULT_FIND_CASE_SENSITIVE
         self._find_whole_words = config.DEFAULT_FIND_WHOLE_WORDS
-        # set_options 不會反向送出訊號，下面那圈迴圈才是真正寫進 QSettings 的地方
+        self._find_bar_corner = config.DEFAULT_FIND_BAR_CORNER
+        self._find_bar_offset = config.DEFAULT_FIND_BAR_OFFSET
+        # set_options / set_placement 不會反向送出訊號，
+        # 下面那圈迴圈才是真正寫進 QSettings 的地方
         self.find_bar.set_options(self._find_case_sensitive, self._find_whole_words)
+        self.find_bar.set_placement(self._find_bar_corner, *self._find_bar_offset)
         self._status_visible = True
         self.status_bar.setVisible(True)
         self.set_always_on_top(False)
@@ -1166,6 +1205,9 @@ class MarkdownViewer(QWidget):
             (config.KEY_STATUS_VISIBLE, self._status_visible),
             (config.KEY_FIND_CASE_SENSITIVE, self._find_case_sensitive),
             (config.KEY_FIND_WHOLE_WORDS, self._find_whole_words),
+            (config.KEY_FIND_BAR_CORNER, self._find_bar_corner),
+            (config.KEY_FIND_BAR_OFFSET_X, self._find_bar_offset[0]),
+            (config.KEY_FIND_BAR_OFFSET_Y, self._find_bar_offset[1]),
             (config.KEY_LANGUAGE_MODE, config.DEFAULT_LANGUAGE_MODE),
         ):
             self._settings.setValue(key, value)
@@ -1722,6 +1764,8 @@ class MarkdownViewer(QWidget):
             self.settings_panel.deactivate()
         # 搜尋要掃整份文件，只有首屏的話比對數會是錯的
         self.flush_pending_chunks()
+        # 先定位再顯示，免得先在舊位置閃一下
+        self._position_find_bar()
         self.find_bar.activate()
 
     def _on_escape(self) -> None:
@@ -1834,6 +1878,8 @@ class MarkdownViewer(QWidget):
         # 限制內文寬度時，左右邊距是依可視寬度算出來的，必須立即重算
         self._apply_content_width()
         self._position_settings_panel()
+        if self.find_bar.isVisible():
+            self._position_find_bar()
         if self._tab.has_scalable_images:
             self._resize_timer.start(180)
 

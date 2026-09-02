@@ -294,12 +294,13 @@ QToolButton#tabClose:hover, QToolButton#tabNew:hover { background-color: $presse
     background: transparent;
 }
 
-/* ---------- 搜尋列 ---------- */
+/* ---------- 搜尋列（浮動面板，不在版面裡）---------- */
 #findBar {
     background-color: $surface;
-    border: none;
-    border-top: 1px solid $border;
+    border: 1px solid $border;
+    border-radius: 8px;
 }
+#findGrip { background: transparent; }
 #findInput {
     background-color: $window_bg;
     color: $text;

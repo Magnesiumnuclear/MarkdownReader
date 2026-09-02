@@ -25,6 +25,7 @@
   "tab.drag.none": "No action",
 
   "find.placeholder": "Search in document…",
+  "find.move": "Drag to move the search bar (position is remembered)",
   "find.caseSensitive": "Match case (Alt+C)",
   "find.wholeWords": "Match whole word (Alt+W)",
   "find.prev": "Previous (Shift+Enter)",

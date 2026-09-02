@@ -716,6 +716,154 @@ def section_rendering(args) -> None:
           f"stored={stored.value(config.KEY_FIND_CASE_SENSITIVE)}/"
           f"{stored.value(config.KEY_FIND_WHOLE_WORDS)}")
 
+    # --- 搜尋列是可拖曳的浮動面板 --------------------------------------------
+    from PyQt6.QtCore import QEvent, QPoint, QPointF, QRect
+    from PyQt6.QtGui import QMouseEvent
+
+    def send_mouse(widget, kind, pos):
+        button = Qt.MouseButton.LeftButton
+        buttons = (Qt.MouseButton.NoButton
+                   if kind == QEvent.Type.MouseButtonRelease else button)
+        app.sendEvent(widget, QMouseEvent(
+            kind, QPointF(pos), QPointF(widget.mapToGlobal(pos)),
+            button, buttons, Qt.KeyboardModifier.NoModifier))
+
+    def drag_bar(delta):
+        """從把手中心按下、拖 delta、放開（走真正的滑鼠事件處理）。"""
+        start = bar.grip.mapTo(bar, bar.grip.rect().center())
+        send_mouse(bar, QEvent.Type.MouseButtonPress, start)
+        send_mouse(bar, QEvent.Type.MouseMove, start + delta)
+        send_mouse(bar, QEvent.Type.MouseButtonRelease, start + delta)
+        app.processEvents()
+
+    def edges(rect):
+        return rect.x(), rect.y(), rect.x() + rect.width(), rect.y() + rect.height()
+
+    # 讓位的測試要用長文件（400 段），短文件捲不動
+    viewer.activate_tab(viewer._index_of_path(search_doc))
+    pump(300)
+    stack_before = QRect(viewer.stack.geometry())
+    viewer.show_find()
+    pump(300)
+    check("搜尋列是浮動面板，開啟時不推開內文",
+          viewer.stack.geometry() == stack_before,
+          f"{edges(stack_before)} -> {edges(viewer.stack.geometry())}")
+    sx, sy, sr, sb = edges(viewer.stack.geometry())
+    bx, by, br, bb = edges(bar.geometry())
+    dx0, dy0 = config.DEFAULT_FIND_BAR_OFFSET
+    check("預設停在內文區右上角",
+          bar.isVisible() and sr - br == dx0 and by - sy == dy0,
+          f"右緣差 {sr - br} 上緣差 {by - sy}")
+
+    before = bar.geometry()
+    drag_bar(QPoint(-300, 200))
+    moved = bar.geometry()
+    check("拖曳把手會移動面板",
+          moved.topLeft() == before.topLeft() + QPoint(-300, 200),
+          f"{edges(before)} -> {edges(moved)}")
+    check("放開後換算成最近的角落（落在左上半邊 -> TL）",
+          bar._corner == "TL"
+          and bar._corner_offset == QPoint(moved.x() - sx, moved.y() - sy),
+          f"{bar._corner} {bar._corner_offset}")
+    check("拖曳放開後位置寫進 QSettings",
+          stored.value(config.KEY_FIND_BAR_CORNER) == "TL"
+          and stored.value(config.KEY_FIND_BAR_OFFSET_X, type=int) == moved.x() - sx
+          and stored.value(config.KEY_FIND_BAR_OFFSET_Y, type=int) == moved.y() - sy,
+          f"{stored.value(config.KEY_FIND_BAR_CORNER)} "
+          f"{stored.value(config.KEY_FIND_BAR_OFFSET_X)}/"
+          f"{stored.value(config.KEY_FIND_BAR_OFFSET_Y)}")
+
+    drag_bar(QPoint(-2000, 2000))
+    check("拖出內文區會被夾在邊界內（並錨到左下）",
+          viewer.stack.geometry().contains(bar.geometry()) and bar._corner == "BL",
+          f"{edges(bar.geometry())} in {edges(viewer.stack.geometry())} {bar._corner}")
+
+    bar.set_placement("TL", 5000, 5000)
+    check("位移超出範圍時 reposition 會夾回內文區",
+          viewer.stack.geometry().contains(bar.geometry()),
+          f"{edges(bar.geometry())} vs {edges(viewer.stack.geometry())}")
+    bar.set_placement("BL", 0, 0)
+
+    # 錨定：放在左下的面板，視窗縮放時要一直貼著左下
+    viewer.resize(640, 500)
+    pump(400)
+    sx, sy, sr, sb = edges(viewer.stack.geometry())
+    small = bar.geometry()
+    viewer.resize(1120, 820)
+    pump(400)
+    sx2, sy2, sr2, sb2 = edges(viewer.stack.geometry())
+    big = bar.geometry()
+    check("視窗縮放時面板跟著錨定的角落走（左下）",
+          viewer.stack.geometry().contains(big)
+          and small.x() - sx == big.x() - sx2 == 0
+          and sb - (small.y() + small.height()) == sb2 - (big.y() + big.height()) == 0,
+          f"小 {edges(small)}/{(sx, sb)} 大 {edges(big)}/{(sx2, sb2)}")
+
+    # 讓位：面板放在底部「靠左」、蓋住文字欄，連按下一筆，目前那筆不得被壓住。
+    # 一定要蓋到文字欄：放在底部正中的話文字（靠左）和面板在水平方向根本不相交，
+    # 有沒有讓位邏輯都是 0 次，測試等於沒測（實測拿掉 _reveal_current 照樣全綠）。
+    bar.input.setText("")
+    app.processEvents()
+    bar.input.setText("zeta")
+    pump(bar.DEBOUNCE_MS + 300)
+    sx, sy, sr, sb = edges(viewer.stack.geometry())
+    target = QPoint(sx + 40, sb - bar.height() - 4)
+    drag_bar(target - bar.geometry().topLeft())
+    first_rect = viewer.browser.cursorRect()
+    bar_in_vp = QRect(viewer.browser.viewport().mapFromGlobal(
+        bar.mapToGlobal(QPoint(0, 0))), bar.size())
+    check("前置：面板在水平方向確實蓋到文字欄（否則下一條測不到東西）",
+          bar_in_vp.left() <= first_rect.left() <= bar_in_vp.right(),
+          f"文字 x={first_rect.left()} 面板 x={bar_in_vp.left()}..{bar_in_vp.right()}")
+    covered = 0
+    for _ in range(40):
+        bar.search(forward=True)
+        app.processEvents()
+        vp = viewer.browser.viewport()
+        bar_in_vp = QRect(vp.mapFromGlobal(bar.mapToGlobal(QPoint(0, 0))), bar.size())
+        if bar_in_vp.intersects(viewer.browser.cursorRect()):
+            covered += 1
+    check("被面板壓住的相符項會自動讓開（連按 40 次下一筆）",
+          len(bar._matches) == 400 and covered == 0,
+          f"matches={len(bar._matches)} 壓住 {covered} 次")
+
+    # 狀態列收起：內文區變高，錨在底部的面板要跟著下移
+    gap_before = edges(viewer.stack.geometry())[3] - (bar.y() + bar.height())
+    viewer.set_status_bar_visible(False)
+    pump(300)
+    gap_after = edges(viewer.stack.geometry())[3] - (bar.y() + bar.height())
+    viewer.set_status_bar_visible(True)
+    pump(300)
+    check("狀態列收起時錨在底部的面板跟著移動",
+          gap_before == gap_after, f"{gap_before} -> {gap_after}")
+
+    # 新視窗建構時就套用上次的位置
+    corner_now, offset_now = bar._corner, QPoint(bar._corner_offset)
+    fresh = MarkdownViewer(search_doc)
+    fresh.resize(900, 600)
+    fresh.show()
+    pump(500)
+    fresh.show_find()
+    pump(300)
+    check("新視窗建構時就套用上次的搜尋列位置",
+          fresh.find_bar._corner == corner_now
+          and fresh.find_bar._corner_offset == offset_now,
+          f"{fresh.find_bar._corner} {fresh.find_bar._corner_offset} "
+          f"vs {corner_now} {offset_now}")
+    fresh.close()
+    pump(250)
+
+    viewer.reset_settings()
+    pump(300)
+    check("恢復預設會把搜尋列位置一起帶回右上",
+          bar._corner == config.DEFAULT_FIND_BAR_CORNER
+          and bar._corner_offset == QPoint(*config.DEFAULT_FIND_BAR_OFFSET)
+          and stored.value(config.KEY_FIND_BAR_CORNER) == config.DEFAULT_FIND_BAR_CORNER,
+          f"{bar._corner} {bar._corner_offset} "
+          f"stored={stored.value(config.KEY_FIND_BAR_CORNER)}")
+    bar.deactivate()
+    pump(200)
+
     viewer.close()
     pump(300)
     QSettings(config.ORG_NAME, config.APP_NAME).clear()

@@ -14,26 +14,38 @@ Enter 找下一個、Shift+Enter 找上一個、Esc 關閉，並以背景色高�
 【比對選項：區分大小寫（Alt+C）與全字（Alt+W）】
 兩者都直接映射到 QTextDocument 的 FindFlag，比對邏輯本身一行都不必自己寫。
 選項存進 QSettings、由 viewer 落盤（比照設定面板：元件送訊號、viewer 寫設定）。
+
+【浮動面板】
+搜尋列不在版面裡，是浮在內文上的覆蓋層（和設定面板同類），抓住空白處或
+左端的把手可以拖到內文區的任何位置。位置記成「最近的角落 + 對該角落的位移」
+：使用者把它放在右上，視窗變寬時它要跟著右邊走——存絕對座標的話會停在原地，
+愈拉愈往中間跑。位置同樣由 viewer 落盤，viewer 在顯示與視窗改變大小時呼叫
+reposition() 餵入允許範圍（內文區的矩形）。
+
+浮動的代價是它會蓋住內文，所以跳到相符項之後要檢查那一筆是否剛好被面板壓住，
+是的話往外多捲一點（_reveal_current）。
 """
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QEvent, QObject, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QObject, QPoint, QRect, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QKeySequence, QShortcut, QTextCursor, QTextDocument
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QTextBrowser, QTextEdit, QWidget
 
-from . import config, styles
+from . import config, icons, styles
 from .language import t
 from .title_bar import IconButton
 
 
 class FindBar(QWidget):
-    """底部搜尋列。"""
+    """浮在內文上的搜尋面板（可拖曳）。"""
 
     closed = pyqtSignal()
     # (區分大小寫, 全字)。由 viewer 接去寫 QSettings——搜尋列不自己碰設定，
     # 和設定面板同一個分工（元件送訊號、viewer 落盤）。
     optionsChanged = pyqtSignal(bool, bool)
+    # (角落, dx, dy)。拖曳放開時發出，一樣由 viewer 落盤。
+    placementChanged = pyqtSignal(str, int, int)
 
     # 停止輸入多久（毫秒）之後才真的去掃文件
     DEBOUNCE_MS = 120
@@ -41,6 +53,8 @@ class FindBar(QWidget):
     # 有上限的只是「畫出來」這件事；超過時取以目前這筆為中心的一段窗格，
     # 使用者所在的位置附近一定畫得到。
     MAX_HIGHLIGHTS = 2000
+    # 浮動面板的目標寬度；視窗更窄時縮到允許範圍內
+    FLOAT_WIDTH = 520
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -58,8 +72,26 @@ class FindBar(QWidget):
         self._selections: list[QTextEdit.ExtraSelection] = []
         self._window: tuple[int, int] = (0, 0)
         self._painted_current = -1
+        # 浮動位置：錨定角落 + 對角落的位移；_allowed 是最近一次 reposition
+        # 拿到的允許範圍（拖曳夾住用），_drag_grab 是按下點在面板內的偏移
+        self._corner = config.DEFAULT_FIND_BAR_CORNER
+        self._corner_offset = QPoint(*config.DEFAULT_FIND_BAR_OFFSET)
+        self._allowed = QRect()
+        self._drag_grab: QPoint | None = None
 
         tool_size = config.TOOL_BUTTON_SIZE
+
+        # 面板本體的游標提示「這裡可以拖」；子元件各有自己的游標會蓋回去，
+        # 所以只有空白處與把手會顯示移動游標。
+        self.setCursor(Qt.CursorShape.SizeAllCursor)
+
+        # 左端的拖曳把手。QLabel 不吃滑鼠事件，按下去會穿透到面板本體，
+        # 正好落進下面的拖曳處理；它存在的意義是給「可以拖」一個看得見的記號。
+        self.grip = QLabel(self)
+        self.grip.setObjectName("findGrip")
+        self.grip.setFixedWidth(config.ICON_PIXEL_SIZE)
+        self.grip.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.grip.setToolTip(t("find.move"))
 
         self.input = QLineEdit(self)
         self.input.setObjectName("findInput")
@@ -91,8 +123,9 @@ class FindBar(QWidget):
         )
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 5, 8, 5)
+        layout.setContentsMargins(6, 5, 8, 5)
         layout.setSpacing(4)
+        layout.addWidget(self.grip)
         layout.addWidget(self.input, 1)
         layout.addWidget(self.case_button)
         layout.addWidget(self.word_button)
@@ -143,6 +176,97 @@ class FindBar(QWidget):
             self._debounce.stop()
             self._recompute()
 
+    def set_placement(self, corner: str, dx: int, dy: int) -> None:
+        """依既有設定同步位置來源（不反向送出 placementChanged）。
+
+        非法值退回預設，比照 viewer 對主題模式等設定的白名單處理。
+        """
+        if corner not in config.FIND_BAR_CORNERS:
+            corner = config.DEFAULT_FIND_BAR_CORNER
+        self._corner = corner
+        self._corner_offset = QPoint(max(0, int(dx)), max(0, int(dy)))
+        if not self._allowed.isNull():
+            self.reposition(self._allowed)
+
+    def reposition(self, allowed: QRect) -> None:
+        """依「角落 + 位移」把面板放進允許範圍，超出就夾回來。
+
+        allowed 是內文區在父元件座標系裡的矩形，由 viewer 餵入——
+        面板自己不知道版面長什麼樣，也不該知道。
+        """
+        self._allowed = QRect(allowed)
+        width = min(self.FLOAT_WIDTH, allowed.width() - 16)
+        height = self.sizeHint().height()
+        right_edge = allowed.x() + allowed.width()
+        bottom_edge = allowed.y() + allowed.height()
+        if "L" in self._corner:
+            x = allowed.x() + self._corner_offset.x()
+        else:
+            x = right_edge - width - self._corner_offset.x()
+        if "T" in self._corner:
+            y = allowed.y() + self._corner_offset.y()
+        else:
+            y = bottom_edge - height - self._corner_offset.y()
+        x = max(allowed.x(), min(x, right_edge - width))
+        y = max(allowed.y(), min(y, bottom_edge - height))
+        self.setGeometry(x, y, width, height)
+
+    def _commit_placement(self) -> None:
+        """拖曳放開：把目前位置換算成「最近的角落 + 位移」並通知落盤。
+
+        以面板中心落在允許範圍的哪半邊決定錨定角落——放在右半邊就跟右邊走，
+        視窗變寬時面板貼著右緣移動，這是瀏覽器搜尋框的行為。
+        """
+        if self._allowed.isNull():
+            return
+        allowed, geom = self._allowed, self.geometry()
+        right_edge = allowed.x() + allowed.width()
+        bottom_edge = allowed.y() + allowed.height()
+        left = geom.center().x() < allowed.center().x()
+        top = geom.center().y() < allowed.center().y()
+        self._corner = ("T" if top else "B") + ("L" if left else "R")
+        dx = (geom.x() - allowed.x()) if left else (right_edge - geom.x() - geom.width())
+        dy = (geom.y() - allowed.y()) if top else (bottom_edge - geom.y() - geom.height())
+        self._corner_offset = QPoint(max(0, dx), max(0, dy))
+        self.placementChanged.emit(
+            self._corner, self._corner_offset.x(), self._corner_offset.y()
+        )
+
+    # -- 拖曳 ----------------------------------------------------------------
+    # 只有落在空白處（版面邊距、把手、狀態文字）的按壓會到這裡；
+    # 輸入框和按鈕都自己吃掉滑鼠事件，拖不動它們。
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_grab = event.position().toPoint()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._drag_grab is None or not (
+            event.buttons() & Qt.MouseButton.LeftButton
+        ):
+            super().mouseMoveEvent(event)
+            return
+        target = self.mapToParent(event.position().toPoint() - self._drag_grab)
+        if not self._allowed.isNull():
+            target.setX(max(self._allowed.x(), min(
+                target.x(),
+                self._allowed.x() + self._allowed.width() - self.width())))
+            target.setY(max(self._allowed.y(), min(
+                target.y(),
+                self._allowed.y() + self._allowed.height() - self.height())))
+        self.move(target)
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if self._drag_grab is not None:
+            self._drag_grab = None
+            self._commit_placement()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
     def attach(self, browser: QTextBrowser) -> None:
         self._browser = browser
         # 換了文件，快取裡那些 QTextCursor 全都綁在舊文件上，不能再用
@@ -155,6 +279,9 @@ class FindBar(QWidget):
         self._text_color = QColor(colors["text"])
         for button in self._buttons:
             button.apply_theme(theme)
+        self.grip.setPixmap(
+            icons.pixmap("drag_handle", colors["text_faint"], config.ICON_PIXEL_SIZE)
+        )
         # 配色換了，快取裡每一筆 selection 的 format 都是舊色，整份重做
         self._invalidate_highlights()
         if self.isVisible():
@@ -163,6 +290,7 @@ class FindBar(QWidget):
     def apply_language(self) -> None:
         """語言切換：靜態文字重設，狀態文字交給既有的重算路徑。"""
         self.input.setPlaceholderText(t("find.placeholder"))
+        self.grip.setToolTip(t("find.move"))
         for button in self._buttons:
             button.apply_language()
         if self.isVisible():
@@ -188,7 +316,13 @@ class FindBar(QWidget):
             selected = self._browser.textCursor().selectedText().strip()
             if selected and " " not in selected:
                 self.input.setText(selected)
+        # 正常路徑是 viewer.show_find 先 reposition 過才 activate；這條保底是
+        # 給「沒經過 viewer 直接 activate」的呼叫端（測試就是），不然第一次
+        # show 會用 QWidget 的預設幾何（640x480、蓋在左上角）。
+        if self._allowed.isNull() and self.parentWidget() is not None:
+            self.reposition(self.parentWidget().rect())
         self.show()
+        self.raise_()   # 浮動面板不在版面裡，疊放順序要自己保證
         self.input.setFocus()
         self.input.selectAll()
         # 上面的 setText 可能已經排了一次防抖；這裡是明確的「立刻算」
@@ -319,6 +453,7 @@ class FindBar(QWidget):
         cursor.setPosition(start + needle_length, QTextCursor.MoveMode.KeepAnchor)
         self._browser.setTextCursor(cursor)
         self._browser.ensureCursorVisible()
+        self._reveal_current()
         total = len(self._matches)
         # 沒有全部畫出來就要講：捲到遠處看見沒上色的相符字會像是壞掉。
         # 整句一個鍵而不是拼接——英文的括號是半形，那是翻譯的一部分。
@@ -327,6 +462,34 @@ class FindBar(QWidget):
             key, current=self._current_index + 1, total=total, cap=self.MAX_HIGHLIGHTS
         ))
         self._sync_highlights()
+
+    def _reveal_current(self) -> None:
+        """目前這一筆若剛好被浮動面板壓住，往外多捲一點讓它露出來。
+
+        ensureCursorVisible 只保證游標在 viewport 裡，不知道上面浮著一塊面板。
+        兩個方向都試：面板在下就把內容再往上捲、在上就往下捲，選捲動量小的
+        那個；兩邊都捲不動（文件太短或已到頂/底）就算了，不硬捲。
+        """
+        if self._browser is None or not self.isVisible():
+            return
+        viewport = self._browser.viewport()
+        bar = QRect(
+            viewport.mapFromGlobal(self.mapToGlobal(QPoint(0, 0))), self.size()
+        )
+        cursor_rect = self._browser.cursorRect()
+        if not bar.intersects(cursor_rect):
+            return
+        margin = 8
+        scrollbar = self._browser.verticalScrollBar()
+        # 值加大＝內容上移＝游標矩形往上跑
+        push_up = cursor_rect.bottom() - bar.top() + margin
+        push_down = bar.bottom() - cursor_rect.top() + margin
+        can_up = scrollbar.value() + push_up <= scrollbar.maximum()
+        can_down = scrollbar.value() - push_down >= scrollbar.minimum()
+        if can_up and (not can_down or push_up <= push_down):
+            scrollbar.setValue(scrollbar.value() + push_up)
+        elif can_down:
+            scrollbar.setValue(scrollbar.value() - push_down)
 
     # -- 高亮 ----------------------------------------------------------------
     def _window_bounds(self) -> tuple[int, int]:

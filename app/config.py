@@ -144,6 +144,17 @@ DEFAULT_CONFIRM_LINKS = False
 DEFAULT_FIND_CASE_SENSITIVE = False
 DEFAULT_FIND_WHOLE_WORDS = False
 
+# --- 搜尋列的位置（浮動面板）------------------------------------------------
+# 搜尋列不釘在版面裡，是一塊浮在內文上的面板，抓住空白處可以拖到任何位置。
+# 位置記成「最近的角落 + 對該角落的位移」而不是絕對座標：視窗改變大小時，
+# 靠右的面板要跟著右邊走（瀏覽器的搜尋框都是這樣貼著右上），存絕對座標做不到。
+FIND_BAR_CORNERS = ("TL", "TR", "BL", "BR")
+DEFAULT_FIND_BAR_CORNER = "TR"
+DEFAULT_FIND_BAR_OFFSET = (12, 10)
+KEY_FIND_BAR_CORNER = "find/barCorner"
+KEY_FIND_BAR_OFFSET_X = "find/barOffsetX"
+KEY_FIND_BAR_OFFSET_Y = "find/barOffsetY"
+
 # --- 分頁 -------------------------------------------------------------------
 TAB_HEIGHT = 34
 TAB_INSERT_MARKER_WIDTH = 3   # 合併時的插入位置指示線
