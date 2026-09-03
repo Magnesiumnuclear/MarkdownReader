@@ -64,10 +64,10 @@
       "runs": 5
     },
     "sethtml_readme": {
-      "median": 33.7,
-      "min": 33.6,
-      "max": 35.2,
-      "stdev": 0.8,
+      "median": 43.1,
+      "min": 41.0,
+      "max": 44.2,
+      "stdev": 1.2,
       "runs": 5
     },
     "md_mermaid": {

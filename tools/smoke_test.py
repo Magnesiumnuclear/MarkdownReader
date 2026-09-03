@@ -3316,9 +3316,9 @@ def section_mermaid(args) -> None:
     hl_key = mermaid.register(mermaid.parse(hl_src), hl_src)
     plain_img = mermaid.render(hl_key, "light", 900, font, 1.0)
     match_img = mermaid.render(hl_key, "light", 900, font, 1.0,
-                               mermaid.Highlight("資料庫", False, False, False))
+                               mermaid.Highlight("資料庫", False, False, -1))
     cur_img = mermaid.render(hl_key, "light", 900, font, 1.0,
-                             mermaid.Highlight("資料庫", False, False, True))
+                             mermaid.Highlight("資料庫", False, False, 0))
 
     def count_colour(img, palette_key):
         want_name = _styles.palette("light")[palette_key].lower()
@@ -3388,9 +3388,20 @@ def section_mermaid(args) -> None:
 
         all_images = dbar._diagram_images()
         seen = visible_diagrams()
-        check("搜尋找得到圖表裡的字（每張圖各算一筆相符）",
+        per_diagram = {
+            pos: len(mermaid.diagram_hits(
+                k, dsv.browser.document().defaultFont(),
+                dsv.browser.column_width(), "資料庫"))
+            for pos, k in all_images
+        }
+        check("搜尋找得到圖表裡的字（每張圖都有命中）",
               len(dbar._diagram_matches) == len(all_images) == 20,
               f"相符 {len(dbar._diagram_matches)} 圖 {len(all_images)}")
+        check("一張圖有幾筆命中就算幾筆（同一個位置放幾次）",
+              all(dbar._matches.count(p) == n for p, n in per_diagram.items())
+              and min(per_diagram.values()) > 1,
+              f"每張 {sorted(set(per_diagram.values()))} 實際 "
+              f"{[dbar._matches.count(p) for p in list(per_diagram)[:3]]}")
         check("圖表那幾筆併進 _matches，且仍照文件先後排序",
               all(p in dbar._matches for p in dbar._diagram_matches)
               and dbar._matches == sorted(dbar._matches)
@@ -3441,7 +3452,7 @@ def section_mermaid(args) -> None:
         pump(300)
         check("跳到圖表那一筆時該張改用強調色",
               dbar._pushed.get(lit_key) is not None
-              and dbar._pushed[lit_key].current,
+              and dbar._pushed[lit_key].current_ordinal >= 0,
               str(dbar._pushed.get(lit_key)))
 
         # 捲動之後補畫新進畫面的圖
@@ -3467,6 +3478,123 @@ def section_mermaid(args) -> None:
         mermaid.render = real_render
         dsv.close()
         pump(300)
+    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+
+    # --- 完整計數：序號的順序、以及捲到圖裡那一筆 ---------------------------
+    # 序列圖的參與者標籤上下各畫一排，兩排都會被標色，所以兩排各算一筆；
+    # 但序號必須照畫面（上、訊息、下），不能照場景清單（上、下、訊息）
+    seq_hits_src = ("sequenceDiagram\n  participant U as 使用者\n"
+                    "  participant DB as 資料庫\n  U->>DB: 查詢\n"
+                    "  loop 每次寫入\n    U->>DB: 更新資料庫\n  end")
+    seq_hits_key = mermaid.register(mermaid.parse(seq_hits_src), seq_hits_src)
+    seq_hits = mermaid.diagram_hits(seq_hits_key, font, 900, "資料庫")
+    seq_scene = mermaid.scene_for(seq_hits_key, font)
+    check("序列圖上下兩排參與者各算一筆（照畫面數）",
+          len(seq_hits) == 3, f"{len(seq_hits)} 筆")
+    check("序號照畫面由上而下，不是照場景清單的順序",
+          [h.y for h in seq_hits] == sorted(h.y for h in seq_hits)
+          and [h.item for h in seq_hits] != sorted(h.item for h in seq_hits),
+          f"y={[round(h.y) for h in seq_hits]} item={[h.item for h in seq_hits]}")
+    check("每一筆的矩形都落在含有搜尋詞的那個原語上",
+          all("資料庫" in seq_scene.items[h.item].text for h in seq_hits),
+          str([seq_scene.items[h.item].text for h in seq_hits]))
+    twice_src = "graph TD\n  A[資料庫連到資料庫] --> B[結束]"
+    twice_key = mermaid.register(mermaid.parse(twice_src), twice_src)
+    twice_hits = mermaid.diagram_hits(twice_key, font, 900, "資料庫")
+    check("同一個標籤裡出現兩次就算兩筆，且由左而右",
+          len(twice_hits) == 2
+          and twice_hits[0].item == twice_hits[1].item
+          and twice_hits[0].x < twice_hits[1].x,
+          f"{len(twice_hits)} 筆 x={[round(h.x) for h in twice_hits]}")
+
+    narrow_hits = mermaid.diagram_hits(seq_hits_key, font, 120, "資料庫")
+    want_scale = 120 / seq_scene.width
+    check("欄寬變窄時命中座標跟著等比縮小（和畫出來的同一份算法）",
+          len(narrow_hits) == len(seq_hits)
+          and all(abs(n.y - h.y * want_scale) < 0.01
+                  and abs(n.x - h.x * want_scale) < 0.01
+                  for n, h in zip(narrow_hits, seq_hits)),
+          f"比例 {want_scale:.3f} y={[round(h.y, 1) for h in narrow_hits]}")
+
+    def current_top(img):
+        """圖裡強調色那一塊的頂端 y（沒有就回 None）。"""
+        want_name = _styles.palette("light")["find_current_bg"].lower()
+        rows = [y for y in range(img.height()) for x in range(img.width())
+                if img.pixelColor(x, y).name() == want_name]
+        return min(rows) if rows else None
+
+    drawn = [
+        current_top(mermaid.render(seq_hits_key, "light", 900, font, 1.0,
+                                   mermaid.Highlight("資料庫", False, False, k)))
+        for k in range(len(seq_hits))
+    ]
+    check("第 k 筆的強調色就畫在 diagram_hits 說的第 k 個位置",
+          all(top is not None and abs(top - h.y) <= 3
+              for top, h in zip(drawn, seq_hits)),
+          f"畫在 {drawn} vs 說在 {[round(h.y, 1) for h in seq_hits]}")
+
+    # 捲到圖裡那一筆：用一張遠比視窗高的圖
+    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    tall = os.path.join(tmp, "tall_diagram.md")
+    with open(tall, "w", encoding="utf-8") as handle:
+        handle.write("# 長圖\n\n```mermaid\ngraph TD\n")
+        for k in range(20):
+            word = "資料庫" if k in (0, 9, 19) else "步驟"
+            handle.write(f"  N{k}[{word} {k}] --> N{k + 1}\n")
+        handle.write("```\n")
+    tallv = MarkdownViewer(tall)
+    tallv.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+    tallv.resize(1000, 700)
+    tallv.show()
+    pump(800)
+    tallv.flush_pending_chunks()
+    pump(300)
+    tbar = tallv.find_bar
+    tallv.show_find()
+    pump(300)
+    tbar.input.setText("資料庫")
+    pump(tbar.DEBOUNCE_MS + 500)
+    tdoc = tallv.browser.document()
+    view_h = tallv.browser.viewport().height()
+    tpos, tkey = tbar._diagram_images()[0]
+    thits = mermaid.diagram_hits(
+        tkey, tdoc.defaultFont(), tallv.browser.column_width(), "資料庫")
+    check("整張圖只有一個字元，卻算得出圖裡的每一筆",
+          len(thits) == 3 and tbar._matches.count(tpos) == 3
+          and len(tbar._matches) == 3,
+          f"圖裡 {len(thits)} 筆，_matches {tbar._matches}")
+    check("前置：命中散佈得比一個視窗還開（不然測不到捲動）",
+          thits[-1].y - thits[0].y > view_h,
+          f"y={[round(h.y) for h in thits]} 視窗高 {view_h}")
+    # 走使用者真正的路徑：在搜尋框裡按 Enter，一次前進一筆。
+    # 手動指定索引測不到「連按 Enter 會不會被吃掉」。
+    from PyQt6.QtTest import QTest
+
+    tbar._current_index = tbar._matches.index(tpos)
+    tbar.input.setFocus()
+    ordinals, offsets = [], []
+    for k in range(len(thits)):
+        if k:
+            QTest.keyClick(tbar.input, Qt.Key.Key_Return)
+        else:
+            tbar._goto_current()
+        ordinals.append(tbar._hit_ordinal(tpos))
+        pump(300)
+        scrolled = tallv.browser.verticalScrollBar().value()
+        block_top = tdoc.documentLayout().blockBoundingRect(
+            tdoc.findBlock(tpos)).top()
+        hit_y = block_top + thits[k].y
+        offsets.append((k, round(hit_y), scrolled,
+                        scrolled - 5 <= hit_y <= scrolled + view_h + 5))
+    check("圖裡逐筆前進時序號依序遞增",
+          ordinals == list(range(len(thits))), str(ordinals))
+    check("按下一筆會捲到圖裡的那一個字（每一筆都進畫面）",
+          all(row[3] for row in offsets), str(offsets))
+    check("捲軸真的跟著那一筆走（不是三次都停在同一處）",
+          len({row[2] for row in offsets}) == len(offsets),
+          str([row[2] for row in offsets]))
+    tallv.close()
+    pump(300)
     QSettings(config.ORG_NAME, config.APP_NAME).clear()
 
     mermaid.clear_caches()

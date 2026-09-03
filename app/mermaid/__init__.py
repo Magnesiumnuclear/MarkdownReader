@@ -37,6 +37,7 @@ from .model import (
     Diagram,
     Flowchart,
     Highlight,
+    Hit,
     MermaidError,
     Scene,
     SequenceDiagram,
@@ -48,7 +49,8 @@ if TYPE_CHECKING:  # pragma: no cover
 
 __all__ = [
     "SCHEME", "MermaidError", "UnsupportedDiagram", "Highlight",
-    "parse", "register", "diagram", "render", "scene_for", "clear_caches",
+    "parse", "register", "diagram", "render", "scene_for", "diagram_hits",
+    "clear_caches",
 ]
 
 # 文件裡 <img src="mermaid:鍵"> 用的協定，browser.loadResource 靠它辨識
@@ -182,6 +184,34 @@ def scene_for(key: str, font: "QFont") -> "Scene | None":
     return scene
 
 
+def _scale_for(scene: "Scene", column_width: float) -> float:
+    """圖太寬時等比縮小（只縮不放）。render 與 diagram_hits 共用同一份算法，
+    不然標出來的位置會和畫出來的差一個比例。"""
+    if column_width > 0 and scene.width > column_width:
+        return column_width / scene.width
+    return 1.0
+
+
+def diagram_hits(
+    key: str, font: "QFont", column_width: float, needle: str,
+    case_sensitive: bool = False, whole_words: bool = False,
+) -> list[Hit]:
+    """這張圖裡所有命中，依畫面順序編號，座標已換成縮放後的邏輯像素。
+
+    搜尋列用它算「這張圖有幾筆」與「第 k 筆畫在哪，要捲到哪」；畫家在
+    render_scene 裡用同一個函式算上色的位置。單一來源，順序不會分家。
+    """
+    scene = scene_for(key, font)
+    if scene is None:
+        return []
+    from .paint import pixel_font, scene_hits
+
+    return scene_hits(
+        scene, pixel_font(font), needle, case_sensitive, whole_words,
+        _scale_for(scene, column_width),
+    )
+
+
 def render(
     key: str, theme: str, column_width: float, font: "QFont", dpr: float,
     highlight: Highlight | None = None,
@@ -211,9 +241,7 @@ def render(
         return cached
 
     scene = scene_for(key, base_font)
-    scale = 1.0
-    if column_width > 0 and scene.width > column_width:
-        scale = column_width / scene.width
+    scale = _scale_for(scene, column_width)
 
     from .paint import render_scene
 

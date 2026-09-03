@@ -13,10 +13,18 @@ Enter 找下一個、Shift+Enter 找上一個、Esc 關閉，並以背景色高�
 
 【Mermaid 圖表裡的字也搜得到】
 圖表是畫成圖片嵌進文件的，圖裡的文字在 QTextDocument 裡完全不存在（一張圖就是
-一個 U+FFFC 字元），document.find 看不到它。所以另外走一條：拿圖的場景文字比對，
-命中就把「圖片那個字元的位置」當成一筆相符，高亮則是帶著搜尋詞把圖重畫一張、
-推回文件（見 _sync_diagram_highlights）。外面不能用 ExtraSelection 上色——圖片背景
-是透明的，那會把整張圖刷成一片黃。
+一個 U+FFFC 字元），document.find 看不到它。所以另外走一條：問 mermaid.diagram_hits
+拿這張圖裡所有命中，高亮則是帶著搜尋詞把圖重畫一張、推回文件
+（見 _sync_diagram_highlights）。外面不能用 ExtraSelection 上色——圖片背景是透明的，
+那會把整張圖刷成一片黃。
+
+【一張圖有幾筆命中就算幾筆】
+_matches 是「文件位置」的清單，而整張圖只佔一個字元。有三筆命中的圖就把同一個
+位置放三次——總數、上一筆／下一筆因此都正確，而 _matches 仍是單純的 int 清單，
+_sync_highlights 用 index - low 索引的快路徑不受影響。排序後同一張圖的幾筆必然
+相鄰，所以「這是圖裡第幾筆」= 目前索引減掉這個位置的第一個索引（見 _hit_ordinal）。
+序號的順序由 diagram_hits 決定，是**畫面順序**（由上而下、由左而右）：序列圖的
+參與者標籤上下各畫一排，照場景清單的順序會變成「上、下、中間」這種跳法。
 
 【只重畫螢幕上看得到的圖】
 重畫一張圖要 3.2ms，全部命中的圖都重畫（實測 40 張要 145ms）會卡在 UI 執行緒上、
@@ -40,6 +48,8 @@ reposition() 餵入允許範圍（內文區的矩形）。
 
 from __future__ import annotations
 
+from bisect import bisect_left
+
 from PyQt6.QtCore import (
     QEvent, QObject, QPoint, QRect, Qt, QTimer, QUrl, pyqtSignal,
 )
@@ -48,7 +58,6 @@ from PyQt6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QTextBrowser, QTextE
 
 from . import config, icons, mermaid, styles
 from .language import t
-from .mermaid import search as mermaid_search
 from .title_bar import IconButton
 
 
@@ -480,17 +489,16 @@ class FindBar(QWidget):
                 break
             self._matches.append(cursor.selectionStart())
 
-        # 圖表裡的字 document.find 看不到，另外比一次（見模組說明）
+        # 圖表裡的字 document.find 看不到，另外算一次（見模組說明）。
+        # 有幾筆就放幾次同一個位置——整張圖只佔一個字元，重複就是它的多重性。
         for position, key in self._diagram_images():
-            scene = mermaid.scene_for(key, document.defaultFont())
-            if scene is None:
-                continue
-            if mermaid_search.has_match(
-                mermaid_search.scene_text(scene), needle,
-                self._case_sensitive, self._whole_words,
-            ):
+            hits = mermaid.diagram_hits(
+                key, document.defaultFont(), self._browser.column_width(),
+                needle, self._case_sensitive, self._whole_words,
+            )
+            if hits:
                 self._diagram_matches[position] = key
-                self._matches.append(position)
+                self._matches.extend([position] * len(hits))
         if self._diagram_matches:
             # 上一筆／下一筆要照文件先後走，插進來的圖表位置得排回去
             self._matches.sort()
@@ -535,7 +543,10 @@ class FindBar(QWidget):
             )
         self._browser.setTextCursor(cursor)
         self._browser.ensureCursorVisible()
-        self._reveal_current()
+        # 圖表：游標只指到圖片本身，捲進畫面的是整張圖。命中的那個字可能在
+        # 圖的下半部、還在畫面外，所以再捲一次到那一筆，並拿它的矩形去閃避浮動面板。
+        target = self._scroll_to_hit(start) if start in self._diagram_matches else None
+        self._reveal_current(target)
         total = len(self._matches)
         # 沒有全部畫出來就要講：捲到遠處看見沒上色的相符字會像是壞掉。
         # 整句一個鍵而不是拼接——英文的括號是半形，那是翻譯的一部分。
@@ -546,12 +557,16 @@ class FindBar(QWidget):
         self._sync_highlights()
         self._sync_diagram_highlights()
 
-    def _reveal_current(self) -> None:
+    def _reveal_current(self, target: QRect | None = None) -> None:
         """目前這一筆若剛好被浮動面板壓住，往外多捲一點讓它露出來。
 
         ensureCursorVisible 只保證游標在 viewport 裡，不知道上面浮著一塊面板。
         兩個方向都試：面板在下就把內容再往上捲、在上就往下捲，選捲動量小的
         那個；兩邊都捲不動（文件太短或已到頂/底）就算了，不硬捲。
+
+        target 是要讓開的矩形（viewport 座標），預設是游標。圖表那一筆要傳
+        「圖裡那個字」的矩形進來——整張圖往往比視窗還高，拿游標矩形去算會
+        永遠判定被壓住而亂捲。
         """
         if self._browser is None or not self.isVisible():
             return
@@ -559,7 +574,7 @@ class FindBar(QWidget):
         bar = QRect(
             viewport.mapFromGlobal(self.mapToGlobal(QPoint(0, 0))), self.size()
         )
-        cursor_rect = self._browser.cursorRect()
+        cursor_rect = target if target is not None else self._browser.cursorRect()
         if not bar.intersects(cursor_rect):
             return
         margin = 8
@@ -573,6 +588,58 @@ class FindBar(QWidget):
             scrollbar.setValue(scrollbar.value() + push_up)
         elif can_down:
             scrollbar.setValue(scrollbar.value() - push_down)
+
+    def _hit_ordinal(self, position: int) -> int:
+        """目前這一筆是這張圖裡的第幾筆（0-based）。
+
+        _matches 排序過，同一個位置的幾筆必然相鄰，所以用二分找到第一個就能
+        相減。不是圖表、或索引不在範圍內時回 -1。
+        """
+        if position not in self._diagram_matches:
+            return -1
+        first = bisect_left(self._matches, position)
+        ordinal = self._current_index - first
+        return ordinal if ordinal >= 0 else -1
+
+    def _scroll_to_hit(self, position: int) -> "QRect | None":
+        """把圖裡目前那一筆捲進畫面，回傳它在 viewport 裡的矩形。
+
+        圖片在文件裡是一個字元，命中的字可能在圖的下半部；只靠
+        ensureCursorVisible 只保證「圖」進畫面，那個字仍可能在畫面外。
+        diagram_hits 給的座標已經算過縮放，加上圖片所在段落的頂端就是文件座標。
+        段落的內距會讓它差幾個像素——捲動只要「看得到」，不必到像素精準。
+        """
+        key = self._diagram_matches.get(position)
+        ordinal = self._hit_ordinal(position)
+        if key is None or ordinal < 0:
+            return None
+        document = self._browser.document()
+        hits = mermaid.diagram_hits(
+            key, document.defaultFont(), self._browser.column_width(),
+            self.input.text(), self._case_sensitive, self._whole_words,
+        )
+        if not 0 <= ordinal < len(hits):
+            return None
+        hit = hits[ordinal]
+        block = document.documentLayout().blockBoundingRect(
+            document.findBlock(position)
+        )
+        top, bottom = block.top() + hit.y, block.top() + hit.y + hit.h
+        scrollbar = self._browser.verticalScrollBar()
+        view_h = self._browser.viewport().height()
+        margin = 24
+        if top - margin < scrollbar.value():
+            scrollbar.setValue(max(scrollbar.minimum(), int(top - margin)))
+        elif bottom + margin > scrollbar.value() + view_h:
+            scrollbar.setValue(
+                min(scrollbar.maximum(), int(bottom + margin - view_h))
+            )
+        # 回傳的是 viewport 座標：面板閃避是 2D 判斷，x 也要對齊，
+        # 不然面板明明壓在那個字上、卻因為 x 差了一個左邊界而判成沒壓到。
+        return QRect(
+            int(block.left() + hit.x - self._browser.horizontalScrollBar().value()),
+            int(top - scrollbar.value()), int(hit.w), int(hit.h),
+        )
 
     # -- 高亮 ----------------------------------------------------------------
     def _window_bounds(self) -> tuple[int, int]:
@@ -708,7 +775,7 @@ class FindBar(QWidget):
                 if rect.bottom() >= top and rect.top() <= bottom:
                     want = mermaid.Highlight(
                         needle, self._case_sensitive, self._whole_words,
-                        position == current_pos,
+                        self._hit_ordinal(position) if position == current_pos else -1,
                     )
             self._push_diagram(position, key, want)
         # 已經不在文件裡的鍵（換過文件）不必還原，直接忘掉

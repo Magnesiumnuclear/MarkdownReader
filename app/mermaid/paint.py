@@ -38,6 +38,7 @@ from .. import styles
 from . import model, search
 from .model import (
     Highlight,
+    Hit,
     Ellipse,
     Path,
     Point,
@@ -212,11 +213,15 @@ class _ScenePainter:
     def __init__(
         self, painter: QPainter, colors: dict[str, str], measurer: QtMeasurer,
         highlight: "Highlight | None" = None,
+        hits: "dict[int, list[Hit]] | None" = None,
     ) -> None:
         self._p = painter
         self._colors = colors
         self._measurer = measurer
         self._highlight = highlight
+        # 原語索引 -> 那個原語裡的命中。由 scene_hits 算好交進來，畫家不自己比對
+        # ——計數、上色、捲動共用同一份清單，序號才不會各算各的。
+        self._hits = hits or {}
 
     def _color(self, role: Role) -> QColor:
         key = _ROLE_KEY[role]
@@ -238,7 +243,7 @@ class _ScenePainter:
             Qt.PenJoinStyle.RoundJoin,
         )
 
-    def draw(self, item: Primitive) -> None:
+    def draw(self, index: int, item: Primitive) -> None:
         if isinstance(item, Rect):
             self._rect(item)
         elif isinstance(item, Ellipse):
@@ -248,7 +253,7 @@ class _ScenePainter:
         elif isinstance(item, Path):
             self._path(item)
         elif isinstance(item, Text):
-            self._text(item)
+            self._text(index, item)
 
     def _rect(self, item: Rect) -> None:
         self._p.setPen(self._pen(item.stroke, item.line))
@@ -323,42 +328,89 @@ class _ScenePainter:
             self._p.drawLine(QPointF(cx - ax - px, cy - ay - py), QPointF(cx + ax + px, cy + ay + py))
             self._p.drawLine(QPointF(cx - ax + px, cy - ay + py), QPointF(cx + ax - px, cy + ay - py))
 
-    def _text(self, item: Text) -> None:
+    def _text(self, index: int, item: Text) -> None:
         font, fm = self._measurer.metrics_for(item.mono, item.scale)
         lines = item.text.split("\n")
         line_h = fm.height()
         top = item.y - _VALIGN_FACTOR[item.valign] * line_h * len(lines)
+        # 命中的底色先鋪，字再畫上去。矩形是 scene_hits 算好的（和捲動用的
+        # 是同一份），fillRect 不動畫筆，不必 save/restore。
+        current = self._highlight.current_ordinal if self._highlight else -1
+        for hit in self._hits.get(index, ()):
+            role = "find_current" if hit.ordinal == current else "find_match"
+            self._p.fillRect(
+                QRectF(hit.x, hit.y, hit.w, hit.h), self._color(role)
+            )
         self._p.setFont(font)
         self._p.setPen(QPen(self._color(item.role)))
         for i, line in enumerate(lines):
             x = item.x - _ALIGN_FACTOR[item.align] * fm.horizontalAdvance(line)
-            self._highlight_line(line, x, top + i * line_h, line_h, fm)
             # 以 ascent 定基線：畫出來的框才和 measure() 回報的 height() 疊合
             self._p.drawText(QPointF(x, top + i * line_h + fm.ascent()), line)
 
-    def _highlight_line(self, line, x, top, line_h, fm) -> None:
-        """搜尋命中的字後面補一塊底色，再讓上面那行把字畫上去。
 
-        量寬度用的是 metrics_for() 拿到的同一組 QFontMetricsF，和 drawText
-        用的字型完全相同（見模組說明），所以偏移不會和實際畫出來的字錯開。
-        fillRect 不動畫筆，畫完直接接著 drawText，不必 save/restore。
-        """
-        if self._highlight is None:
-            return
-        spans = search.matches_in(
-            line, self._highlight.needle,
-            self._highlight.case_sensitive, self._highlight.whole_words,
-        )
-        if not spans:
-            return
-        role = "find_current" if self._highlight.current else "find_match"
-        color = self._color(role)
-        for start, end in spans:
-            left = x + fm.horizontalAdvance(line[:start])
-            self._p.fillRect(
-                QRectF(left, top, fm.horizontalAdvance(line[start:end]), line_h),
-                color,
-            )
+def scene_hits(
+    scene: Scene, font: QFont, needle: str,
+    case_sensitive: bool = False, whole_words: bool = False, scale: float = 1.0,
+) -> list[Hit]:
+    """列出這個場景裡所有命中，依**畫面順序**（由上而下、由左而右）編號。
+
+    這是計數、上色與捲動的**單一來源**：三邊都吃這份清單，序號就不可能分家。
+    幾何算法和 _text 畫字時完全一樣（同一組 metrics_for 的 QFontMetricsF），
+    所以標出來的框必然對齊實際畫出來的字。
+
+    scale 讓呼叫端直接拿到「縮放後的邏輯像素」，省得自己再乘一次。
+    """
+    if not needle:
+        return []
+    measurer = QtMeasurer(font)
+    found: list[tuple[float, float, int, int, int, int, float, float, float]] = []
+    for index, item in enumerate(scene.items):
+        if not isinstance(item, Text):
+            continue
+        spans_by_line = [
+            (i, search.matches_in(line, needle, case_sensitive, whole_words))
+            for i, line in enumerate(item.text.split("\n"))
+        ]
+        if not any(spans for _i, spans in spans_by_line):
+            continue
+        _font, fm = measurer.metrics_for(item.mono, item.scale)
+        lines = item.text.split("\n")
+        line_h = fm.height()
+        top = item.y - _VALIGN_FACTOR[item.valign] * line_h * len(lines)
+        for i, spans in spans_by_line:
+            line = lines[i]
+            x = item.x - _ALIGN_FACTOR[item.align] * fm.horizontalAdvance(line)
+            line_top = top + i * line_h
+            for start, end in spans:
+                left = x + fm.horizontalAdvance(line[:start])
+                width = fm.horizontalAdvance(line[start:end])
+                found.append((
+                    line_top, left, index, i, start, end, left, line_top, width,
+                ))
+    # 畫面順序：先由上而下，再由左而右。四捨五入到 0.1 避免浮點抖動換順序；
+    # 完全同位置時用場景索引與行內位置壓住，結果必定可重現。
+    found.sort(key=lambda r: (round(r[0], 1), round(r[1], 1), r[2], r[3], r[4]))
+    line_heights: dict[int, float] = {}
+    hits: list[Hit] = []
+    for ordinal, row in enumerate(found):
+        line_top, left, index, i, start, end, hx, hy, width = row
+        item = scene.items[index]
+        if index not in line_heights:
+            line_heights[index] = measurer.metrics_for(item.mono, item.scale)[1].height()
+        hits.append(Hit(
+            ordinal, index, i, start, end,
+            hx * scale, hy * scale, width * scale, line_heights[index] * scale,
+        ))
+    return hits
+
+
+def hits_by_item(hits: list[Hit]) -> dict[int, list[Hit]]:
+    """把 scene_hits 的結果依原語索引分組，給畫家查表用。"""
+    grouped: dict[int, list[Hit]] = {}
+    for hit in hits:
+        grouped.setdefault(hit.item, []).append(hit)
+    return grouped
 
 
 def render_scene(
@@ -383,11 +435,18 @@ def render_scene(
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
     painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+    grouped: dict[int, list[Hit]] = {}
+    if highlight is not None:
+        # 命中的幾何在場景座標算（畫筆已經套了縮放），所以這裡 scale 用 1.0
+        grouped = hits_by_item(scene_hits(
+            scene, font, highlight.needle,
+            highlight.case_sensitive, highlight.whole_words,
+        ))
     drawer = _ScenePainter(
-        painter, styles.palette(theme), QtMeasurer(font), highlight
+        painter, styles.palette(theme), QtMeasurer(font), highlight, grouped
     )
-    for item in scene.items:
-        drawer.draw(item)
+    for index, item in enumerate(scene.items):
+        drawer.draw(index, item)
     painter.end()
     # 一定要畫完才標 DPR：先標的話 QPainter 會自己再套一次縮放，內容變兩倍大溢出圖外
     image.setDevicePixelRatio(dpr)

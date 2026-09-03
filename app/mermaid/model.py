@@ -339,14 +339,39 @@ class Highlight(NamedTuple):
     """要在圖裡標出來的搜尋詞。
 
     放在契約層而不是 facade：畫家與外部介面都要用到它，畫家再反過來匯入
-    facade 就成了循環匯入。current 代表「這張圖就是使用者目前所在的那一筆」，
-    用強調色畫，其餘用一般的相符色——和內文的高亮同一套語彙。
+    facade 就成了循環匯入。
+
+    current_ordinal 是「這張圖裡的第幾筆命中正是使用者目前所在的那一筆」
+    （見 Hit.ordinal），那一筆畫強調色、其餘畫一般的相符色——和內文的高亮
+    同一套語彙。-1 代表目前那一筆不在這張圖裡。
     """
 
     needle: str
     case_sensitive: bool = False
     whole_words: bool = False
-    current: bool = False
+    current_ordinal: int = -1
+
+
+class Hit(NamedTuple):
+    """圖裡的一筆搜尋命中：它是第幾筆、在哪個原語的哪一行、以及畫在哪裡。
+
+    ordinal 的順序是**畫面上的順序**（由上而下、由左而右），不是場景清單的
+    順序——序列圖的參與者標籤上下各畫一排，照場景順序會變成「上、下、中間」
+    這種跳來跳去的走法。計數、上色與捲動全部共用這一份清單，順序就不可能分家。
+
+    x/y/w/h 是算好縮放之後的邏輯像素（左上原點），可以直接加上圖片在文件裡的
+    位置換成文件座標，用來把那一筆捲進畫面。
+    """
+
+    ordinal: int
+    item: int          # scene.items 裡的索引
+    line: int          # 那個 Text 原語的第幾行
+    start: int         # 行內的 Python 字串索引
+    end: int
+    x: float
+    y: float
+    w: float
+    h: float
 
 
 class TextMeasurer(Protocol):
