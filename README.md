@@ -9,7 +9,7 @@
 | 分類 | 內容 |
 |------|------|
 | 開檔 | 接收 Windows 傳入的命令列路徑、`Ctrl+O` 選檔、拖放檔案到視窗 |
-| 排版 | GitHub 風格 CSS、程式碼語法高亮、表格、任務清單、註腳、定義清單、刪除線 |
+| 排版 | GitHub 風格 CSS、程式碼語法高亮、表格、任務清單、註腳、定義清單、刪除線、Mermaid 流程圖與序列圖（內嵌畫出） |
 | 視窗 | 無邊框 + 自訂標題列、拖曳移動（保留 Aero Snap）、四邊四角縮放、雙擊最大化 |
 | 閱讀 | 深淺色主題切換、字級縮放、`Ctrl+F` 搜尋並高亮全部符合項（可切換區分大小寫／全字；搜尋列是浮動面板，可拖到任何位置）、狀態列資訊 |
 | 設定 | 覆蓋式設定面板（`Ctrl+,`）：主題模式、字級、行高、內文寬度、行為開關，一鍵恢復預設 |
@@ -231,6 +231,90 @@ alt 就會靜靜地失效。所以 `set_image_alts()` 會先用同一個 baseUrl
 圖示本身遵守既有的圖示規範：`16×16` viewBox、純描邊、`{color}` 佔位符隨主題著色。
 它是這套圖示裡第一個帶封閉方框的形狀（其餘 18 個都是開放形狀），這是「圖片」這個
 概念避不掉的；好在它只出現在內文裡，旁邊沒有其他圖示可比。
+
+### Mermaid 圖表：自己畫的子集渲染器
+
+```` ```mermaid ```` 區塊會**直接畫成圖**嵌在文件裡，支援 **flowchart**（`graph`／`flowchart`，
+TD·TB·BT·LR·RL）與 **sequence diagram**。其餘類型（class、state、ER、gantt、pie…）維持顯示
+原始碼，上方加一行「尚未內嵌支援」；解析失敗則標示「第 N 行」。範例與對照見 `Mermaid 測試.md`。
+
+**為什麼自己畫。** Mermaid 本體是瀏覽器裡的 JavaScript：解析、dagre 版面、DOM 長 SVG，
+整條鏈都要瀏覽器，而 QTextDocument 什麼都不能跑。內嵌 WebEngine 要多 150MB、違背這個程式
+輕量的前提；呼叫外部 `mmdc` 依機器而異；線上服務會把文件內容送出去。剩下的路只有一條：
+自己寫一個子集，用 QPainter 畫成 QImage，經 `loadResource` 嵌進去——和任務清單的核取方塊、
+破圖佔位是同一個機制。
+
+**保真度的定位要先講清楚：語意保真，不是像素保真。** 節點、形狀、連線、標籤、方向都對，
+但配色跟閱讀器的主題走、字型是閱讀器的字型，畫出來不會和 mermaid.live 一模一樣。
+這不是做不到而已，是結構性的：Mermaid 決定節點多大是問瀏覽器「這段字幾像素寬」，
+Qt 量同一段字差個一兩像素是常態，節點尺寸一差，版面就全部位移。反過來說，自己畫的好處
+正是這些——深淺色即時跟隨、字級縮放跟著變、高 DPI 清晰、離線、不加任何相依。
+
+#### 管線
+
+```
+```mermaid 圍欄 ──(qt_html.MermaidPreprocessor，轉換期)──> mermaid.parse() 成功 ──> 登錄表（鍵=原始碼雜湊）
+                                                            │                       └─> <p class="imgblock"><img src="mermaid:鍵">
+                                                            └─ 失敗 ──> 標示 + 原樣留給 fenced_code
+文件排版要圖時 ──(browser.loadResource，載入期)──> mermaid.render(鍵, 主題, 欄寬, 字型, DPR) ──> QImage
+```
+
+程式碼在 `app/mermaid/`：`model.py` 是所有模組共用的契約（圖表模型、幾何、Scene 繪圖原語），
+`flowchart.py`／`sequence.py` 解析並組場景，`layout.py` 是流程圖的分層版面，`paint.py` 把
+Scene 畫成 QImage。Scene 是刻意多加的一層——畫家只認得矩形、線、文字，不必知道圖表語意，
+測試也能直接對原語做斷言而不必比像素。版面演算法藏在 `model.LayoutEngine` 介面後面，
+日後要換成別的引擎不必動解析與繪製。
+
+**解析在轉換期、畫在載入期。** 畫要知道主題、字級、欄寬與 DPR，轉換時都還不知道；
+解析只跟原始碼有關，做一次就夠。登錄表是行程全域、以原始碼雜湊為鍵的 LRU：
+HTML 是按分頁、按主題快取的，換主題、換字級都不會重新轉換 Markdown，
+「鍵 → 已解析圖表」的對照必須活得比一次轉換久。
+
+#### 三個地雷
+
+1. **語言標記在 fenced_code 那一關就被吃掉了。** 沒有 mermaid 的 lexer，區塊變成純文字丟進
+   htmlStash，最後的 HTML 找不到任何「這曾經是 mermaid」的痕跡。所以只能用**前處理器**
+   在 fenced_code（優先序 25）之前攔（我們是 27），做法和它一樣：把 HTML 交給
+   `md.htmlStash.store()` 留佔位符。
+2. **欄寬要在 setHtml 之前餵給閱讀區。** 圖是排版時載入的，而 `_apply_content_width`
+   在 setHtml 之後才跑。每個分頁各有一個閱讀區，新分頁的閱讀區在第一次 setHtml 前沒被
+   resize 餵過欄寬，會退回「viewport 減邊距」（約 1030）來畫，超出 900 的內文欄。
+   回歸測試不是直接呼叫 `loadResource`（那拿到的是「現在」的欄寬），而是看
+   `document().resource()` 快取的那張圖——那才是排版當下用的。
+3. **標示文字翻譯過，但 HTML 快取不含語言。** 標示的表格帶 `mermaid-note` 這個 class 當記號，
+   `DocumentTab.on_language_changed` 只對含它的快取作廢（和大檔警告同一個例外）。
+   圖片本身的 `alt` 固定寫 `Mermaid` 不翻，免得也進同一個坑。
+
+還有一個從破圖佔位那次學來、這裡一體適用的：`setDevicePixelRatio` 一定要在畫完之後才標，
+先標的話 QPainter 會自己套一次 DPR、再乘一次就是放大兩倍。
+
+#### 版面
+
+流程圖是分層排版（Sugiyama 那一套）：DFS 去環、最長路徑分層、長邊插假節點、barycenter
+上下各掃四輪減少交叉、座標依寬度排開再做四輪「往鄰居平均靠攏」的放鬆，最後依方向轉置或
+翻轉。子圖用「成員在同一層內保持相鄰」的近似，外框取成員的包圍盒——成員橫跨很多層時框會
+很高，也可能框到非成員，這是已知限制。實測 300 節點／600 邊約 9 ms，40 節點的圖從解析到
+畫完 20 ms 內。序列圖不需要圖版面：參與者橫排、訊息依序縱排，照規格寫就是了。
+
+#### 上限與退路
+
+`config.py` 的 `MERMAID_MAX_NODES`(300)、`MERMAID_MAX_EDGES`(600)、`MERMAID_MAX_MESSAGES`(400)、
+`MERMAID_MAX_SOURCE_BYTES`(64KB)：超過就當解析失敗、顯示原始碼。版面演算法是純 Python，
+節點數上去是超線性的，這些上限把「一張圖」的成本壓在百毫秒內。`benchmark_render.py`
+多了 `md_mermaid`（轉換期解析 40 張圖）與 `render_mermaid`（載入期排版＋繪製 40 張圖）兩個指標。
+
+#### 已知限制
+
+- 語法是子集：流程圖不支援 v11 的 `A@{shape: …}`、markdown 字串、圖示；`style`／`classDef`／
+  `linkStyle`／`click` 會被接受但忽略（配色跟閱讀器走）。序列圖的 `-)`／`--)` 開放箭頭畫成一般箭頭；
+  `box`、`links`、`create`／`destroy` 不支援。
+- 邊是平滑曲線，沒有避障，可能穿過其他節點；相鄰的 loop／alt 區塊框會貼在一起。
+- 版面不會和官方一樣（見上面的定位）。要和別處看到的一模一樣，只有真的跑 Mermaid 的路。
+- 巢狀（subgraph、loop/alt…）上限 60 層：版面是逐層遞迴的，兩萬字節的來源就能疊出
+  上千層打穿直譯器——超過就退回「解析失敗」標示，而不是當機。同理，跨很多層的長邊
+  受假節點預算（4000）約束，病態圖超出預算的長邊會退化成直線，換取版面永遠在百毫秒內。
+- 已解析圖表的登錄表是行程全域的 LRU（4096 筆）。極端情況下（一個行程裡看過幾千張
+  內容都不同的圖）較舊分頁的圖會退成破圖佔位，按 F5 重新載入即恢復。
 
 ### 搜尋在大文件上的兩個成本
 
@@ -903,7 +987,8 @@ app/
   title_bar.py              自訂標題列（拖曳、控制按鈕）
   find_bar.py               Ctrl+F 搜尋列
   settings_panel.py         Ctrl+, 覆蓋式設定面板
-  browser.py                閱讀區元件（核取方塊資源、圖片縮放、破圖佔位）
+  browser.py                閱讀區元件（核取方塊資源、圖片縮放、破圖佔位、Mermaid 圖片）
+  mermaid/                  Mermaid 子集渲染器（model 契約、flowchart、layout、sequence、paint）
   document_tab.py           單一分頁的狀態（內容、捲動位置、歷史、延後載入旗標）
   tab_bar.py                分頁列與分頁按鈕、拖曳縮影（相對抓取點跟隨）
   single_instance.py        具名管道：把路徑交給既有實例
@@ -956,7 +1041,7 @@ assets/icons/*.svg          所有 UI 圖示
 
 ## 已知限制
 
-- 不支援圓角、陰影、Mermaid 圖表、HTML `<details>` 與 GFM 警示區塊（`> [!NOTE]`）。若日後需要完整保真度，唯一解是改用 `QWebEngineView`（exe 會增加約 150MB）；渲染層已隔離在 `document.py` 與 `viewer.py`，替換成本不高。
+- 不支援圓角、陰影、HTML `<details>` 與 GFM 警示區塊（`> [!NOTE]`）。Mermaid 只支援 flowchart 與 sequence diagram 的子集（見「Mermaid 圖表」一節）。若日後需要完整保真度，唯一解是改用 `QWebEngineView`（exe 會增加約 150MB）；渲染層已隔離在 `document.py` 與 `viewer.py`，替換成本不高。
 - 無邊框視窗不支援 Windows 11 的 Snap Layouts（滑鼠停在最大化鈕上跳出的版面選單），那需要攔截原生 `WM_NCHITTEST` 訊息。
 - 「還原上次分頁」在多視窗下只記住最後關閉的那個視窗（每個視窗關閉時都會覆寫同一份紀錄，最後寫的贏）。要完整還原多個視窗需要另一套session 格式，目前不做。
 - **還原成最大化之後，第一次點還原鈕沒有反應，要點第二次。**「一開始就以最大化

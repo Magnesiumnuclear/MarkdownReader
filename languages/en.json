@@ -108,6 +108,14 @@
 
   "encoding.latin1Uncertain": "latin-1 (may be incorrect)",
   "image.notFound": "Image not found",
+  "mermaid.unsupported": "This Mermaid diagram type ({kind}) is not supported inline yet; the source is shown below.",
+  "mermaid.parseFailed": "Mermaid parse error (line {line}): {reason}",
+  "mermaid.err.syntax": "Unrecognised statement: {token}",
+  "mermaid.err.tooLarge": "Diagram too large (over {limit} elements)",
+  "mermaid.err.unclosedBlock": "Block is missing its end",
+  "mermaid.err.tooDeep": "Nesting too deep (over {limit} levels)",
+  "mermaid.err.unexpectedEnd": "Unexpected end",
+  "mermaid.err.unknownParticipant": "Unknown participant: {name}",
 
   "dialog.openTitle": "Open Markdown file",
   "dialog.openFilter": "Markdown documents (*.md *.markdown *.mdown *.mkd *.mkdn *.mdtxt);;Plain text (*.txt);;All files (*.*)",

@@ -108,6 +108,14 @@
 
   "encoding.latin1Uncertain": "latin-1（可能不正確）",
   "image.notFound": "找不到圖片",
+  "mermaid.unsupported": "此 Mermaid 圖表類型（{kind}）尚未內嵌支援，以下顯示原始碼。",
+  "mermaid.parseFailed": "Mermaid 解析失敗（第 {line} 行）：{reason}",
+  "mermaid.err.syntax": "看不懂這一行：{token}",
+  "mermaid.err.tooLarge": "圖表太大（超過 {limit} 個元素）",
+  "mermaid.err.unclosedBlock": "區塊沒有對應的 end",
+  "mermaid.err.tooDeep": "巢狀太深（超過 {limit} 層）",
+  "mermaid.err.unexpectedEnd": "多出來的 end",
+  "mermaid.err.unknownParticipant": "引用了未宣告的參與者：{name}",
 
   "dialog.openTitle": "開啟 Markdown 檔案",
   "dialog.openFilter": "Markdown 文件 (*.md *.markdown *.mdown *.mkd *.mkdn *.mdtxt);;純文字檔 (*.txt);;所有檔案 (*.*)",

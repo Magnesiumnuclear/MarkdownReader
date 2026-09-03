@@ -15,16 +15,23 @@ Qt 認得的等效結構（而不是用正規表達式改字串，以免誤傷�
   <table>       -> 加上 class="data" 以便和上述包裝用表格區分樣式
   - [ ] / - [x] -> <img src="mdres:checkbox-off|on">（由 viewer 以 QPainter 繪製）
   標題 id       -> 於標題開頭插入 <a name="id"> 讓 #錨點 連結可以跳轉
+  ```mermaid    -> <img src="mermaid:鍵">（前處理階段攔截，由 app/mermaid 解析並繪製；
+                   不支援的類型或解析失敗則保留原始碼區塊並在前面加一行標示）
 """
 
 from __future__ import annotations
 
+import html
 import re
 import xml.etree.ElementTree as ET
 
 from markdown.extensions import Extension
 from markdown.inlinepatterns import SimpleTagInlineProcessor
+from markdown.preprocessors import Preprocessor
 from markdown.treeprocessors import Treeprocessor
+
+from . import mermaid
+from .language import t
 
 # 任務清單語法：位於清單項目開頭的 [ ] 或 [x]
 _TASK_RE = re.compile(r"^\[([ xX])\]\s+")
@@ -59,6 +66,104 @@ def _new_table(table_class: str, cell_class: str) -> tuple[ET.Element, ET.Elemen
     row = ET.SubElement(table, "tr")
     cell = ET.SubElement(row, "td", {"class": cell_class})
     return table, cell
+
+
+class MermaidPreprocessor(Preprocessor):
+    """在 fenced_code 之前攔下 ```mermaid 圍欄。
+
+    【為什麼是前處理器】語言標記在 fenced_code + codehilite 那一關就被吃掉了：
+    沒有 mermaid 的 lexer，區塊變成純文字丟進 htmlStash，最後的 HTML 裡找不到
+    任何「這曾經是 mermaid」的痕跡。所以只能在它們之前、還看得到圍欄的時候動手。
+    優先序 27：在 normalize_whitespace(30) 之後、fenced_code(25) 之前。
+
+    做法和 fenced_code 一樣——把 HTML 交給 md.htmlStash.store()，留下佔位符
+    （轉換流程末端會換回來）。成功解析：整個圍欄換成一個 <img src="mermaid:鍵">；
+    類型不支援或解析失敗：在圍欄「前面」插一段標示，圍欄原封不動留給
+    fenced_code，畫面上就是原本的程式碼區塊加一行說明。
+    """
+
+    _OPEN_RE = re.compile(r"^(?P<indent>[ ]{0,3})(?P<fence>`{3,}|~{3,})[ \t]*mermaid\b")
+    # 任何圍欄的開頭（含沒有語言標記的）。用來略過別的圍欄的內容：
+    # 展示用的程式碼區塊裡寫著 ```mermaid 是「文字」，不是圖表
+    _ANY_FENCE_RE = re.compile(r"^[ ]{0,3}(?P<fence>`{3,}|~{3,})")
+
+    def run(self, lines: list[str]) -> list[str]:
+        out: list[str] = []
+        index = 0
+        total = len(lines)
+        while index < total:
+            match = self._OPEN_RE.match(lines[index])
+            if match is None:
+                out.append(lines[index])
+                index += 1
+                # 別的圍欄（```python、~~~、甚至光禿禿的 ```）整塊原樣跳過：
+                # 裡面出現的 ```mermaid 是被展示的文字，不是圖表。實際踩過的例子
+                # 就是本專案的 README——說明管線的程式碼區塊裡寫著 ```mermaid，
+                # 沒有這一段會被當成真的圍欄攔走，整個區塊被打散。
+                # 收尾找不到就照原樣走到檔尾，與 fenced_code 對沒關上的圍欄一致。
+                other = self._ANY_FENCE_RE.match(lines[index - 1])
+                if other is not None:
+                    closing = self._find_closing(lines, index, other.group("fence"))
+                    stop = (closing + 1) if closing is not None else total
+                    out.extend(lines[index:stop])
+                    index = stop
+                continue
+            fence = match.group("fence")
+            closing = self._find_closing(lines, index + 1, fence)
+            if closing is None:
+                # 沒關上的圍欄：照 fenced_code 的規則會被當成一般段落，這裡不插手
+                out.append(lines[index])
+                index += 1
+                continue
+
+            source = "\n".join(lines[index + 1:closing])
+            notice = self._try_embed(source, out)
+            if notice is not None:
+                out.extend(["", self.md.htmlStash.store(notice), ""])
+                out.extend(lines[index:closing + 1])
+            index = closing + 1
+        return out
+
+    @staticmethod
+    def _find_closing(lines: list[str], start: int, fence: str) -> int | None:
+        char = fence[0]
+        for index in range(start, len(lines)):
+            stripped = lines[index].strip()
+            if stripped and set(stripped) == {char} and len(stripped) >= len(fence):
+                return index
+        return None
+
+    def _try_embed(self, source: str, out: list[str]) -> str | None:
+        """成功就把 <img> 佔位符放進 out 並回 None；否則回傳標示的 HTML。"""
+        try:
+            parsed = mermaid.parse(source)
+        except mermaid.UnsupportedDiagram as error:
+            text = t("mermaid.unsupported", kind=html.escape(error.kind))
+        except mermaid.MermaidError as error:
+            params = {k: html.escape(str(v)) for k, v in error.params.items()}
+            reason = t(error.key, **params)
+            text = t("mermaid.parseFailed", line=error.line, reason=reason)
+        else:
+            key = mermaid.register(parsed, source)
+            # alt 固定用 Mermaid 不翻譯：HTML 快取不含語言，翻了會在切語言後停在舊語言。
+            # class="imgblock" 要自己帶——stash 進去的 HTML 不在文件樹裡，
+            # _tag_image_paragraphs 掃不到它。
+            out.extend([
+                "",
+                self.md.htmlStash.store(
+                    '<p class="imgblock"><img alt="Mermaid" '
+                    f'src="{mermaid.SCHEME}:{key}" class="mermaid"></p>'
+                ),
+                "",
+            ])
+            return None
+        # mermaid-note 是給 document_tab.on_language_changed 認的記號：
+        # 這段文字翻譯過，切語言時含它的 HTML 快取要作廢
+        return (
+            '<table class="notice mermaid-note" width="100%" border="0" '
+            'cellspacing="0" cellpadding="0">'
+            f'<tr><td class="warncell">{text}</td></tr></table>'
+        )
 
 
 class QtRichTextTreeprocessor(Treeprocessor):
@@ -257,6 +362,8 @@ class QtRichTextExtension(Extension):
         md.inlinePatterns.register(
             SimpleTagInlineProcessor(r"()~~(.*?)~~", "del"), "strikethrough", 100
         )
+        # 要在 fenced_code(25) 之前看到圍欄，見 MermaidPreprocessor 的說明
+        md.preprocessors.register(MermaidPreprocessor(md), "mermaid_fence", 27)
         md.treeprocessors.register(
             QtRichTextTreeprocessor(md), "qt_rich_text", 1
         )

@@ -74,6 +74,7 @@ import gc
 import json
 import os
 import random
+import re
 import statistics
 import subprocess
 import sys
@@ -101,6 +102,8 @@ ABSOLUTE_BUDGET_MS = {
     "sethtml_mixed": 700,
     "sethtml_headings": 2500,
     "sethtml_readme": 300,
+    "md_mermaid": 600,
+    "render_mermaid": 900,
 }
 
 DEFAULT_TOLERANCE = 0.15
@@ -112,6 +115,7 @@ DOC_SIZES = {
     "code": 400,        # 程式碼密集：壓 codehilite 的語法高亮
     "table": 300,       # 表格密集：壓 extra 的表格解析
     "mixed": 1500,      # 混合：最接近真實文件
+    "mermaid": 40,      # Mermaid：40 張各約 20 節點的流程圖 + 序列圖交錯
 }
 
 # Qt 端的排版參數直接寫死，不從 QSettings 讀。
@@ -170,12 +174,36 @@ def build_documents() -> dict[str, str]:
     docs["mixed"] = "\n\n".join(
         rng.choice(shapes).format(i=i) for i in range(DOC_SIZES["mixed"])
     )
+
+    # Mermaid：轉換期要解析每張圖（md_mermaid），載入期要排版與繪製（render_mermaid）。
+    # 流程圖 20 節點含分支與子圖、序列圖 12 則訊息含區塊，接近真實筆記裡的規模。
+    # 每張圖的標籤都帶 i：登錄表的鍵是原始碼雜湊，40 張一模一樣的圖只會畫一張，
+    # 其餘全是快取命中，量出來的數字會小到沒有意義。
+    blocks = []
+    for i in range(DOC_SIZES["mermaid"]):
+        if i % 2 == 0:
+            lines = ["graph TD"]
+            for k in range(18):
+                shape = ("[步驟 {i}-{k}]", "{{判斷 {i}-{k}}}", "([{i}-{k}])", "[[子 {i}-{k}]]")[k % 4]
+                lines.append(f"  N{k}{shape.format(i=i, k=k)} --> N{k + 1}")
+                if k % 3 == 0:
+                    lines.append(f"  N{k} -->|分支 {i}-{k}| N{k + 2}")
+            lines.append(f"  subgraph 群組 {i}\n    N3 --> N19\n  end")
+            blocks.append("```mermaid\n" + "\n".join(lines) + "\n```")
+        else:
+            lines = ["sequenceDiagram", "  participant A", "  participant B", "  participant C"]
+            for k in range(12):
+                src, dst = ("A", "B") if k % 2 else ("B", "C")
+                lines.append(f"  {src}->>{dst}: 訊息 {i}-{k}")
+            lines.append(f"  loop 每次 {i}\n    C-->>A: 回應\n  end")
+            blocks.append("```mermaid\n" + "\n".join(lines) + "\n```")
+    docs["mermaid"] = "\n\n".join(f"## 圖 {i}\n\n{block}" for i, block in enumerate(blocks))
     return docs
 
 
 # --- 量測工具 ---------------------------------------------------------------
-MD_METRICS = ("md_headings", "md_prose", "md_code", "md_table", "md_mixed")
-QT_METRICS = ("sethtml_mixed", "sethtml_headings", "sethtml_readme")
+MD_METRICS = ("md_headings", "md_prose", "md_code", "md_table", "md_mixed", "md_mermaid")
+QT_METRICS = ("sethtml_mixed", "sethtml_headings", "sethtml_readme", "render_mermaid")
 
 # 丟掉前幾次不列入統計。1 次不夠：轉換器要載入並串接八個擴充、pygments 要建
 # lexer、Qt 要建字型快取，第二次都還在受影響。
@@ -223,6 +251,8 @@ def run_probe(name: str, runs: int) -> int:
 
         text = docs[name[len("md_") :]]
         samples = timed(lambda: document.markdown_to_html(str(text), THEME), runs)
+    elif name == "render_mermaid":
+        samples = _probe_mermaid_render(docs, runs)
     else:
         samples = _probe_qt(name, docs, runs)
 
@@ -275,6 +305,35 @@ def _probe_qt(name: str, docs: dict[str, str], runs: int) -> list[float]:
         doc.setTextWidth(LAYOUT_TEXT_WIDTH)
         doc.setHtml(html)
         doc.documentLayout().documentSize()
+
+    return timed(action, runs)
+
+
+def _probe_mermaid_render(docs: dict[str, str], runs: int) -> list[float]:
+    """量 Mermaid 圖表從「已解析的模型」到「畫好的 QImage」的成本（版面 + 繪製）。
+
+    這段不在 setHtml 的探針裡：那邊用的是獨立的 QTextDocument，沒有閱讀區覆寫的
+    loadResource，mermaid: 圖片根本不會被畫。轉換期的解析成本則已經算在 md_mermaid
+    裡（前處理器就是在那時解析並登錄的）。
+    """
+    from PyQt6.QtGui import QFont
+    from PyQt6.QtWidgets import QApplication
+
+    from app import document, mermaid
+
+    global _QAPP
+    _QAPP = QApplication.instance() or QApplication([])
+
+    html = document.markdown_to_html(docs["mermaid"], THEME)
+    keys = re.findall(r'src="mermaid:([0-9a-f]+)"', html)
+    font = QFont()
+    font.setPointSize(LAYOUT_FONT_PT)
+
+    def action():
+        # 只清圖片快取，登錄表留著：量的是「畫」，不是「解析」
+        mermaid._images.clear()
+        for key in keys:
+            mermaid.render(key, THEME, LAYOUT_TEXT_WIDTH, font, 1.0)
 
     return timed(action, runs)
 

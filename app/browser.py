@@ -19,7 +19,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import QFrame, QTextBrowser, QWidget
 
-from . import config, icons, qt_html, styles
+from . import config, icons, mermaid, qt_html, styles
 from .language import t
 
 
@@ -32,6 +32,10 @@ class MarkdownBrowser(QTextBrowser):
         self._theme = config.DEFAULT_THEME
         # 解析後的圖片 url -> (alt 文字, 原始 src)。破圖佔位要用（見 set_image_alts）
         self._image_alts: dict[str, tuple[str, str]] = {}
+        # 內文欄的實際寬度（像素），由 viewer 在算完內文寬度後餵入。Mermaid 圖表
+        # 要縮到欄寬內，而欄寬取決於「內文寬度」設定，不是 viewport 寬——
+        # 閱讀區自己算不出來（見 viewer._apply_content_width）。0 代表還不知道。
+        self._column_width = 0
         self.setOpenLinks(False)
         self.setOpenExternalLinks(False)
         self.setFrameShape(QFrame.Shape.NoFrame)
@@ -39,6 +43,19 @@ class MarkdownBrowser(QTextBrowser):
 
     def set_theme(self, theme: str) -> None:
         self._theme = theme
+
+    def set_content_column_width(self, width: float) -> None:
+        """記下內文欄寬。一定要在 setHtml 之前設好——圖片資源是排版時載入的。"""
+        self._column_width = max(0, int(width))
+
+    def _column_width_or_fallback(self) -> int:
+        """內文欄寬；viewer 還沒餵入時退回 viewport 減去邊距（和圖片縮放同一個算法）。"""
+        if self._column_width > 0:
+            return self._column_width
+        available = self.viewport().width()
+        if available < 100:
+            available = self.width()
+        return max(0, available - 2 * styles.DOCUMENT_MARGIN - 8)
 
     def set_image_alts(self, alts: dict[str, str]) -> None:
         """記下這份文件每張圖的 alt 文字，供破圖佔位顯示。
@@ -62,6 +79,25 @@ class MarkdownBrowser(QTextBrowser):
             colors = styles.palette(self._theme)
             checked = url.toString().endswith("checkbox-on")
             return icons.checkbox_pixmap(checked, colors["text_muted"], colors["accent"])
+
+        # Mermaid 圖表：文件裡是 <img src="mermaid:鍵">，這裡才真的畫。
+        # 畫要知道主題、字級、欄寬與 DPR，都是這一刻才確定的東西。
+        if url.scheme() == mermaid.SCHEME:
+            try:
+                image = mermaid.render(
+                    url.path(),
+                    self._theme,
+                    self._column_width_or_fallback(),
+                    self.document().defaultFont(),
+                    self.devicePixelRatioF() or 1.0,
+                )
+            except Exception:
+                # 這裡在 Qt 排版的呼叫鏈上，例外漏出去就是整個程式的當機對話框。
+                # 解析期的上限應該擋掉一切病態輸入，這是最後一道保險：
+                # 畫不出來就退回破圖佔位，一張圖壞不該拖垮整份文件。
+                image = None
+            # 登錄表被擠掉才會查不到；退回破圖佔位，alt 會寫著 Mermaid
+            return image if image is not None else self._broken_image(url)
 
         resource = super().loadResource(resource_type, url)
 

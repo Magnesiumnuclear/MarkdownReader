@@ -1045,6 +1045,14 @@ class MarkdownViewer(QWidget):
                 return percent
         return 160
 
+    def _content_side_margin(self) -> float:
+        """內文欄兩側的邊距：限制內文寬度時把欄夾成固定寬並置中，否則用基本邊距。"""
+        margin = styles.DOCUMENT_MARGIN
+        viewport = self.browser.viewport().width()
+        if self._content_width and viewport > self._content_width + 2 * margin:
+            return (viewport - self._content_width) / 2
+        return margin
+
     def _apply_content_width(self) -> None:
         """限制文字欄寬度並置中。
 
@@ -1054,11 +1062,10 @@ class MarkdownViewer(QWidget):
         """
         margin = styles.DOCUMENT_MARGIN
         viewport = self.browser.viewport().width()
-
-        if self._content_width and viewport > self._content_width + 2 * margin:
-            side = (viewport - self._content_width) / 2
-        else:
-            side = margin
+        side = self._content_side_margin()
+        # Mermaid 圖表要縮到欄寬內，欄寬只有這裡算得出來（取決於內文寬度設定）。
+        # 便宜的一行，放在早退之前，讓閱讀區永遠拿得到最新的值。
+        self.browser.set_content_column_width(viewport - 2 * side)
 
         # 【算出同一個邊距就不要碰 frameFormat】setFrameFormat 會讓整份文件
         # 重新排版，而 resizeEvent 每一幀都會走到這裡。限制內文寬度時，只要
@@ -1347,6 +1354,12 @@ class MarkdownViewer(QWidget):
         self._tab.pending_chunks = chunks
         self._tab.pending_scroll_ratio = ratio if preserve_scroll else 0.0
 
+        # Mermaid 圖表是排版時（就在下面這行 setHtml 裡）載入的，欄寬得先給——
+        # _apply_content_width 在 setHtml 之後才跑，等它就晚了一步，
+        # 第一次載入的圖會用錯的寬度畫。
+        self.browser.set_content_column_width(
+            self.browser.viewport().width() - 2 * self._content_side_margin()
+        )
         self.browser.setHtml(head)
         # setHtml 會重建文件，root frame 的邊距回到預設值——快取要跟著失效，
         # 否則下面這次會誤判「和上次算出來的一樣」而跳過，邊距就套不上去

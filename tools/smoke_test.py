@@ -44,6 +44,7 @@ import faulthandler
 faulthandler.enable()
 
 import argparse
+import re
 import os
 import subprocess
 import sys
@@ -2744,9 +2745,523 @@ def section_tab_dnd(args) -> None:
     QSettings(config.ORG_NAME, config.APP_NAME).clear()
 
 
+# ===========================================================================
+# 區塊：Mermaid 圖表（子集渲染器：解析、版面、序列圖、繪製、與閱讀器的整合）
+# ===========================================================================
+def section_mermaid(args) -> None:
+    from PyQt6.QtCore import QEventLoop, QSettings, Qt, QTimer, QUrl
+    from PyQt6.QtGui import QFont, QTextDocument
+    from PyQt6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+
+    def pump(ms=250):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+        for _ in range(3):
+            app.processEvents()
+
+    from app import document, mermaid
+    from app.mermaid import flowchart, sequence
+    from app.mermaid import layout as flow_layout
+    from app.mermaid import model
+    from app.mermaid.model import FixedMeasurer, MermaidError, UnsupportedDiagram  # noqa: F401
+    from app.viewer import MarkdownViewer
+
+    def intersects(a, b):
+        return not (a.right <= b.x or b.right <= a.x or a.bottom <= b.y or b.bottom <= a.y)
+
+    # --- 流程圖：解析 --------------------------------------------------------
+    flow_src = "\n".join([
+        "graph LR",
+        "  %% 整行註解",
+        "  A[方形] --> B(圓角); B --> C([體育場])",
+        "  C --> D[[子程序]] --> E[(資料庫)] --> F((圓))",
+        "  F --> G{菱形} --> H{{六角}} --> I>旗標]",
+        "  I --> J[/平行/] --> K[\\反向\\] --> L[/梯形\\] --> M[\\倒梯/]",
+        "  A -- 文字一 --> N",
+        "  A -->|文字二| O",
+        "  A -. 文字三 .-> P",
+        "  A == 文字四 ==> Q",
+        "  A --- R",
+        "  A -.- S",
+        "  A === T",
+        "  A --x U",
+        "  A --o V",
+        "  A <--> W",
+        "  x1 & x2 --> y1 & y2",
+        '  Z["引號 [裡面] 可以有 <br> 換行"]:::cls',
+        "  classDef cls fill:#fff",
+        "  style A fill:#eee",
+        '  click A "https://example.com"',
+        "  subgraph outer [外層]",
+        "    subgraph inner",
+        "      I2 --> I3",
+        "    end",
+        "    O1 --> I2",
+        "  end",
+    ])
+    chart = flowchart.parse_flowchart(flow_src)
+    check("流程圖：方向 LR", chart.direction == "LR", chart.direction)
+    expected_shapes = dict(zip(
+        "ABCDEFGHIJKLM",
+        ["rect", "round", "stadium", "subroutine", "cylinder", "circle", "diamond",
+         "hexagon", "asym", "lean_right", "lean_left", "trapezoid", "trapezoid_alt"],
+    ))
+    got_shapes = {k: chart.nodes[k].shape for k in expected_shapes if k in chart.nodes}
+    check("流程圖：13 種節點形狀全部解析對", got_shapes == expected_shapes,
+          str({k: v for k, v in got_shapes.items() if expected_shapes.get(k) != v}))
+    check("流程圖：形狀裡的文字是標籤", chart.nodes["A"].label == "方形"
+          and chart.nodes["G"].label == "菱形", f"{chart.nodes['A'].label}/{chart.nodes['G'].label}")
+
+    def edge(src, dst):
+        return next(e for e in chart.edges if e.source == src and e.target == dst)
+
+    check("流程圖：三種標籤寫法都拿到文字",
+          edge("A", "N").label == "文字一" and edge("A", "O").label == "文字二"
+          and edge("A", "P").label == "文字三" and edge("A", "Q").label == "文字四",
+          f"{edge('A', 'N').label}/{edge('A', 'O').label}/{edge('A', 'P').label}/{edge('A', 'Q').label}")
+    check("流程圖：線型與端點（點線、粗線、無箭頭、叉、圈、雙向）",
+          edge("A", "P").style == "dotted" and edge("A", "Q").style == "thick"
+          and edge("A", "R").head == "none" and edge("A", "S").style == "dotted"
+          and edge("A", "T").style == "thick" and edge("A", "U").head == "cross"
+          and edge("A", "V").head == "circle"
+          and edge("A", "W").head == "arrow" and edge("A", "W").tail == "arrow",
+          str([(e.source, e.target, e.style, e.head, e.tail)
+               for e in chart.edges if e.source == "A"]))
+    fanout = {(e.source, e.target) for e in chart.edges if e.source in ("x1", "x2")}
+    check("流程圖：& 展開成笛卡兒積",
+          fanout == {("x1", "y1"), ("x1", "y2"), ("x2", "y1"), ("x2", "y2")}, str(fanout))
+    chain = [(e.source, e.target) for e in chart.edges if e.source in ("C", "D", "E")]
+    check("流程圖：鏈 C --> D --> E --> F 拆成三條邊",
+          ("C", "D") in chain and ("D", "E") in chain and ("E", "F") in chain, str(chain))
+    z = chart.nodes["Z"].label
+    check("流程圖：引號標籤保留括號、<br> 變換行、:::class 被忽略",
+          "引號 [裡面]" in z and "\n" in z and "換行" in z and ":::" not in z, repr(z))
+    check("流程圖：style/classDef/click 被忽略而不是報錯",
+          "classDef" not in chart.nodes and "style" not in chart.nodes, str(list(chart.nodes)[-4:]))
+    outer = chart.subgraphs[0] if chart.subgraphs else None
+    check("流程圖：子圖巢狀結構與成員",
+          outer is not None and outer.id == "outer" and outer.title == "外層"
+          and "O1" in outer.nodes and outer.children and outer.children[0].id == "inner"
+          and set(outer.children[0].nodes) == {"I2", "I3"},
+          f"{outer.id if outer else None} {outer.nodes if outer else None} "
+          f"{[c.id for c in outer.children] if outer else None}")
+
+    # --- 流程圖：錯誤與上限 --------------------------------------------------
+    def error_of(fn):
+        try:
+            fn()
+        except MermaidError as error:
+            return error
+        except UnsupportedDiagram as error:
+            return error
+        return None
+
+    err = error_of(lambda: flowchart.parse_flowchart("graph TD\n A --> B\n ??? !!!\n B --> C"))
+    check("流程圖：看不懂的行回報正確行號與片段",
+          isinstance(err, MermaidError) and err.line == 3 and err.key == model.ERR_SYNTAX
+          and "???" in str(err.params.get("token", "")), f"{err and err.__dict__}")
+    err = error_of(lambda: flowchart.parse_flowchart("graph TD\n subgraph S\n A --> B"))
+    check("流程圖：少了 end 指到 subgraph 那一行",
+          isinstance(err, MermaidError) and err.key == model.ERR_UNCLOSED and err.line == 2,
+          f"{err and (err.key, err.line)}")
+    err = error_of(lambda: flowchart.parse_flowchart("graph TD\n A --> B\n end"))
+    check("流程圖：多出來的 end 報 unexpectedEnd",
+          isinstance(err, MermaidError) and err.key == model.ERR_UNEXPECTED_END,
+          f"{err and (err.key, err.line)}")
+    err = error_of(lambda: flowchart.parse_flowchart(
+        "graph TD\n A --> B\n B --> C\n C --> D", max_nodes=3))
+    check("流程圖：節點超過上限報 tooLarge 並帶上限值",
+          isinstance(err, MermaidError) and err.key == model.ERR_TOO_LARGE
+          and err.params.get("limit") == 3, f"{err and (err.key, err.params)}")
+    err = error_of(lambda: mermaid.parse("classDiagram\n  A <|-- B"))
+    check("對外介面：未支援類型拋 UnsupportedDiagram 並帶類型名",
+          isinstance(err, UnsupportedDiagram) and err.kind == "classDiagram",
+          f"{type(err).__name__} {getattr(err, 'kind', None)}")
+    err = error_of(lambda: mermaid.parse("%% c\n\ngraph TD\nA-->B\nbad !!\n"))
+    check("對外介面：前言（註解、空行）被略過後行號仍指向原始區塊的行",
+          isinstance(err, MermaidError) and err.line == 5, f"{err and err.line}")
+    check("對外介面：frontmatter 與 %%{init}%% 指令會被略過",
+          isinstance(mermaid.parse("---\ntitle: x\n---\n%%{init: {'theme':'dark'}}%%\ngraph TD\nA-->B"),
+                     model.Flowchart))
+
+    # --- 流程圖：版面不變量 --------------------------------------------------
+    engine = flow_layout.LayeredLayout()
+    measurer = FixedMeasurer()
+
+    def lay_out(src):
+        parsed = flowchart.parse_flowchart(src)
+        placed = engine.layout(
+            parsed, flowchart.measure_nodes(parsed, measurer),
+            flowchart.measure_edge_labels(parsed, measurer), model.LayoutSpacing(),
+            flowchart.measure_subgraph_titles(parsed, measurer))
+        return parsed, placed
+
+    parsed_lr, placed_lr = lay_out(flow_src)
+    boxes = list(placed_lr.nodes.values())
+    overlaps = sum(1 for i in range(len(boxes)) for j in range(i + 1, len(boxes))
+                   if intersects(boxes[i], boxes[j]))
+    check("版面：節點兩兩不重疊（LR，30+ 節點）", overlaps == 0, f"重疊 {overlaps} 對")
+    forward = [e for e in parsed_lr.edges if e.source != e.target]
+    wrong = [(e.source, e.target) for e in forward
+             if placed_lr.nodes[e.target].x < placed_lr.nodes[e.source].right - 1]
+    check("版面：LR 時所有邊的 target 都在 source 右邊（真的有轉置）",
+          not wrong, str(wrong[:5]))
+    parsed_tb, placed_tb = lay_out(flow_src.replace("graph LR", "graph TD", 1))
+    wrong_tb = [(e.source, e.target) for e in parsed_tb.edges if e.source != e.target
+                if placed_tb.nodes[e.target].y < placed_tb.nodes[e.source].bottom - 1]
+    check("版面：TD 時所有邊的 target 都在 source 下方", not wrong_tb, str(wrong_tb[:5]))
+    outer_box = placed_lr.subgraphs.get("outer")
+    inner_box = placed_lr.subgraphs.get("inner")
+    check("版面：子圖外框包住所有成員，巢狀子圖框在父框內",
+          outer_box is not None and inner_box is not None
+          and all(intersects(outer_box, placed_lr.nodes[n]) and
+                  outer_box.x <= placed_lr.nodes[n].x and placed_lr.nodes[n].right <= outer_box.right
+                  for n in ("O1", "I2", "I3"))
+          and outer_box.x <= inner_box.x and inner_box.right <= outer_box.right
+          and outer_box.y <= inner_box.y and inner_box.bottom <= outer_box.bottom,
+          f"outer={outer_box} inner={inner_box}")
+    def on_box(pt, box, tol=2.0):
+        return (box.x - tol <= pt[0] <= box.right + tol
+                and box.y - tol <= pt[1] <= box.bottom + tol)
+
+    bad_ends = [
+        (e.source, e.target)
+        for r in placed_lr.edges
+        for e in [parsed_lr.edges[r.index]]
+        if e.source != e.target
+        and not (on_box(r.points[0], placed_lr.nodes[e.source])
+                 and on_box(r.points[-1], placed_lr.nodes[e.target]))
+    ]
+    check("版面：邊的路徑起點貼在 source 框上、終點貼在 target 框上（含被反向的回邊）",
+          not bad_ends and all(len(r.points) >= 2 for r in placed_lr.edges),
+          str(bad_ends[:4]))
+    _again, placed_again = lay_out(flow_src)
+    check("版面：同樣的輸入兩次算出一模一樣的結果（可重現）",
+          repr(placed_again) == repr(placed_lr))
+    # 覆審抓到的：_exclude 掃描的層範圍拿成員清單的頭尾當上下界，但清單是
+    # 「首次提到」的順序，跟層無關——掃錯範圍，非成員就被留在子圖框裡
+    exc, placed_exc = lay_out("flowchart TB\nN0 --> N4\nN3 --> N0\nsubgraph S0\nN4\nN3\nend")
+    n0, s0 = placed_exc.nodes["N0"], placed_exc.subgraphs["S0"]
+    check("版面：非成員不會落在子圖框裡（exclude 掃對層範圍）",
+          not intersects(n0, s0), f"N0={n0} S0={s0}")
+
+    # 標題比成員寬的子圖：框與版面都要撐開，否則字被畫出圖片外
+    wide_title = "A very long subgraph title far wider than the member"
+    wt, placed_wt = lay_out(f"flowchart TB\nsubgraph S [{wide_title}]\nA\nend")
+    need = measurer.measure(wide_title).w + 16
+    check("版面：子圖標題比成員寬時框與版面跟著撐開",
+          placed_wt.subgraphs["S"].w >= need
+          and placed_wt.width >= placed_wt.subgraphs["S"].right,
+          f"box.w={placed_wt.subgraphs['S'].w} need={need}")
+
+    # 假節點要受預算約束：病態圖（長邊 × 幾百層）不受控會疊出七萬個、卡秒級
+    big_lines = ["flowchart TB"] + [f"N{i} --> N{i+1}" for i in range(299)]
+    big_lines += [f"N{i % 50} -->|l{i}| N{299 - (i % 40)}" for i in range(301)]
+    _big, placed_big = lay_out("\n".join(big_lines))
+    interior = sum(len(r.points) - 2 for r in placed_big.edges)
+    check("版面：假節點總數受預算約束（病態圖不會卡住 UI）",
+          interior <= flow_layout.DUMMY_BUDGET + 10, f"中繼點 {interior}")
+
+    # 只有空子圖的圖要畫出佔位框，不是一張看不見的小空圖
+    _e, placed_empty = lay_out("flowchart TB\nsubgraph S [Hello]\nend")
+    check("版面：只有空子圖也畫得出佔位框",
+          "S" in placed_empty.subgraphs and placed_empty.width > 60,
+          f"{placed_empty.subgraphs} w={placed_empty.width}")
+
+    # 巢狀太深要在解析期擋下——版面是逐層遞迴的，不擋會打穿直譯器（當機而不是標示）
+    deep = "flowchart TB\n" + "subgraph s\n" * 100 + "A --> B\n" + "end\n" * 100
+    err = error_of(lambda: flowchart.parse_flowchart(deep))
+    check("流程圖：巢狀超過上限報 tooDeep（不是 RecursionError）",
+          isinstance(err, MermaidError) and err.key == model.ERR_TOO_DEEP,
+          f"{type(err).__name__} {getattr(err, 'key', None)}")
+    deep_seq = "sequenceDiagram\n" + "loop x\n" * 100 + "A->>B: t\n" + "end\n" * 100
+    err = error_of(lambda: sequence.parse_sequence(deep_seq))
+    check("序列圖：巢狀超過上限報 tooDeep",
+          isinstance(err, MermaidError) and err.key == model.ERR_TOO_DEEP,
+          f"{type(err).__name__} {getattr(err, 'key', None)}")
+
+    # 模糊測試：覆審的 parser-robustness 掃描——失敗一律是自家例外，
+    # 任何別的例外（IndexError、RecursionError…）都會讓整份文件的轉換當掉
+    nasty = [
+        "", "graph", "graph XX", "graph TD\nA[--", 'graph TD\nA["', "graph TD\n&",
+        "graph TD\nA -->", "graph TD\n--> B", "graph TD\nA -->|", "graph TD\nsubgraph",
+        "graph TD\nA((", "graph TD\nA{{{}}}", "graph TD\nA --> B %% c %% d",
+        "sequenceDiagram\nA->", "sequenceDiagram\n->>B: x", "sequenceDiagram\nend",
+        "sequenceDiagram\nNote over : x", "sequenceDiagram\nbox\nend",
+        "graph TD\n" + ";" * 3000, "---\nonly frontmatter",
+        "graph TD\nA[" + "x" * 3000 + "]",
+    ]
+    foreign = []
+    for source_text in nasty:
+        try:
+            mermaid.parse(source_text)
+        except (MermaidError, UnsupportedDiagram):
+            pass
+        except Exception as caught:   # noqa: BLE001（就是要抓「別的」例外）
+            foreign.append(f"{type(caught).__name__}: {source_text[:20]!r}")
+    check("解析：怪輸入的失敗一律是自家例外（不會炸掉整份文件的轉換）",
+          not foreign, str(foreign[:3]))
+
+    cyc, placed_cyc = lay_out("graph TD\n A --> B --> C --> A\n C --> C")
+    check("版面：有環與自環的圖也排得出來且不重疊",
+          len(placed_cyc.nodes) == 3 and len(placed_cyc.edges) == 4
+          and not any(intersects(a, b) for a in placed_cyc.nodes.values()
+                      for b in placed_cyc.nodes.values() if a is not b),
+          str(placed_cyc.nodes))
+
+    # --- 序列圖：解析與場景 --------------------------------------------------
+    seq_src = "\n".join([
+        "sequenceDiagram",
+        "  title 標題",
+        "  autonumber",
+        "  actor U as 使用者",
+        "  participant S",
+        "  U->>+S: 請求",
+        "  S-->>-U: 回應<br>兩行",
+        "  S->S: 自己",
+        "  Note over U,S: 跨越",
+        "  Note left of U: 左",
+        "  Note right of S: 右",
+        "  loop 每次",
+        "    U-xS: 叉",
+        "  end",
+        "  alt 成功",
+        "    S-)U: 開放",
+        "  else 失敗",
+        "    S--)U: 虛線開放",
+        "  end",
+        "  activate S",
+        "  deactivate S",
+    ])
+    seq = sequence.parse_sequence(seq_src)
+    check("序列圖：標題與 autonumber", seq.title == "標題" and seq.autonumber, f"{seq.title!r} {seq.autonumber}")
+    check("序列圖：參與者依宣告順序，actor 有標籤與旗標",
+          [p.id for p in seq.participants] == ["U", "S"] and seq.participants[0].actor
+          and seq.participants[0].label == "使用者" and not seq.participants[1].actor,
+          str([(p.id, p.label, p.actor) for p in seq.participants]))
+    messages = [i for i in seq.items if isinstance(i, model.Message)]
+    check("序列圖：+/- 啟用旗標與 <br> 換行",
+          messages[0].activate and messages[1].deactivate and "\n" in messages[1].text,
+          f"{messages[0].activate} {messages[1].deactivate} {messages[1].text!r}")
+    check("序列圖：八種箭頭的線型與端點（實/虛、箭頭/叉/開放）",
+          (messages[0].line, messages[0].head) == ("solid", "arrow")
+          and (messages[1].line, messages[1].head) == ("dotted", "arrow")
+          and messages[2].source == messages[2].target == "S",
+          str([(m.source, m.target, m.line, m.head) for m in messages[:3]]))
+    notes = [i for i in seq.items if isinstance(i, model.Note)]
+    check("序列圖：三種便條位置",
+          [n.position for n in notes] == ["over", "left", "right"]
+          and notes[0].participants == ["U", "S"], str([(n.position, n.participants) for n in notes]))
+    blocks = [i for i in seq.items if isinstance(i, model.Block)]
+    check("序列圖：loop 一段、alt/else 兩段，訊息在各自的段落裡",
+          [b.kind for b in blocks] == ["loop", "alt"]
+          and [s.label for s in blocks[0].sections] == ["每次"]
+          and [s.label for s in blocks[1].sections] == ["成功", "失敗"]
+          and isinstance(blocks[0].sections[0].items[0], model.Message)
+          and blocks[0].sections[0].items[0].head == "cross"
+          and blocks[1].sections[0].items[0].head == "open"
+          and blocks[1].sections[1].items[0].line == "dotted",
+          str([(b.kind, [s.label for s in b.sections]) for b in blocks]))
+    err = error_of(lambda: sequence.parse_sequence("sequenceDiagram\n A->>B: x\n 亂七八糟\n"))
+    check("序列圖：看不懂的行回報行號",
+          isinstance(err, MermaidError) and err.line == 3 and err.key == model.ERR_SYNTAX,
+          f"{err and (err.key, err.line)}")
+    err = error_of(lambda: sequence.parse_sequence("sequenceDiagram\n loop x\n A->>B: y\n"))
+    check("序列圖：少了 end 指到 loop 那一行",
+          isinstance(err, MermaidError) and err.key == model.ERR_UNCLOSED and err.line == 2,
+          f"{err and (err.key, err.line)}")
+    err = error_of(lambda: sequence.parse_sequence(
+        "sequenceDiagram\n A->>B: 1\n B->>A: 2\n A->>B: 3", max_messages=2))
+    check("序列圖：訊息超過上限報 tooLarge",
+          isinstance(err, MermaidError) and err.key == model.ERR_TOO_LARGE,
+          f"{err and err.key}")
+    scene = sequence.to_scene(seq, measurer)
+    headers = [p for p in scene.items if isinstance(p, model.Rect)
+               and p.fill == "header_fill" and p.radius == 4]
+    msg_paths = [p for p in scene.items if isinstance(p, model.Path)
+                 and p.stroke == "edge" and p.line != "dashed"]
+    activations = [p for p in scene.items if isinstance(p, model.Rect)
+                   and p.fill == "node_fill" and abs(p.box.w - 10) < 0.01]
+    frames = [p for p in scene.items if isinstance(p, model.Rect)
+              and p.stroke == "frame" and p.fill == "none"]
+    # actor 畫的是小人不是方框，所以框數 = 非 actor 參與者 × 上下兩排；
+    # 訊息要連區塊裡的一起算
+    def all_messages(items):
+        for item in items:
+            if isinstance(item, model.Message):
+                yield item
+            elif isinstance(item, model.Block):
+                for section in item.sections:
+                    yield from all_messages(section.items)
+    total_messages = len(list(all_messages(seq.items)))
+    boxed = [p for p in seq.participants if not p.actor]
+    check("序列圖場景：參與者框上下各一排、訊息線與訊息數一致、有啟用框與區塊框",
+          len(headers) == 2 * len(boxed) and len(msg_paths) == total_messages == 6
+          and len(activations) >= 2 and len(frames) == 2 and scene.width > 0 and scene.height > 0,
+          f"headers={len(headers)}/{2 * len(boxed)} paths={len(msg_paths)}/{total_messages} "
+          f"act={len(activations)} frames={len(frames)}")
+
+    # --- 繪製：對外介面 render() ----------------------------------------------
+    font = QFont("Microsoft JhengHei")
+    font.setPixelSize(15)
+    key = mermaid.register(chart, flow_src)
+    image = mermaid.render(key, "light", 900, font, 1.5)
+    check("繪製：回傳非空的 QImage，標上正確的裝置像素比",
+          image is not None and not image.isNull() and abs(image.devicePixelRatio() - 1.5) < 0.01,
+          f"{image and image.devicePixelRatio()}")
+    logical_w = image.width() / image.devicePixelRatio()
+    check("繪製：寬度不超過內文欄寬（過寬的圖等比縮小）", logical_w <= 900 + 0.5, str(logical_w))
+    right = max(image.pixelColor(image.width() - 1, y).alpha() for y in range(image.height()))
+    bottom = max(image.pixelColor(x, image.height() - 1).alpha() for x in range(image.width()))
+    check("繪製：內容沒有溢出邊界（沒有重複套用 DPR）", right == 0 and bottom == 0,
+          f"右欄 alpha={right} 底列 alpha={bottom}")
+    dark = mermaid.render(key, "dark", 900, font, 1.5)
+    check("繪製：深淺色主題畫出來的圖不同", dark is not None and dark != image)
+    check("繪製：同樣的參數第二次直接命中快取（同一個物件）",
+          mermaid.render(key, "light", 900, font, 1.5) is image)
+    narrow = mermaid.render(key, "light", 300, font, 1.0)
+    check("繪製：欄寬變窄圖跟著縮", narrow is not None and narrow.width() <= 300 + 1, str(narrow and narrow.width()))
+    big_font = QFont(font)
+    big_font.setPixelSize(22)
+    small_chart_key = mermaid.register(flowchart.parse_flowchart("graph TD\n A --> B"), "graph TD\n A --> B")
+    small_15 = mermaid.render(small_chart_key, "light", 900, font, 1.0)
+    small_22 = mermaid.render(small_chart_key, "light", 900, big_font, 1.0)
+    check("繪製：字級變大圖跟著變大（快取鍵含字級）",
+          small_22.width() > small_15.width() and small_22.height() > small_15.height(),
+          f"{small_15.width()}x{small_15.height()} -> {small_22.width()}x{small_22.height()}")
+    point_font = QFont("Microsoft JhengHei")
+    point_font.setPointSize(11)
+    check("繪製：點數字型也能畫（快取鍵用換算後的像素字級，不會全部撞在 -1）",
+          mermaid.render(small_chart_key, "light", 900, point_font, 1.0) is not None)
+    check("對外介面：查無此鍵回傳 None", mermaid.render("no-such-key", "light", 900, font, 1.0) is None)
+
+    # --- 與閱讀器整合 ---------------------------------------------------------
+    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    tmp = tempfile.mkdtemp()
+    doc_path = os.path.join(tmp, "mermaid.md")
+    with open(doc_path, "w", encoding="utf-8") as handle:
+        handle.write("# Mermaid\n\n```mermaid\n" + flow_src + "\n```\n\n段落。\n\n"
+                     "```mermaid\n" + seq_src + "\n```\n\n"
+                     "```mermaid\nclassDiagram\n  Animal <|-- Duck\n```\n\n"
+                     "```mermaid\ngraph TD\n  A --> B\n  這行壞了 !!!\n```\n")
+    # 覆審抓到的：展示用圍欄裡寫著 ```mermaid 是文字不是圖表——README 自己的
+    # 管線說明就是這樣寫的，被攔走整個區塊會被打散
+    IMG_RE = re.compile(r'<img[^>]+src="mermaid:')
+    NOTE_RE = re.compile(r'<table class="notice mermaid-note"')
+    fenced = ("````markdown\n```mermaid\ngraph TD\n A --> B\n```\n````\n\n"
+              "```\n```mermaid 圍欄 --(轉換期)--> 解析\n```\n\n"
+              "```mermaid\ngraph TD\nX-->Y\n```\n")
+    fenced_html = document.markdown_to_html(fenced, "light")
+    check("整合：別的圍欄裡的 ```mermaid 是文字；圍欄外的照畫",
+          len(IMG_RE.findall(fenced_html)) == 1 and not NOTE_RE.findall(fenced_html)
+          and "graph TD" in fenced_html,
+          f"img={len(IMG_RE.findall(fenced_html))} note={len(NOTE_RE.findall(fenced_html))}")
+    with open(README, encoding="utf-8") as handle:
+        readme_html = document.markdown_to_html(handle.read(), "light")
+    check("整合：README 轉換後沒有任何真的 mermaid 圖或標示（管線圖是展示文字）",
+          not IMG_RE.findall(readme_html) and not NOTE_RE.findall(readme_html),
+          f"img={len(IMG_RE.findall(readme_html))} note={len(NOTE_RE.findall(readme_html))}")
+
+    viewer = MarkdownViewer(doc_path)
+    viewer.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+    viewer.resize(1120, 820)
+    viewer.show()
+    pump(600)
+    viewer.flush_pending_chunks()
+    pump(200)
+    html = viewer._tab.build_html(viewer._theme)
+    check("整合：支援的區塊變成 mermaid: 圖片，不支援與壞掉的變成標示＋原始碼",
+          html.count('src="mermaid:') == 2 and html.count("mermaid-note") == 2
+          and "classDiagram" in html and 'class="code"' in html,
+          f"img={html.count('src=\"mermaid:')} note={html.count('mermaid-note')}")
+    check("整合：圖片段落帶 imgblock（避免行高留白）",
+          '<p class="imgblock"><img alt="Mermaid" src="mermaid:' in html)
+    check("整合：alt 對照表也記到 mermaid 圖片",
+          any(src.startswith("mermaid:") and alt == "Mermaid"
+              for src, alt in document.image_alts(html).items()))
+    keys = re.findall(r'src="mermaid:([0-9a-f]+)"', html)
+    image_type = QTextDocument.ResourceType.ImageResource.value
+    loaded = viewer.browser.loadResource(image_type, QUrl(f"mermaid:{keys[0]}"))
+    expected_dpr = viewer.browser.devicePixelRatioF() or 1.0
+    check("整合：loadResource 對 mermaid: 回傳畫好的圖（不是破圖佔位）",
+          loaded is not None and not loaded.isNull() and loaded.height() / expected_dpr > 150
+          and abs(loaded.devicePixelRatio() - expected_dpr) < 0.01,
+          f"{loaded and (loaded.width(), loaded.height(), loaded.devicePixelRatio())}")
+    # 【排版當下用的寬度】直接呼叫 loadResource 拿到的是「現在」的欄寬，測不到
+    # setHtml 那一刻用的是什麼；要看文件自己快取的那張圖（document().resource）。
+    # 每個分頁各有一個閱讀區，新分頁的閱讀區在第一次 setHtml 前還沒被 resize
+    # 餵過欄寬——沒有 _render_now 裡那次預先餵入，會用 viewport 減邊距（約 1030）
+    # 來畫，超出 900 的內文欄。這張圖自然寬 1800 多，一定會被縮，縮到多寬就是證據。
+    doc2_path = os.path.join(tmp, "mermaid2.md")
+    with open(doc2_path, "w", encoding="utf-8") as handle:
+        handle.write("```mermaid" + chr(10) + flow_src + chr(10) + "```" + chr(10))
+    viewer.open_path(doc2_path, new_tab=True)
+    pump(600)
+    viewer.flush_pending_chunks()
+    pump(200)
+    html2 = viewer._tab.build_html(viewer._theme)
+    key2 = re.findall(r'src="mermaid:([0-9a-f]+)"', html2)[0]
+    cached = viewer.browser.document().resource(image_type, QUrl(f"mermaid:{key2}"))
+    cached_w = cached.width() / (cached.devicePixelRatio() or 1.0) if cached is not None else -1
+    check("整合：新分頁第一次排版就用內文欄寬縮圖（欄寬在 setHtml 之前就餵入）",
+          cached is not None and cached_w <= viewer._content_width + 0.5,
+          f"{cached_w} vs 欄寬 {viewer._content_width}")
+    viewer.close_tab_at(viewer._active)
+    pump(300)
+    before_theme = viewer._theme
+    viewer.apply_theme("dark" if before_theme == "light" else "light")
+    pump(500)
+    reloaded = viewer.browser.loadResource(image_type, QUrl(f"mermaid:{keys[0]}"))
+    check("整合：換主題後重畫的圖不同（配色跟主題走）", reloaded != loaded)
+    viewer.apply_theme(before_theme)
+    pump(400)
+    small = viewer.browser.loadResource(image_type, QUrl(f"mermaid:{keys[1]}"))
+    viewer.zoom_in()
+    pump(500)
+    bigger = viewer.browser.loadResource(image_type, QUrl(f"mermaid:{keys[1]}"))
+    check("整合：字級放大後圖跟著變大", bigger.width() > small.width(),
+          f"{small.width()} -> {bigger.width()}")
+    viewer.zoom_reset()
+    pump(400)
+    viewer.resize(560, 700)
+    pump(700)          # 等 _on_resize_settled（180ms）觸發重繪
+    # 不能直接呼叫 loadResource——那會拿「現在」的欄寬重畫一張，永遠是對的，
+    # 測不到「文件有沒有真的重新排版」。要看文件自己快取的那張
+    # （實測把 has_scalable_images 的正則改成排除 mermaid: 後，直接呼叫的
+    # 版本照樣全綠，看文件快取的版本會紅）。
+    check("前置：mermaid 圖片算 scalable（視窗縮放要觸發重繪）",
+          viewer._tab.has_scalable_images)
+    narrow_img = viewer.browser.document().resource(image_type, QUrl(f"mermaid:{keys[0]}"))
+    column = viewer.browser._column_width_or_fallback()
+    narrow_w = (narrow_img.width() / (narrow_img.devicePixelRatio() or 1.0)
+                if narrow_img is not None else -1)
+    check("整合：視窗變窄後文件排版用的那張圖重新貼合欄寬",
+          narrow_img is not None and narrow_w <= column + 0.5,
+          f"{narrow_w} vs {column}")
+    viewer.resize(1120, 820)
+    pump(500)
+    viewer.set_language_mode("en")
+    pump(500)
+    html_en = viewer._tab.build_html(viewer._theme)
+    check("整合：切換語言後標示文字跟著換（含標示的 HTML 快取被清掉）",
+          "not supported inline" in html_en and "尚未內嵌支援" not in html_en
+          and "parse error" in html_en,
+          html_en[html_en.find("mermaid-note"):][:120])
+    viewer.set_language_mode(config.DEFAULT_LANGUAGE)
+    pump(300)
+    viewer.close()
+    pump(300)
+    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    mermaid.clear_caches()
+
+
 SECTIONS = [
     ("渲染與閱讀", section_rendering),
     ("渲染快取", section_render_cache),
+    ("Mermaid 圖表", section_mermaid),
     ("介面語言", section_language),
     ("分頁操作", section_tabs),
     ("分頁狀態還原", section_session),

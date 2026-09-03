@@ -155,6 +155,30 @@ KEY_FIND_BAR_CORNER = "find/barCorner"
 KEY_FIND_BAR_OFFSET_X = "find/barOffsetX"
 KEY_FIND_BAR_OFFSET_Y = "find/barOffsetY"
 
+# --- Mermaid 圖表 -----------------------------------------------------------
+# ```mermaid 區塊由 app/mermaid 自己解析、排版、用 QPainter 畫成圖片嵌入文件
+# （QTextDocument 跑不了 JavaScript，內嵌瀏覽器要多 150MB，都不採用）。
+# 支援 flowchart 與 sequence diagram 的子集；其餘類型維持顯示原始碼。
+#
+# 上限是為了把「一張圖」的解析與版面成本壓在百毫秒內：版面演算法是純 Python 的
+# 分層排版，節點數上去是超線性的。超過就退回顯示原始碼並標示，不硬畫。
+MERMAID_MAX_NODES = 300
+MERMAID_MAX_EDGES = 600
+MERMAID_MAX_MESSAGES = 400
+MERMAID_MAX_SOURCE_BYTES = 64 * 1024
+# 巢狀深度上限（subgraph 與序列圖的 loop/alt…）。版面與組場景是「一層一層」
+# 遞迴的，兩萬字節的來源就能疊出上千層、打穿直譯器的遞迴上限——那會變成
+# 當機對話框而不是「解析失敗」標示。60 層遠超任何真實圖表。
+MERMAID_MAX_DEPTH = 60
+# 已解析圖表的登錄表與畫好的圖片各留多少筆（LRU）。登錄表的鍵是原始碼雜湊，
+# 同一張圖在不同分頁、不同主題下共用同一筆。
+#
+# 登錄表放大方：被擠掉的鍵會讓「HTML 已快取、圖表卻查不到」的分頁永遠顯示
+# 破圖佔位（重新整理 F5 才會重新解析登錄）。一筆就是幾個 dataclass，4096 筆
+# 也只是幾 MB；要在一個行程裡塞爆它得看過四千多張「內容都不同」的圖。
+MERMAID_DIAGRAM_CACHE = 4096
+MERMAID_IMAGE_CACHE = 128
+
 # --- 分頁 -------------------------------------------------------------------
 TAB_HEIGHT = 34
 TAB_INSERT_MARKER_WIDTH = 3   # 合併時的插入位置指示線

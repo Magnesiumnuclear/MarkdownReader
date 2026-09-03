@@ -101,6 +101,12 @@ class DocumentTab:
         self.dirty = True
         if self.meta is not None and self.meta.size_bytes > config.LARGE_FILE_BYTES:
             self._html_cache.clear()
+            return
+        # 第二個例外：Mermaid 區塊解析失敗或類型不支援時插進頁首的那行標示，
+        # 文字是翻譯過的。qt_html 在那張表格加了 mermaid-note 這個 class 當記號，
+        # 只有真的含這種標示的文件才付重新轉換的成本。
+        if any("mermaid-note" in html for _text, html in self._html_cache.values()):
+            self._html_cache.clear()
 
     def build_html(self, theme: str) -> str:
         """產生（或取用快取的）HTML。
