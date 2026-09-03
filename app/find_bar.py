@@ -59,6 +59,12 @@ class FindBar(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("findBar")
+        # 【浮動之後才需要】純 QWidget 預設不套用 QSS 的 background-color 與
+        # border，要開 WA_StyledBackground 才會由樣式表繪製（設定面板早就踩過，
+        # 見 settings_panel 的同一行）。以前搜尋列排在版面裡、底下沒有東西，
+        # 背景沒畫出來也看不出來；改成浮在內文上之後，整塊面板是透明的——
+        # 內文直接透出來，輸入框看起來就跟頁面同色、像是印在文章上。
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._browser: QTextBrowser | None = None
         self._match_bg = QColor("#fff3c4")
         self._current_bg = QColor("#ffd33d")

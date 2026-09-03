@@ -756,6 +756,26 @@ def section_rendering(args) -> None:
           bar.isVisible() and sr - br == dx0 and by - sy == dy0,
           f"右緣差 {sr - br} 上緣差 {by - sy}")
 
+    # 【浮動面板一定要不透明】純 QWidget 預設不套用 QSS 的 background-color 與
+    # border，要開 WA_StyledBackground 才會畫（設定面板早就踩過同一個坑）。
+    # 排在版面裡時看不出來，浮到內文上就是整塊透明：文字直接透出來、輸入框
+    # 看起來跟頁面同色，像印在文章上。取樣面板左邊框與把手之間那條純背景。
+    width_before = viewer._content_width
+    viewer.set_content_width(0)          # 不限寬，文字才會鋪到面板底下
+    pump(500)
+    surface = styles.palette(viewer._theme)["surface"].lower()
+    shot = viewer.grab().toImage()
+    shot_dpr = shot.width() / viewer.width()   # grab 是實體像素，幾何是邏輯像素
+    g = bar.geometry()
+    strip = [shot.pixelColor(int((g.x() + 3 + 1) * shot_dpr),
+                             int((g.y() + y + 1) * shot_dpr)).name()
+             for y in range(12, g.height() - 12)]
+    check("搜尋列浮在內文上時不透明（面板背景與外框真的畫出來）",
+          bool(strip) and set(strip) == {surface},
+          f"面板色 {surface}，取樣到 {sorted(set(strip))[:4]}")
+    viewer.set_content_width(width_before)
+    pump(400)
+
     before = bar.geometry()
     drag_bar(QPoint(-300, 200))
     moved = bar.geometry()
