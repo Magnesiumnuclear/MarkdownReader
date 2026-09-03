@@ -12,6 +12,8 @@
 - 拖出列外（任一方向超過 TEAR_OFF_MARGIN）再放開 -> 發出 detachRequested，
   由視窗層決定是「拆成新視窗」還是「合併進游標下的另一個視窗」。
   分頁列自己不認識其他視窗，這個決定不屬於它。
+- 兩種情況都用同一個 InsertMarker 標出「會插在哪兩個之間」。列內重排時它
+  畫在被拖分頁自己的左緣——即時重排已經把它挪到目標槽位了，那條縫就是落點。
 
 【拖曳期間絕對不能重建按鈕】
 按下分頁會觸發 activate_tab -> set_tabs。舊版 set_tabs 一律砍掉重建，
@@ -36,7 +38,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from . import config, styles
+from . import config, icons, styles
 from .language import t
 from .title_bar import IconButton
 
@@ -150,6 +152,57 @@ class DragGhost(QWidget):
         margins 為 0，它的左上角恆等於幽靈的左上角（見類別說明）。
         """
         self.move(global_pos - self._grab_offset)
+
+
+class InsertMarker(QWidget):
+    """「分頁會插進這條縫」的指示：一條強調色的線，上下各扣一個三角帽。
+
+    為什麼要三角帽：分頁之間本來就有一條 1px 的分隔線，純粹加粗那條線在深色
+    主題下很難分辨是「新東西」還是分頁自己的邊框；上下兩端各張開一個比線寬
+    四倍的三角，形狀就不可能和任何既有的邊框混淆。
+
+    做成三個子元件而不是自己 paintEvent：專案規範是「圖示一律來自
+    assets/icons/*.svg」「外觀來自 styles.py 的集中 QSS」。線走 QSS，
+    三角帽走 icons.pixmap（同一份 SVG 換色即可跟著主題走）。
+
+    整塊是分頁條上的覆蓋層，不進版面——進版面的話每次移動都會把分頁擠開重排。
+    背景保持透明，所以容器本身刻意沒有樣式（只有線和帽子畫得出東西）。
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("tabInsertMarker")
+        # 覆蓋層絕不能吃到滑鼠事件：它就蓋在分頁的縫上，攔下來會讓那一條
+        # 細縫按不動（拖曳中滑鼠被按鈕抓著，但放開後這塊還在）
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        cap = config.TAB_INSERT_CAP_SIZE
+        self.setFixedSize(cap, config.TAB_HEIGHT)
+
+        line_width = config.TAB_INSERT_MARKER_WIDTH
+        self._line = QFrame(self)
+        self._line.setObjectName("tabInsertLine")
+        self._line.setGeometry(
+            (cap - line_width) // 2, 0, line_width, config.TAB_HEIGHT
+        )
+
+        self._top = QLabel(self)
+        self._top.setObjectName("tabInsertCap")
+        self._top.setGeometry(0, 0, cap, cap)
+        self._bottom = QLabel(self)
+        self._bottom.setObjectName("tabInsertCap")
+        self._bottom.setGeometry(0, config.TAB_HEIGHT - cap, cap, cap)
+        self.apply_theme(config.DEFAULT_THEME)
+
+    def line_x(self) -> int:
+        """線在本元件內的水平中心；定位時要對齊的是線，不是容器邊緣。"""
+        return self._line.x() + self._line.width() // 2
+
+    def apply_theme(self, theme: str) -> None:
+        """三角帽是點陣圖，換主題要重新上色（線走 QSS，會自己跟著換）。"""
+        colour = styles.palette(theme)["accent"]
+        cap = config.TAB_INSERT_CAP_SIZE
+        self._top.setPixmap(icons.pixmap("insert_cap_down", colour, cap))
+        self._bottom.setPixmap(icons.pixmap("insert_cap_up", colour, cap))
 
 
 class TabButton(QFrame):
@@ -363,11 +416,9 @@ class TabBar(QFrame):
         self._row.setSpacing(0)
         self._row.addStretch(1)
         self._scroll.setWidget(self._strip)
-        # 跨視窗合併時標示插入位置。放在分頁條上當覆蓋層（不進版面），
-        # 否則插入標記會把分頁擠開、每次移動都重新排版。
-        self._insert_marker = QFrame(self._strip)
-        self._insert_marker.setObjectName("tabInsertMarker")
-        self._insert_marker.setFixedWidth(config.TAB_INSERT_MARKER_WIDTH)
+        # 標示插入位置（列內重排與跨視窗合併共用）。放在分頁條上當覆蓋層
+        # （不進版面），否則插入標記會把分頁擠開、每次移動都重新排版。
+        self._insert_marker = InsertMarker(self._strip)
         self._insert_marker.hide()
 
         self.new_button = IconButton(
@@ -430,6 +481,7 @@ class TabBar(QFrame):
     def apply_theme(self, theme: str) -> None:
         self._theme = theme
         self.new_button.apply_theme(theme)
+        self._insert_marker.apply_theme(theme)
         for button in self._buttons:
             button.apply_theme(theme)
         # 拖曳進行中主題可能被系統切換（自動深色模式），幽靈也要跟上
@@ -474,6 +526,9 @@ class TabBar(QFrame):
         # 幽靈與徽章：離開本列（含容忍帶內）就顯示，回到列上才收——
         # 容忍帶內雖不能拆分，仍可能合併進相鄰視窗，也需要預告。
         if not on_bar:
+            # 離開本列就把自己的線收掉：接下來要標的是「目標視窗」那條，
+            # 由 drop_intent_probe 決定畫在誰身上（可能就是本列，也可能不是）。
+            self.hide_insert_marker()
             if self._ghost is None:
                 self._ghost = DragGhost(
                     button.grab(), self._theme, button.grab_offset()
@@ -520,6 +575,15 @@ class TabBar(QFrame):
         if target != current:
             self._move_button(current, target)
             self.tabMoved.emit(current, target)
+        # 即時重排已經把它挪到目標槽位，所以「會插在哪」就是它自己現在的位置。
+        # 畫在它的左緣；拖到最後一格時左緣仍在最後一個縫上，語意不變。
+        #
+        # 【只在游標真的落在本列上時才畫】容忍帶（列外 48px 內）也會走到這裡
+        # 繼續重排，但那時游標可能正停在**別的視窗**的分頁列上、上面那段
+        # 已經請 drop_intent_probe 在那邊畫了一條。不擋的話兩條線同時亮，
+        # 使用者無從知道放開會插到哪一個。
+        if on_bar:
+            self.show_insert_marker(self._buttons.index(button))
 
     def _move_button(self, frm: int, to: int) -> None:
         button = self._buttons.pop(frm)
@@ -595,7 +659,7 @@ class TabBar(QFrame):
 
     # -- 插入位置指示線 -------------------------------------------------------
     def show_insert_marker(self, index: int) -> None:
-        """在第 index 個分頁「之前」的縫隙畫一條線（index == 分頁數代表最後）。
+        """在第 index 個分頁「之前」的縫隙畫指示線（index == 分頁數代表最後）。
 
         位置用同一套 insert_index_at 算出來的索引，因此指示線與實際落點
         必然一致——預告不能說一套做一套。
@@ -607,10 +671,12 @@ class TabBar(QFrame):
             x = last.x() + last.width()
         else:
             x = self._buttons[index].x()
-        half = self._insert_marker.width() // 2
-        self._insert_marker.setGeometry(
-            max(0, x - half), 0, self._insert_marker.width(), config.TAB_HEIGHT
-        )
+        # 對齊的是**線**，不是容器左緣：容器比線寬（要放得下三角帽），
+        # 拿容器去對齊會讓線整個偏掉半個帽子的寬度。
+        # 最左邊那條縫的座標是 0，容器因此有一半落在分頁條外被裁掉——這是
+        # 刻意的：指示線的職責是說「插在哪」，寧可帽子少一半，也不要為了
+        # 完整顯示而把線挪進第一個分頁裡、指到錯的縫。
+        self._insert_marker.move(x - self._insert_marker.line_x(), 0)
         self._insert_marker.raise_()
         self._insert_marker.show()
 

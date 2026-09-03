@@ -210,6 +210,17 @@ QToolButton#tabClose, QToolButton#tabNew {
 }
 QToolButton#tabClose:hover, QToolButton#tabNew:hover { background-color: $pressed_bg; }
 
+/* 拖曳時標出分頁會插進哪個縫隙。這條規則一定要留在主視窗的 QSS 裡——
+   指示線是主視窗的子元件，寫進拖曳幽靈那份（它是獨立頂層視窗、自己套一份
+   樣式）等於完全沒有樣式，isVisible() 仍是 True 卻一個像素都不畫。 */
+#tabInsertMarker { background: transparent; border: none; }
+#tabInsertLine {
+    background-color: $accent;
+    border: none;
+    border-radius: 1px;
+}
+#tabInsertCap { background: transparent; border: none; }
+
 #tabScroll QScrollBar:horizontal {
     background: transparent;
     height: 6px;
@@ -523,11 +534,6 @@ QLabel#dragGhostBadge[intent="merge"] {
     color: $icon_on_accent;
     background-color: $accent;
     border: 1px solid $accent;
-}
-/* 跨視窗合併時，標出分頁會插進哪個縫隙 */
-QFrame#tabInsertMarker {
-    background-color: $accent;
-    border: none;
 }
 QLabel#dragGhostBadge[intent="detach"] {
     color: $accent;

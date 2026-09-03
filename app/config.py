@@ -185,7 +185,8 @@ MERMAID_SCENE_CACHE = 256
 
 # --- 分頁 -------------------------------------------------------------------
 TAB_HEIGHT = 34
-TAB_INSERT_MARKER_WIDTH = 3   # 合併時的插入位置指示線
+TAB_INSERT_MARKER_WIDTH = 3   # 插入位置指示線的線寬
+TAB_INSERT_CAP_SIZE = 13      # 線上下兩端的三角帽邊長；也決定指示線的整體寬度
 TAB_MAX_WIDTH = 190
 TAB_MIN_WIDTH = 92
 TAB_LABEL_WIDTH = 130            # 檔名可用寬度，超過就中間省略

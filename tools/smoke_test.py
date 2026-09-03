@@ -2088,6 +2088,7 @@ def section_tab_dnd(args) -> None:
         for _ in range(3):
             app.processEvents()
 
+    from app import styles as _styles
     from app.window_manager import WindowManager
 
     QSettings(config.ORG_NAME, config.APP_NAME).clear()
@@ -2146,6 +2147,73 @@ def section_tab_dnd(args) -> None:
           names(viewer)[1] == "d0.md", str(names(viewer)))
     check("手勢重排後資料與按鈕一致",
           [b._name for b in viewer.tab_bar._buttons] == names(viewer))
+    check("放開後列內的指示線收起", not viewer.tab_bar._insert_marker.isVisible())
+
+    # 列內排序途中也要看得到「會插在哪兩個之間」。即時重排已經把分頁挪到
+    # 目標槽位，所以線就畫在它自己的左緣——線的位置必須跟著它一起跑。
+    inbar = viewer.tab_bar
+    src2 = inbar._buttons[0]
+    start2 = src2.mapToGlobal(src2.rect().center())
+    app.sendEvent(src2, QMouseEvent(
+        QEvent.Type.MouseButtonPress, QPointF(src2.rect().center()),
+        QPointF(start2), Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier))
+    seen = []
+    target_x2 = inbar._buttons[2].mapToGlobal(
+        inbar._buttons[2].rect().center()).x()
+    for step_x in range(start2.x(), target_x2, 10):
+        app.sendEvent(src2, QMouseEvent(
+            QEvent.Type.MouseMove,
+            QPointF(src2.mapFromGlobal(QPoint(step_x, start2.y()))),
+            QPointF(step_x, start2.y()),
+            Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier))
+        if inbar._insert_marker.isVisible():
+            seen.append((
+                inbar._buttons.index(src2),
+                inbar._insert_marker.x() + inbar._insert_marker.line_x(),
+                src2.x(),
+            ))
+    check("列內拖曳排序途中會顯示指示線", bool(seen), str(seen[:3]))
+    check("指示線畫在被拖分頁的左緣（那就是它會插進去的縫）",
+          all(abs(line_x - btn_x) <= 1 for _slot, line_x, btn_x in seen),
+          str(seen[:3]))
+    check("跨過鄰居後指示線跟著換位置（不是釘在原地）",
+          len({slot for slot, _lx, _bx in seen}) > 1,
+          str(sorted({slot for slot, _lx, _bx in seen})))
+    app.sendEvent(src2, QMouseEvent(
+        QEvent.Type.MouseButtonRelease,
+        QPointF(src2.mapFromGlobal(QPoint(target_x2, start2.y()))),
+        QPointF(target_x2, start2.y()),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier))
+    pump(200)
+    check("列內排序放開後指示線收起", not inbar._insert_marker.isVisible())
+
+    # 容忍帶（列外 48px 內）仍會繼續重排，但線不能再畫在自己身上——
+    # 那時游標可能正停在別的視窗的分頁列上，兩條線同時亮就分不清會插到哪。
+    src3 = inbar._buttons[0]
+    start3 = src3.mapToGlobal(src3.rect().center())
+    app.sendEvent(src3, QMouseEvent(
+        QEvent.Type.MouseButtonPress, QPointF(src3.rect().center()),
+        QPointF(start3), Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier))
+    below = QPoint(start3.x() + 30, start3.y() + config.TAB_HEIGHT)
+    for point in (QPoint(start3.x() + 10, start3.y()), below):
+        app.sendEvent(src3, QMouseEvent(
+            QEvent.Type.MouseMove, QPointF(src3.mapFromGlobal(point)),
+            QPointF(point), Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier))
+    check("游標離開本列（仍在容忍帶內）時，自己的線收起",
+          not inbar._insert_marker.isVisible())
+    app.sendEvent(src3, QMouseEvent(
+        QEvent.Type.MouseButtonRelease, QPointF(src3.mapFromGlobal(below)),
+        QPointF(below), Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier))
+    pump(200)
+    viewer.move_tab(names(viewer).index("d0.md"), 0)
+    viewer.activate_tab(0)
+    pump(150)
     viewer.move_tab(names(viewer).index("d0.md"), 0)
     viewer.activate_tab(0)
     pump(150)
@@ -2190,9 +2258,67 @@ def section_tab_dnd(args) -> None:
     check("來源視窗不顯示插入指示線",
           not new_window.tab_bar._insert_marker.isVisible())
     first_button = viewer.tab_bar._buttons[0]
-    check("指示線畫在插入處（第一個分頁左緣）",
-          abs(marker.x() - max(0, first_button.x() - marker.width() // 2)) <= 1,
-          f"{marker.x()} vs {first_button.x()}")
+    check("指示線的線心對準那條縫（第一個分頁左緣）",
+          abs(marker.x() + marker.line_x() - first_button.x()) <= 1,
+          f"線心 {marker.x() + marker.line_x()} vs 縫 {first_button.x()}")
+    check("容器比線寬，才放得下三角帽",
+          marker.width() > config.TAB_INSERT_MARKER_WIDTH,
+          f"{marker.width()} vs {config.TAB_INSERT_MARKER_WIDTH}")
+
+    # 【這條抓的是「有樣式規則但畫不出來」】指示線曾經只寫在拖曳幽靈的那份
+    # QSS 裡（幽靈是獨立頂層視窗，自己套一份），主視窗的子元件吃不到，
+    # isVisible() 一路是 True 卻一個像素都沒畫。只看 isVisible 的檢查全綠。
+    # 量的是指示線那一欄「每一列有多寬」。這樣線、上帽、下帽三者可以各自被
+    # 單獨打破：少了線中間那列會歸零，少了帽子該端就縮成線寬。
+    # 只掃指示線自己的 x 範圍——作用中的分頁有一條 2px 的強調色上框，
+    # 掃整列的話上面那列永遠是滿的。
+    def marker_row_widths(window):
+        bar = window.tab_bar
+        block = bar._insert_marker
+        want = _styles.palette(bar._theme)["accent"].lower()
+        bar.show_insert_marker(1)
+        pump(150)
+        image = bar._strip.grab().toImage()
+        bar.hide_insert_marker()
+        # grab() 回傳裝置像素，換算回邏輯寬度才能跟線寬比
+        dpr = image.width() / max(1, bar._strip.width())
+        left = max(0, int(block.x() * dpr))
+        right = min(image.width(), int((block.x() + block.width()) * dpr))
+
+        def width_at(logical_y):
+            y = min(image.height() - 1, max(0, int(logical_y * dpr)))
+            hits = sum(
+                1
+                for x in range(left, right)
+                if image.pixelColor(x, y).name() == want
+            )
+            return hits / dpr
+
+        # 上帽避開分頁那條 2px 的上框（量 y=4），下帽量倒數第 3 列
+        return width_at(4), width_at(config.TAB_HEIGHT // 2), \
+            width_at(config.TAB_HEIGHT - 3)
+
+    line_width = config.TAB_INSERT_MARKER_WIDTH
+    top_w, mid_w, bottom_w = marker_row_widths(viewer)
+    check("線真的畫得出來（不是只有 isVisible 為真）",
+          abs(mid_w - line_width) <= 1,
+          f"中間那列寬 {mid_w:.1f}，線寬應為 {line_width}")
+    check("上面有三角帽（那一列比線寬）",
+          top_w > mid_w + 1, f"上 {top_w:.1f} vs 中 {mid_w:.1f}")
+    check("下面有三角帽（那一列比線寬）",
+          bottom_w > mid_w + 1, f"下 {bottom_w:.1f} vs 中 {mid_w:.1f}")
+    check("整塊沒有超出容器寬度",
+          max(top_w, mid_w, bottom_w) <= marker.width(),
+          f"{max(top_w, mid_w, bottom_w):.1f} vs {marker.width()}")
+    before_theme = viewer.tab_bar._theme
+    viewer.apply_theme("light" if before_theme == "dark" else "dark")
+    pump(200)
+    top2, mid2, bottom2 = marker_row_widths(viewer)
+    check("換主題後線和兩個三角帽都改用新主題的強調色",
+          abs(mid2 - line_width) <= 1 and top2 > mid2 + 1 and bottom2 > mid2 + 1,
+          f"上 {top2:.1f} 中 {mid2:.1f} 下 {bottom2:.1f}")
+    viewer.apply_theme(before_theme)
+    pump(200)
     new_window._drag_intent_at(QPoint(1500, 950), True)
     check("游標離開目標後指示線收起", not marker.isVisible())
     # 拖曳被取消（分頁列重建、Esc 等）也不能留下殘影
