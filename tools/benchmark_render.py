@@ -104,6 +104,7 @@ ABSOLUTE_BUDGET_MS = {
     "sethtml_readme": 300,
     "md_mermaid": 600,
     "render_mermaid": 900,
+    "render_mermaid_highlight": 900,
 }
 
 DEFAULT_TOLERANCE = 0.15
@@ -203,7 +204,8 @@ def build_documents() -> dict[str, str]:
 
 # --- 量測工具 ---------------------------------------------------------------
 MD_METRICS = ("md_headings", "md_prose", "md_code", "md_table", "md_mixed", "md_mermaid")
-QT_METRICS = ("sethtml_mixed", "sethtml_headings", "sethtml_readme", "render_mermaid")
+QT_METRICS = ("sethtml_mixed", "sethtml_headings", "sethtml_readme",
+              "render_mermaid", "render_mermaid_highlight")
 
 # 丟掉前幾次不列入統計。1 次不夠：轉換器要載入並串接八個擴充、pygments 要建
 # lexer、Qt 要建字型快取，第二次都還在受影響。
@@ -251,8 +253,8 @@ def run_probe(name: str, runs: int) -> int:
 
         text = docs[name[len("md_") :]]
         samples = timed(lambda: document.markdown_to_html(str(text), THEME), runs)
-    elif name == "render_mermaid":
-        samples = _probe_mermaid_render(docs, runs)
+    elif name.startswith("render_mermaid"):
+        samples = _probe_mermaid_render(docs, runs, name.endswith("highlight"))
     else:
         samples = _probe_qt(name, docs, runs)
 
@@ -309,7 +311,9 @@ def _probe_qt(name: str, docs: dict[str, str], runs: int) -> list[float]:
     return timed(action, runs)
 
 
-def _probe_mermaid_render(docs: dict[str, str], runs: int) -> list[float]:
+def _probe_mermaid_render(
+    docs: dict[str, str], runs: int, highlight: bool = False
+) -> list[float]:
     """量 Mermaid 圖表從「已解析的模型」到「畫好的 QImage」的成本（版面 + 繪製）。
 
     這段不在 setHtml 的探針裡：那邊用的是獨立的 QTextDocument，沒有閱讀區覆寫的
@@ -329,11 +333,15 @@ def _probe_mermaid_render(docs: dict[str, str], runs: int) -> list[float]:
     font = QFont()
     font.setPointSize(LAYOUT_FONT_PT)
 
+    # 帶搜尋詞的版本量的是「搜尋列把一張可見的圖重畫成帶高亮」的成本；
+    # 場景快取留著（實際情形也是留著的），所以量到的就是繪製本身。
+    mark = mermaid.Highlight("步驟", False, False, False) if highlight else None
+
     def action():
-        # 只清圖片快取，登錄表留著：量的是「畫」，不是「解析」
+        # 只清圖片快取，登錄表與場景留著：量的是「畫」，不是「解析」或「排版」
         mermaid._images.clear()
         for key in keys:
-            mermaid.render(key, THEME, LAYOUT_TEXT_WIDTH, font, 1.0)
+            mermaid.render(key, THEME, LAYOUT_TEXT_WIDTH, font, 1.0, mark)
 
     return timed(action, runs)
 

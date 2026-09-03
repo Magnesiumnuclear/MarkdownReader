@@ -48,8 +48,12 @@ class MarkdownBrowser(QTextBrowser):
         """記下內文欄寬。一定要在 setHtml 之前設好——圖片資源是排版時載入的。"""
         self._column_width = max(0, int(width))
 
-    def _column_width_or_fallback(self) -> int:
-        """內文欄寬；viewer 還沒餵入時退回 viewport 減去邊距（和圖片縮放同一個算法）。"""
+    def column_width(self) -> int:
+        """內文欄寬；viewer 還沒餵入時退回 viewport 減去邊距（和圖片縮放同一個算法）。
+
+        搜尋列重畫圖表高亮時也要用同一個寬度，不然推回去的圖尺寸會和原本的
+        對不上、害文件重排——所以這是公開的，兩邊共用同一份算法。
+        """
         if self._column_width > 0:
             return self._column_width
         available = self.viewport().width()
@@ -87,7 +91,7 @@ class MarkdownBrowser(QTextBrowser):
                 image = mermaid.render(
                     url.path(),
                     self._theme,
-                    self._column_width_or_fallback(),
+                    self.column_width(),
                     self.document().defaultFont(),
                     self.devicePixelRatioF() or 1.0,
                 )

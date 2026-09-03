@@ -35,8 +35,9 @@ from PyQt6.QtGui import (
 )
 
 from .. import styles
-from . import model
+from . import model, search
 from .model import (
+    Highlight,
     Ellipse,
     Path,
     Point,
@@ -64,6 +65,8 @@ _ROLE_KEY: dict[str, str | None] = {
     "note_fill": "code_inline_bg",
     "note_stroke": "border",
     "header_fill": "code_bg",
+    "find_match": "find_match_bg",
+    "find_current": "find_current_bg",
     "accent": "accent",
     "none": None,
 }
@@ -207,11 +210,13 @@ class _ScenePainter:
     """把原語畫到已設好縮放的 QPainter 上；角色到顏色、畫筆的對應集中在這裡。"""
 
     def __init__(
-        self, painter: QPainter, colors: dict[str, str], measurer: QtMeasurer
+        self, painter: QPainter, colors: dict[str, str], measurer: QtMeasurer,
+        highlight: "Highlight | None" = None,
     ) -> None:
         self._p = painter
         self._colors = colors
         self._measurer = measurer
+        self._highlight = highlight
 
     def _color(self, role: Role) -> QColor:
         key = _ROLE_KEY[role]
@@ -327,12 +332,38 @@ class _ScenePainter:
         self._p.setPen(QPen(self._color(item.role)))
         for i, line in enumerate(lines):
             x = item.x - _ALIGN_FACTOR[item.align] * fm.horizontalAdvance(line)
+            self._highlight_line(line, x, top + i * line_h, line_h, fm)
             # 以 ascent 定基線：畫出來的框才和 measure() 回報的 height() 疊合
             self._p.drawText(QPointF(x, top + i * line_h + fm.ascent()), line)
 
+    def _highlight_line(self, line, x, top, line_h, fm) -> None:
+        """搜尋命中的字後面補一塊底色，再讓上面那行把字畫上去。
+
+        量寬度用的是 metrics_for() 拿到的同一組 QFontMetricsF，和 drawText
+        用的字型完全相同（見模組說明），所以偏移不會和實際畫出來的字錯開。
+        fillRect 不動畫筆，畫完直接接著 drawText，不必 save/restore。
+        """
+        if self._highlight is None:
+            return
+        spans = search.matches_in(
+            line, self._highlight.needle,
+            self._highlight.case_sensitive, self._highlight.whole_words,
+        )
+        if not spans:
+            return
+        role = "find_current" if self._highlight.current else "find_match"
+        color = self._color(role)
+        for start, end in spans:
+            left = x + fm.horizontalAdvance(line[:start])
+            self._p.fillRect(
+                QRectF(left, top, fm.horizontalAdvance(line[start:end]), line_h),
+                color,
+            )
+
 
 def render_scene(
-    scene: Scene, theme: str, font: QFont, dpr: float, scale: float = 1.0
+    scene: Scene, theme: str, font: QFont, dpr: float, scale: float = 1.0,
+    highlight: "Highlight | None" = None,
 ) -> QImage:
     """把 Scene 畫成 QImage。
 
@@ -352,7 +383,9 @@ def render_scene(
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
     painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-    drawer = _ScenePainter(painter, styles.palette(theme), QtMeasurer(font))
+    drawer = _ScenePainter(
+        painter, styles.palette(theme), QtMeasurer(font), highlight
+    )
     for item in scene.items:
         drawer.draw(item)
     painter.end()

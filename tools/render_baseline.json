@@ -78,10 +78,17 @@
       "runs": 5
     },
     "render_mermaid": {
-      "median": 123.0,
-      "min": 122.9,
-      "max": 123.7,
-      "stdev": 0.4,
+      "median": 109.0,
+      "min": 107.1,
+      "max": 109.3,
+      "stdev": 0.9,
+      "runs": 5
+    },
+    "render_mermaid_highlight": {
+      "median": 118.0,
+      "min": 117.1,
+      "max": 118.6,
+      "stdev": 0.6,
       "runs": 5
     }
   }

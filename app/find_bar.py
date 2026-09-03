@@ -11,6 +11,18 @@ Enter 找下一個、Shift+Enter 找上一個、Esc 關閉，並以背景色高�
    （原本那筆變回一般色、新的那筆變成強調色），所以整份 selection 留著重用、
    只換那兩筆；另外以 MAX_HIGHLIGHTS 限制同時交出去的筆數。
 
+【Mermaid 圖表裡的字也搜得到】
+圖表是畫成圖片嵌進文件的，圖裡的文字在 QTextDocument 裡完全不存在（一張圖就是
+一個 U+FFFC 字元），document.find 看不到它。所以另外走一條：拿圖的場景文字比對，
+命中就把「圖片那個字元的位置」當成一筆相符，高亮則是帶著搜尋詞把圖重畫一張、
+推回文件（見 _sync_diagram_highlights）。外面不能用 ExtraSelection 上色——圖片背景
+是透明的，那會把整張圖刷成一片黃。
+
+【只重畫螢幕上看得到的圖】
+重畫一張圖要 3.2ms，全部命中的圖都重畫（實測 40 張要 145ms）會卡在 UI 執行緒上、
+比防抖還久。所以只同步可見範圍內的那幾張，其餘維持乾淨的圖，等捲過去再補。
+_pushed 記著每張圖目前推進去的是什麼狀態，沒變就完全不做事。
+
 【比對選項：區分大小寫（Alt+C）與全字（Alt+W）】
 兩者都直接映射到 QTextDocument 的 FindFlag，比對邏輯本身一行都不必自己寫。
 選項存進 QSettings、由 viewer 落盤（比照設定面板：元件送訊號、viewer 寫設定）。
@@ -28,12 +40,15 @@ reposition() 餵入允許範圍（內文區的矩形）。
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QEvent, QObject, QPoint, QRect, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import (
+    QEvent, QObject, QPoint, QRect, Qt, QTimer, QUrl, pyqtSignal,
+)
 from PyQt6.QtGui import QColor, QKeySequence, QShortcut, QTextCursor, QTextDocument
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QTextBrowser, QTextEdit, QWidget
 
-from . import config, icons, styles
+from . import config, icons, mermaid, styles
 from .language import t
+from .mermaid import search as mermaid_search
 from .title_bar import IconButton
 
 
@@ -55,6 +70,9 @@ class FindBar(QWidget):
     MAX_HIGHLIGHTS = 2000
     # 浮動面板的目標寬度；視窗更窄時縮到允許範圍內
     FLOAT_WIDTH = 520
+    # 捲動停手多久（毫秒）之後才補畫新進畫面的圖表高亮。和輸入防抖同量級：
+    # 每個捲動事件都重畫的話，一次滑過十張圖就是十次重畫。
+    SCROLL_DEBOUNCE_MS = 120
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -66,11 +84,19 @@ class FindBar(QWidget):
         # 內文直接透出來，輸入框看起來就跟頁面同色、像是印在文章上。
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._browser: QTextBrowser | None = None
+        # 重畫圖表高亮要知道主題（畫家依主題查色票）。閱讀區也記了一份，
+        # 但這裡要能在 apply_theme 之前就有值，所以自己留一個保底。
+        self._theme = config.DEFAULT_THEME
         self._match_bg = QColor("#fff3c4")
         self._current_bg = QColor("#ffd33d")
         self._text_color = QColor("#1f2328")
         self._matches: list[int] = []
         self._current_index = -1
+        # 圖表相符：文件位置 -> mermaid 鍵。這些位置也在 _matches 裡（一張圖算一筆），
+        # 但高亮畫在圖片內部，不能走 ExtraSelection（見模組說明）。
+        self._diagram_matches: dict[int, str] = {}
+        # 鍵 -> 上次推進文件的高亮狀態（None = 乾淨的圖）。沒變就不重畫。
+        self._pushed: dict[str, "mermaid.Highlight | None"] = {}
         self._case_sensitive = config.DEFAULT_FIND_CASE_SENSITIVE
         self._whole_words = config.DEFAULT_FIND_WHOLE_WORDS
         # 高亮快取：_selections 對應 _matches[_window[0]:_window[1]]，
@@ -144,6 +170,11 @@ class FindBar(QWidget):
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(self.DEBOUNCE_MS)
         self._debounce.timeout.connect(self._recompute)
+
+        self._scroll_debounce = QTimer(self)
+        self._scroll_debounce.setSingleShot(True)
+        self._scroll_debounce.setInterval(self.SCROLL_DEBOUNCE_MS)
+        self._scroll_debounce.timeout.connect(self._sync_diagram_highlights)
 
         self.input.textChanged.connect(self._on_text_changed)
         self.case_button.toggled.connect(self._on_option_toggled)
@@ -274,11 +305,30 @@ class FindBar(QWidget):
         super().mouseReleaseEvent(event)
 
     def attach(self, browser: QTextBrowser) -> None:
+        # 捲動時要補畫新進畫面的圖表高亮，所以要盯著捲軸。接在這裡而不是 viewer：
+        # 換分頁的四個入口都會經過 attach，接一次就全涵蓋。斷開用 try/except
+        # 是既有慣例（同 viewer.take_tab 拆訊號的那段）。
+        if self._browser is not None and self._browser is not browser:
+            try:
+                self._browser.verticalScrollBar().valueChanged.disconnect(
+                    self._on_scrolled
+                )
+            except TypeError:
+                pass
         self._browser = browser
-        # 換了文件，快取裡那些 QTextCursor 全都綁在舊文件上，不能再用
+        browser.verticalScrollBar().valueChanged.connect(self._on_scrolled)
+        # 換了文件，快取裡那些 QTextCursor 全都綁在舊文件上，不能再用；
+        # 推進舊文件的圖也跟著作廢
+        self._pushed.clear()
+        self._diagram_matches = {}
         self._invalidate_highlights()
 
+    def _on_scrolled(self, _value: int) -> None:
+        if self.isVisible() and self._diagram_matches:
+            self._scroll_debounce.start()
+
     def apply_theme(self, theme: str) -> None:
+        self._theme = theme
         colors = styles.palette(theme)
         self._match_bg = QColor(colors["find_match_bg"])
         self._current_bg = QColor(colors["find_current_bg"])
@@ -337,10 +387,14 @@ class FindBar(QWidget):
 
     def deactivate(self) -> None:
         self._debounce.stop()
+        self._scroll_debounce.stop()
         self.hide()
         self._clear_highlights()
         self._matches = []
         self._current_index = -1
+        # 收工前把推進去的高亮圖換回乾淨的，不然關掉搜尋圖上還留著黃色
+        self._diagram_matches = {}
+        self._restore_diagrams()
         if self._browser is not None:
             cursor = self._browser.textCursor()
             cursor.clearSelection()
@@ -408,10 +462,12 @@ class FindBar(QWidget):
         self._debounce.stop()
         self._matches = []
         self._current_index = -1
+        self._diagram_matches = {}
         self._invalidate_highlights()
         needle = self.input.text()
         if self._browser is None or not needle:
             self._clear_highlights()
+            self._restore_diagrams()
             self.status.setText("")
             return
 
@@ -424,8 +480,24 @@ class FindBar(QWidget):
                 break
             self._matches.append(cursor.selectionStart())
 
+        # 圖表裡的字 document.find 看不到，另外比一次（見模組說明）
+        for position, key in self._diagram_images():
+            scene = mermaid.scene_for(key, document.defaultFont())
+            if scene is None:
+                continue
+            if mermaid_search.has_match(
+                mermaid_search.scene_text(scene), needle,
+                self._case_sensitive, self._whole_words,
+            ):
+                self._diagram_matches[position] = key
+                self._matches.append(position)
+        if self._diagram_matches:
+            # 上一筆／下一筆要照文件先後走，插進來的圖表位置得排回去
+            self._matches.sort()
+
         if not self._matches:
             self._clear_highlights()
+            self._restore_diagrams()
             self.status.setText(t("find.noMatch"))
             return
 
@@ -452,11 +524,15 @@ class FindBar(QWidget):
     def _goto_current(self) -> None:
         if self._browser is None or not self._matches:
             return
-        needle_length = len(self.input.text())
         start = self._matches[self._current_index]
         cursor = QTextCursor(self._browser.document())
         cursor.setPosition(start)
-        cursor.setPosition(start + needle_length, QTextCursor.MoveMode.KeepAnchor)
+        if start not in self._diagram_matches:
+            # 圖表那一筆刻意不選取：選到圖片字元會被 Qt 塗成一整片，
+            # 高亮是畫在圖片裡面的
+            cursor.setPosition(
+                start + len(self.input.text()), QTextCursor.MoveMode.KeepAnchor
+            )
         self._browser.setTextCursor(cursor)
         self._browser.ensureCursorVisible()
         self._reveal_current()
@@ -468,6 +544,7 @@ class FindBar(QWidget):
             key, current=self._current_index + 1, total=total, cap=self.MAX_HIGHLIGHTS
         ))
         self._sync_highlights()
+        self._sync_diagram_highlights()
 
     def _reveal_current(self) -> None:
         """目前這一筆若剛好被浮動面板壓住，往外多捲一點讓它露出來。
@@ -524,6 +601,10 @@ class FindBar(QWidget):
             start + len(self.input.text()), QTextCursor.MoveMode.KeepAnchor
         )
         selection.cursor = cursor
+        if start in self._diagram_matches:
+            # 圖表：高亮畫在圖片內部，外面一上色就會蓋住整張圖。這一筆仍要留在
+            # 清單裡不能抽掉——_sync_highlights 是用 index - low 索引的。
+            return selection
         selection.format.setBackground(self._current_bg if current else self._match_bg)
         selection.format.setForeground(self._text_color)
         return selection
@@ -561,6 +642,110 @@ class FindBar(QWidget):
         self._invalidate_highlights()
         if self._browser is not None:
             self._browser.setExtraSelections([])
+
+
+    # -- 圖表高亮 ------------------------------------------------------------
+    def _diagram_images(self) -> list[tuple[int, str]]:
+        """文件裡每張 Mermaid 圖的 (字元位置, 鍵)。
+
+        直接掃文件片段，不另外快取：實測 40 張圖只要 0.05ms，維護一份會過期的
+        對照表反而是負債（重新渲染、分段補上都會讓它失效）。
+        """
+        if self._browser is None:
+            return []
+        found: list[tuple[int, str]] = []
+        prefix = mermaid.SCHEME + ":"
+        block = self._browser.document().begin()
+        while block.isValid():
+            iterator = block.begin()
+            while not iterator.atEnd():
+                fragment = iterator.fragment()
+                fmt = fragment.charFormat()
+                if fmt.isImageFormat():
+                    name = fmt.toImageFormat().name()
+                    if name.startswith(prefix):
+                        found.append((fragment.position(), name[len(prefix):]))
+                iterator += 1
+            block = block.next()
+        return found
+
+    def _visible_span(self) -> tuple[float, float]:
+        """目前畫面在文件座標裡的上下界。"""
+        bar = self._browser.verticalScrollBar()
+        top = float(bar.value())
+        return top, top + self._browser.viewport().height()
+
+    def _sync_diagram_highlights(self) -> None:
+        """把可見範圍內的圖換成帶高亮的版本，其餘維持乾淨的圖。
+
+        【為什麼只做可見的】重畫一張要 3.2ms，命中的全部重畫（實測 40 張 145ms）
+        會卡住介面。可見的通常只有一兩張，代價落在 3-7ms。捲過去的那些由
+        _on_scrolled 的防抖補上。
+
+        推同尺寸的圖不會讓文件重排（實測高度與 revision 都不變），所以這裡只是
+        換一張圖片並要求重畫那一個字元，成本就是繪製本身。
+        """
+        if self._browser is None or not self.isVisible():
+            return
+        self._scroll_debounce.stop()
+        images = self._diagram_images()
+        if not images and not self._pushed:
+            return
+        document = self._browser.document()
+        top, bottom = self._visible_span()
+        layout = document.documentLayout()
+        current_pos = (
+            self._matches[self._current_index]
+            if 0 <= self._current_index < len(self._matches) else -1
+        )
+        needle = self.input.text()
+        alive: set[str] = set()
+        for position, key in images:
+            alive.add(key)
+            want: "mermaid.Highlight | None" = None
+            if position in self._diagram_matches and needle:
+                rect = layout.blockBoundingRect(document.findBlock(position))
+                if rect.bottom() >= top and rect.top() <= bottom:
+                    want = mermaid.Highlight(
+                        needle, self._case_sensitive, self._whole_words,
+                        position == current_pos,
+                    )
+            self._push_diagram(position, key, want)
+        # 已經不在文件裡的鍵（換過文件）不必還原，直接忘掉
+        for key in [k for k in self._pushed if k not in alive]:
+            self._pushed.pop(key, None)
+
+    def _restore_diagrams(self) -> None:
+        """把所有推過高亮的圖換回乾淨的版本。"""
+        if self._browser is None or not self._pushed:
+            self._pushed.clear()
+            return
+        for position, key in self._diagram_images():
+            if key in self._pushed:
+                self._push_diagram(position, key, None)
+        self._pushed.clear()
+
+    def _push_diagram(
+        self, position: int, key: str, want: "mermaid.Highlight | None"
+    ) -> None:
+        """需要時把圖重畫一張推回文件。狀態沒變就什麼都不做——這是效能護欄。"""
+        if self._pushed.get(key, None) == want:
+            return
+        document = self._browser.document()
+        image = mermaid.render(
+            key, self._theme, self._browser.column_width(),
+            document.defaultFont(), self._browser.devicePixelRatioF() or 1.0,
+            want,
+        )
+        if image is None:
+            return
+        document.addResource(
+            QTextDocument.ResourceType.ImageResource,
+            QUrl(f"{mermaid.SCHEME}:{key}"),
+            image,
+        )
+        document.markContentsDirty(position, 1)
+        self._pushed[key] = want
 
     # -- 鍵盤 ----------------------------------------------------------------
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802

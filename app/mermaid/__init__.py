@@ -36,7 +36,9 @@ from .model import (
     ERR_TOO_LARGE,
     Diagram,
     Flowchart,
+    Highlight,
     MermaidError,
+    Scene,
     SequenceDiagram,
     UnsupportedDiagram,
 )
@@ -45,8 +47,8 @@ if TYPE_CHECKING:  # pragma: no cover
     from PyQt6.QtGui import QFont, QImage
 
 __all__ = [
-    "SCHEME", "MermaidError", "UnsupportedDiagram",
-    "parse", "register", "diagram", "render", "clear_caches",
+    "SCHEME", "MermaidError", "UnsupportedDiagram", "Highlight",
+    "parse", "register", "diagram", "render", "scene_for", "clear_caches",
 ]
 
 # 文件裡 <img src="mermaid:鍵"> 用的協定，browser.loadResource 靠它辨識
@@ -59,6 +61,10 @@ _DIRECTIVE = re.compile(r"^%%\{.*\}%%\s*$")
 # 鍵 -> 已解析的圖表；鍵 -> 畫好的圖片（見模組說明）
 _diagrams: "OrderedDict[str, Diagram]" = OrderedDict()
 _images: "OrderedDict[tuple, QImage]" = OrderedDict()
+# (鍵, 字級) -> 排好版的場景。場景不含顏色也不含縮放，所以換主題、換欄寬、
+# 加搜尋高亮都能重用——帶著搜尋詞重畫時只要再付繪製，不必重算版面。
+# 搜尋列也靠它拿圖裡的文字來比對（見 search.scene_text）。
+_scenes: "OrderedDict[tuple[str, int], Scene]" = OrderedDict()
 
 
 # --- 解析 -------------------------------------------------------------------
@@ -144,20 +150,19 @@ def diagram(key: str) -> Diagram | None:
 
 
 def clear_caches() -> None:
-    """測試用：清空登錄表與圖片快取。"""
+    """測試用：清空登錄表與各層快取。"""
     _diagrams.clear()
     _images.clear()
+    _scenes.clear()
 
 
 # --- 畫 ---------------------------------------------------------------------
-def render(
-    key: str, theme: str, column_width: float, font: "QFont", dpr: float
-) -> "QImage | None":
-    """把鍵對應的圖表畫成 QImage；查無此鍵回傳 None。
+def scene_for(key: str, font: "QFont") -> "Scene | None":
+    """取（或建立）這張圖排好版的場景；查無此鍵回傳 None。
 
-    自然寬度超過內文欄寬時等比縮小（只縮不放），縮放直接乘進畫家的座標變換，
-    不是畫大再縮圖——這樣線條與文字在縮小後仍是向量品質。
-    快取鍵含主題、欄寬、字級與 DPR：任何一個變了都是另一張圖。
+    場景只取決於圖表本身與字級——顏色是畫的時候才依角色查色票，縮放是乘進
+    畫筆變換的，都不在場景裡。所以換主題、換欄寬、加搜尋高亮都能重用同一份，
+    重畫時只要再付繪製那一段。搜尋列也用它拿圖裡的文字來比對。
     """
     parsed = diagram(key)
     if parsed is None:
@@ -165,21 +170,54 @@ def render(
     from .paint import QtMeasurer, pixel_font
 
     base_font = pixel_font(font)
+    cache_key = (key, base_font.pixelSize())
+    cached = _scenes.get(cache_key)
+    if cached is not None:
+        _scenes.move_to_end(cache_key)
+        return cached
+    scene = _scene_for(parsed, QtMeasurer(base_font))
+    _scenes[cache_key] = scene
+    while len(_scenes) > config.MERMAID_SCENE_CACHE:
+        _scenes.popitem(last=False)
+    return scene
+
+
+def render(
+    key: str, theme: str, column_width: float, font: "QFont", dpr: float,
+    highlight: Highlight | None = None,
+) -> "QImage | None":
+    """把鍵對應的圖表畫成 QImage；查無此鍵回傳 None。
+
+    自然寬度超過內文欄寬時等比縮小（只縮不放），縮放直接乘進畫家的座標變換，
+    不是畫大再縮圖——這樣線條與文字在縮小後仍是向量品質。
+    快取鍵含主題、欄寬、字級與 DPR：任何一個變了都是另一張圖。
+
+    highlight 是搜尋列要標出來的詞（None 代表乾淨的圖）。它也進快取鍵——
+    但 highlight 為 None 時整個鍵與行為和從前一字不差，原本那些「同樣參數
+    第二次直接命中同一個物件」的呼叫端不受影響。
+    """
+    parsed = diagram(key)
+    if parsed is None:
+        return None
+    from .paint import pixel_font
+
+    base_font = pixel_font(font)
     cache_key = (key, theme, int(round(column_width)), base_font.pixelSize(), float(dpr))
+    if highlight is not None:
+        cache_key += tuple(highlight)
     cached = _images.get(cache_key)
     if cached is not None:
         _images.move_to_end(cache_key)
         return cached
 
-    measurer = QtMeasurer(base_font)
-    scene = _scene_for(parsed, measurer)
+    scene = scene_for(key, base_font)
     scale = 1.0
     if column_width > 0 and scene.width > column_width:
         scale = column_width / scene.width
 
     from .paint import render_scene
 
-    image = render_scene(scene, theme, base_font, dpr, scale)
+    image = render_scene(scene, theme, base_font, dpr, scale, highlight)
     _images[cache_key] = image
     while len(_images) > config.MERMAID_IMAGE_CACHE:
         _images.popitem(last=False)

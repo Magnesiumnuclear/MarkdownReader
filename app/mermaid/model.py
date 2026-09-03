@@ -20,7 +20,7 @@ Scene 是刻意多加的一層：畫家只認得矩形、線、文字這幾種�
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, Protocol, Union
+from typing import Literal, NamedTuple, Protocol, Union
 
 
 # --- 錯誤 -------------------------------------------------------------------
@@ -266,6 +266,7 @@ Role = Literal[
     "frame", "frame_fill",        # 子圖外框、序列圖的 loop/alt 框
     "note_fill", "note_stroke",   # 序列圖便條
     "header_fill",                # 序列圖參與者方框
+    "find_match", "find_current", # 搜尋高亮：一般相符／目前所在那一筆
     "accent",
     "none",                       # 不填／不描
 ]
@@ -332,6 +333,20 @@ class Scene:
     width: float
     height: float
     items: list[Primitive] = field(default_factory=list)
+
+
+class Highlight(NamedTuple):
+    """要在圖裡標出來的搜尋詞。
+
+    放在契約層而不是 facade：畫家與外部介面都要用到它，畫家再反過來匯入
+    facade 就成了循環匯入。current 代表「這張圖就是使用者目前所在的那一筆」，
+    用強調色畫，其餘用一般的相符色——和內文的高亮同一套語彙。
+    """
+
+    needle: str
+    case_sensitive: bool = False
+    whole_words: bool = False
+    current: bool = False
 
 
 class TextMeasurer(Protocol):

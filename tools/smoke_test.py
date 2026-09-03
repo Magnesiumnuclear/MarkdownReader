@@ -2770,7 +2770,7 @@ def section_tab_dnd(args) -> None:
 # ===========================================================================
 def section_mermaid(args) -> None:
     from PyQt6.QtCore import QEventLoop, QSettings, Qt, QTimer, QUrl
-    from PyQt6.QtGui import QFont, QTextDocument
+    from PyQt6.QtGui import QFont, QTextCursor, QTextDocument
     from PyQt6.QtWidgets import QApplication
 
     app = QApplication.instance() or QApplication([])
@@ -3255,7 +3255,7 @@ def section_mermaid(args) -> None:
     check("前置：mermaid 圖片算 scalable（視窗縮放要觸發重繪）",
           viewer._tab.has_scalable_images)
     narrow_img = viewer.browser.document().resource(image_type, QUrl(f"mermaid:{keys[0]}"))
-    column = viewer.browser._column_width_or_fallback()
+    column = viewer.browser.column_width()
     narrow_w = (narrow_img.width() / (narrow_img.devicePixelRatio() or 1.0)
                 if narrow_img is not None else -1)
     check("整合：視窗變窄後文件排版用的那張圖重新貼合欄寬",
@@ -3275,6 +3275,200 @@ def section_mermaid(args) -> None:
     viewer.close()
     pump(300)
     QSettings(config.ORG_NAME, config.APP_NAME).clear()
+
+    # --- 搜尋找得到圖表裡的字（只重畫螢幕看得到的）---------------------------
+    from app import styles as _styles
+    from app.mermaid import search as _msearch
+
+    # 比對語意必須和內文完全同源，否則會出現「同一個字內文找得到、圖表找不到」
+    semantic_bad = []
+    for probe_text, probe_needle in (
+        ("The the THE theme", "the"), ("cat category concat cat.", "cat"),
+        ("搜尋 搜尋列 全文搜尋 搜", "搜尋"), ("a_b b_c b", "b"),
+        ("讀取設定\n資料庫\n快取命中?", "資料"), ("my_var var variable", "var"),
+    ):
+        for cs in (False, True):
+            for ww in (False, True):
+                probe_doc = QTextDocument()
+                probe_doc.setPlainText(probe_text)
+                probe_flags = QTextDocument.FindFlag(0)
+                if cs:
+                    probe_flags |= QTextDocument.FindFlag.FindCaseSensitively
+                if ww:
+                    probe_flags |= QTextDocument.FindFlag.FindWholeWords
+                probe_cursor = QTextCursor(probe_doc)
+                want = 0
+                while True:
+                    probe_cursor = probe_doc.find(probe_needle, probe_cursor, probe_flags)
+                    if probe_cursor.isNull():
+                        break
+                    want += 1
+                got = _msearch.matches_in(probe_text, probe_needle, cs, ww)
+                if len(got) != want or any(
+                    probe_text[s:e].casefold() != probe_needle.casefold() for s, e in got
+                ):
+                    semantic_bad.append((probe_text, probe_needle, cs, ww, want, got))
+    check("圖表比對的語意與位置和內文同源（含大小寫、全字、底線、CJK）",
+          not semantic_bad, str(semantic_bad[:2]))
+
+    # 圖層：帶不帶搜尋詞畫出來的差別
+    hl_src = "graph TD\n  A[讀取設定] --> B[(資料庫)]"
+    hl_key = mermaid.register(mermaid.parse(hl_src), hl_src)
+    plain_img = mermaid.render(hl_key, "light", 900, font, 1.0)
+    match_img = mermaid.render(hl_key, "light", 900, font, 1.0,
+                               mermaid.Highlight("資料庫", False, False, False))
+    cur_img = mermaid.render(hl_key, "light", 900, font, 1.0,
+                             mermaid.Highlight("資料庫", False, False, True))
+
+    def count_colour(img, palette_key):
+        want_name = _styles.palette("light")[palette_key].lower()
+        return sum(1 for y in range(img.height()) for x in range(img.width())
+                   if img.pixelColor(x, y).name() == want_name)
+
+    check("高亮真的畫在圖片裡（不帶搜尋詞時一個都沒有）",
+          count_colour(match_img, "find_match_bg") > 0
+          and count_colour(plain_img, "find_match_bg") == 0,
+          f"帶 {count_colour(match_img, 'find_match_bg')} / "
+          f"不帶 {count_colour(plain_img, 'find_match_bg')}")
+    check("目前所在那一筆用強調色，和一般相符不同",
+          count_colour(cur_img, "find_current_bg") > 0 and cur_img != match_img)
+    check("加了高亮的圖尺寸不變（推回文件不會害重排）",
+          match_img.size() == plain_img.size() == cur_img.size(),
+          f"{match_img.size()} {plain_img.size()}")
+    check("場景快取回傳同一個物件（重畫高亮不必重算版面）",
+          mermaid.scene_for(hl_key, font) is mermaid.scene_for(hl_key, font))
+
+    # 整合：20 張圖的文件，只有一兩張看得到
+    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    many = os.path.join(tmp, "diagram_search.md")
+    with open(many, "w", encoding="utf-8") as handle:
+        for i in range(20):
+            handle.write(f"## 第 {i} 節\n\n第 {i} 段內文，也有資料庫。\n\n")
+            handle.write("```mermaid\ngraph TD\n"
+                         + "\n".join(f"  N{k}[步驟 {i}-{k} 資料庫] --> N{k+1}"
+                                     for k in range(8))
+                         + "\n```\n\n")
+    dsv = MarkdownViewer(many)
+    dsv.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+    dsv.resize(1000, 760)
+    dsv.show()
+    pump(800)
+    dsv.flush_pending_chunks()
+    pump(300)
+    dbar = dsv.find_bar
+
+    # 數 render 的呼叫次數：這是「只重畫可見的」唯一問得到的問題
+    render_calls = []
+    real_render = mermaid.render
+
+    def counting_render(key, theme, column_width, render_font, dpr, highlight=None):
+        render_calls.append(key)
+        return real_render(key, theme, column_width, render_font, dpr, highlight)
+
+    mermaid.render = counting_render
+    try:
+        dsv.show_find()
+        pump(300)
+        dbar.input.setText("")
+        app.processEvents()
+        render_calls.clear()
+        dbar.input.setText("資料庫")
+        pump(dbar.DEBOUNCE_MS + 400)
+
+        def visible_diagrams():
+            doc = dsv.browser.document()
+            layout = doc.documentLayout()
+            span_top = dsv.browser.verticalScrollBar().value()
+            span_bottom = span_top + dsv.browser.viewport().height()
+            return [
+                (pos, k) for pos, k in dbar._diagram_images()
+                if layout.blockBoundingRect(doc.findBlock(pos)).bottom() >= span_top
+                and layout.blockBoundingRect(doc.findBlock(pos)).top() <= span_bottom
+            ]
+
+        all_images = dbar._diagram_images()
+        seen = visible_diagrams()
+        check("搜尋找得到圖表裡的字（每張圖各算一筆相符）",
+              len(dbar._diagram_matches) == len(all_images) == 20,
+              f"相符 {len(dbar._diagram_matches)} 圖 {len(all_images)}")
+        check("圖表那幾筆併進 _matches，且仍照文件先後排序",
+              all(p in dbar._matches for p in dbar._diagram_matches)
+              and dbar._matches == sorted(dbar._matches)
+              and len(dbar._matches) > 20,
+              f"{len(dbar._matches)} 筆")
+        check("狀態列的總數含圖表那幾筆",
+              dbar.status.text().endswith(str(len(dbar._matches))), dbar.status.text())
+        # 【效能護欄】20 張圖全部命中，但只有看得到的那一兩張該被重畫
+        check("只重畫螢幕上看得到的圖（效能護欄）",
+              0 < len(render_calls) <= len(seen) + 1,
+              f"可見 {len(seen)} 張，render 被呼叫 {len(render_calls)} 次")
+
+        before_calls = len(render_calls)
+        dbar._sync_diagram_highlights()
+        check("狀態沒變就完全不重畫（_pushed 生效）",
+              len(render_calls) == before_calls,
+              f"多了 {len(render_calls) - before_calls} 次")
+
+        # 文件裡那張圖真的換成帶高亮的了
+        image_type = QTextDocument.ResourceType.ImageResource.value
+        lit_key = next(k for _p, k in all_images if dbar._pushed.get(k) is not None)
+        lit = dsv.browser.document().resource(image_type, QUrl(f"mermaid:{lit_key}"))
+        theme_match = _styles.palette(dsv._theme)["find_match_bg"].lower()
+        theme_cur = _styles.palette(dsv._theme)["find_current_bg"].lower()
+
+        def highlight_pixels(img):
+            return sum(1 for y in range(0, img.height(), 2)
+                       for x in range(0, img.width(), 2)
+                       if img.pixelColor(x, y).name() in (theme_match, theme_cur))
+
+        check("文件裡的那張圖真的換成帶高亮的版本", highlight_pixels(lit) > 0)
+
+        # 圖表那一筆不能用 ExtraSelection 上色（會把整張圖刷成一片）
+        lit_pos = next(p for p, k in all_images if k == lit_key)
+        sel_index = dbar._matches.index(lit_pos) - dbar._window[0]
+        sel = (dbar._selections[sel_index]
+               if 0 <= sel_index < len(dbar._selections) else None)
+        check("圖表那一筆的 ExtraSelection 沒有背景色（否則整張圖會被塗滿）",
+              sel is not None
+              and sel.format.background().style() == Qt.BrushStyle.NoBrush,
+              str(sel.format.background().style()) if sel else "None")
+
+        # 跳到圖表那一筆：該張要換成強調色
+        render_calls.clear()
+        target = dbar._matches.index(lit_pos)
+        dbar._current_index = (target - 1) % len(dbar._matches)
+        dbar.search(forward=True)
+        pump(300)
+        check("跳到圖表那一筆時該張改用強調色",
+              dbar._pushed.get(lit_key) is not None
+              and dbar._pushed[lit_key].current,
+              str(dbar._pushed.get(lit_key)))
+
+        # 捲動之後補畫新進畫面的圖
+        render_calls.clear()
+        dsv.browser.verticalScrollBar().setValue(4000)
+        pump(dbar.SCROLL_DEBOUNCE_MS + 400)
+        now_visible = visible_diagrams()
+        check("捲動後補畫新進畫面的圖", len(render_calls) > 0,
+              f"render {len(render_calls)} 次")
+        check("捲動補畫也只做可見的",
+              len(render_calls) <= len(now_visible) + 1,
+              f"可見 {len(now_visible)} 張，render {len(render_calls)} 次")
+
+        # 關掉搜尋要把圖還原
+        dbar.deactivate()
+        pump(300)
+        restored = dsv.browser.document().resource(
+            image_type, QUrl(f"mermaid:{lit_key}"))
+        check("關掉搜尋後圖還原成沒有高亮的版本",
+              highlight_pixels(restored) == 0 and not dbar._pushed,
+              f"還剩 {highlight_pixels(restored)} 個高亮像素")
+    finally:
+        mermaid.render = real_render
+        dsv.close()
+        pump(300)
+    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+
     mermaid.clear_caches()
 
 
