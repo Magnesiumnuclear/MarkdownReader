@@ -2492,9 +2492,11 @@ def section_tab_dnd(args) -> None:
           [b._name for b in viewer.tab_bar._buttons] == names(viewer))
     check("放開後列內的指示線收起", not viewer.tab_bar._insert_marker.isVisible())
 
-    # 列內排序時，指示線畫在「相對按下時那一格」的那一側：往左走畫左緣、
-    # 往右走畫右緣、還在原位完全不畫。原位不畫是因為那時放開什麼都不會變，
-    # 畫一條線反而讓人以為順序會動。
+    # 列內排序時，指示線畫在「使用者正往哪一邊拖」的那一側：
+    #   已離開原位 -> 比對現在的格子與按下時那一格
+    #   還在原位   -> 比對游標與**按下點**的左右（格子沒變，比不出方向）
+    # 原位那一段用按下點而不是分頁中心：抓取點可能落在分頁任何位置，用中心比
+    # 的話，同樣往右拖一點點，抓左半邊和抓右半邊會得到相反的結果。
     inbar = viewer.tab_bar
 
     def drag_along(from_index, to_index):
@@ -2531,6 +2533,10 @@ def section_tab_dnd(args) -> None:
             marker = inbar._insert_marker
             samples.append({
                 "slot": inbar._buttons.index(src),
+                # 前幾步可能還沒超過 startDragDistance，手勢根本還沒開始，
+                # 那時當然什麼都不該畫。用 _drag_origin 有沒有值來分辨，
+                # 而不是「跳過第一筆」那種看心情的規則。
+                "dragging": inbar._drag_origin is not None,
                 "shown": marker.isVisibleTo(inbar),
                 "line": marker.x() + marker.line_x(),
                 "left": src.x(),
@@ -2547,17 +2553,22 @@ def section_tab_dnd(args) -> None:
 
     # --- 往右拖：靠右 ---
     right_samples = drag_along(0, 2)
-    moved_right = [s for s in right_samples if s["slot"] > 0]
-    at_origin_right = [s for s in right_samples if s["slot"] == 0]
+    moved_right = [s for s in right_samples if s["slot"] > 0 and s["dragging"]]
+    at_origin_right = [
+        s for s in right_samples if s["slot"] == 0 and s["dragging"]]
     check("往右拖：離開原位後指示線會出現",
           bool(moved_right) and all(s["shown"] for s in moved_right),
           str(moved_right[:2]))
     check("往右拖：指示線畫在被拖分頁的**右**緣",
           all(abs(s["line"] - s["right"]) <= 1 for s in moved_right),
           str([(s["slot"], s["line"], s["right"]) for s in moved_right[:3]]))
-    check("往右拖：還在原位那幾步完全不畫",
-          all(not s["shown"] for s in at_origin_right),
-          str(at_origin_right[:2]))
+    # 往右拖時，游標一路都在按下點右邊，所以連還沒換格子的那幾步也該畫右緣
+    check("往右拖：還在原位時就已經畫在右緣（跟著滑鼠方向）",
+          bool(at_origin_right)
+          and all(s["shown"] and abs(s["line"] - s["right"]) <= 1
+                  for s in at_origin_right),
+          str([(s["slot"], s["shown"], s["line"], s["right"])
+               for s in at_origin_right[:3]]))
     check("往右拖：跨過鄰居後指示線跟著換位置",
           len({s["slot"] for s in moved_right}) > 1,
           str(sorted({s["slot"] for s in moved_right})))
@@ -2568,45 +2579,72 @@ def section_tab_dnd(args) -> None:
     # 上一段把第 0 格拖到第 2 格，所以現在從第 2 格往回拖
     back_index = 2
     left_samples = drag_along(back_index, 0)
-    moved_left = [s for s in left_samples if s["slot"] < back_index]
-    at_origin_left = [s for s in left_samples if s["slot"] == back_index]
+    moved_left = [
+        s for s in left_samples if s["slot"] < back_index and s["dragging"]]
+    at_origin_left = [
+        s for s in left_samples if s["slot"] == back_index and s["dragging"]]
     check("往左拖：離開原位後指示線會出現",
           bool(moved_left) and all(s["shown"] for s in moved_left),
           str(moved_left[:2]))
     check("往左拖：指示線畫在被拖分頁的**左**緣",
           all(abs(s["line"] - s["left"]) <= 1 for s in moved_left),
           str([(s["slot"], s["line"], s["left"]) for s in moved_left[:3]]))
-    check("往左拖：還在原位那幾步完全不畫",
-          all(not s["shown"] for s in at_origin_left),
-          str(at_origin_left[:2]))
+    check("往左拖：還在原位時就已經畫在左緣（跟著滑鼠方向）",
+          bool(at_origin_left)
+          and all(s["shown"] and abs(s["line"] - s["left"]) <= 1
+                  for s in at_origin_left),
+          str([(s["slot"], s["shown"], s["line"], s["left"])
+               for s in at_origin_left[:3]]))
 
-    # --- 在原位小幅晃動：從頭到尾都不該出現 ---
+    # --- 在原位左右晃動：指示線要跟著滑鼠換邊 ---
+    # 這一段完全不跨過鄰居（位移都小於半個分頁寬），所以格子從頭到尾不變，
+    # 唯一的依據就是游標在按下點的哪一邊。
     jiggle_src = inbar._buttons[1]
     jiggle_start = jiggle_src.mapToGlobal(jiggle_src.rect().center())
     app.sendEvent(jiggle_src, QMouseEvent(
         QEvent.Type.MouseButtonPress, QPointF(jiggle_src.rect().center()),
         QPointF(jiggle_start), Qt.MouseButton.LeftButton,
         Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
-    jiggle_shown = []
-    for offset in (6, 12, 18, 12, 6, 0, -6, -12):
+    jiggle = []
+    # 第一步要夠大才會超過拖曳起始距離，手勢真正開始
+    for offset in (20, 28, 20, 0, -20, -28, -20):
         point = QPoint(jiggle_start.x() + offset, jiggle_start.y())
         app.sendEvent(jiggle_src, QMouseEvent(
             QEvent.Type.MouseMove, QPointF(jiggle_src.mapFromGlobal(point)),
             QPointF(point), Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
             Qt.KeyboardModifier.NoModifier))
-        jiggle_shown.append(
-            (inbar._buttons.index(jiggle_src),
-             inbar._insert_marker.isVisibleTo(inbar)))
+        marker = inbar._insert_marker
+        jiggle.append({
+            "offset": offset,
+            "slot": inbar._buttons.index(jiggle_src),
+            "shown": marker.isVisibleTo(inbar),
+            "line": marker.x() + marker.line_x(),
+            "left": jiggle_src.x(),
+            "right": jiggle_src.x() + jiggle_src.width(),
+        })
     app.sendEvent(jiggle_src, QMouseEvent(
         QEvent.Type.MouseButtonRelease,
         QPointF(jiggle_src.mapFromGlobal(jiggle_start)), QPointF(jiggle_start),
         Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
         Qt.KeyboardModifier.NoModifier))
     pump(200)
-    check("在原位小幅晃動（沒跨過任何鄰居）從頭到尾不顯示指示線",
-          all(not shown for _slot, shown in jiggle_shown)
-          and len({slot for slot, _s in jiggle_shown}) == 1,
-          str(jiggle_shown))
+
+    check("前置：原位晃動全程沒有換過格子（不然測到的是另一條規則）",
+          len({s["slot"] for s in jiggle}) == 1,
+          str(sorted({s["slot"] for s in jiggle})))
+    check("原位往右晃：畫在右緣",
+          all(s["shown"] and abs(s["line"] - s["right"]) <= 1
+              for s in jiggle if s["offset"] > 0),
+          str([(s["offset"], s["shown"], s["line"], s["right"])
+               for s in jiggle if s["offset"] > 0]))
+    check("原位往左晃：畫在左緣",
+          all(s["shown"] and abs(s["line"] - s["left"]) <= 1
+              for s in jiggle if s["offset"] < 0),
+          str([(s["offset"], s["shown"], s["line"], s["left"])
+               for s in jiggle if s["offset"] < 0]))
+    check("游標正好回到按下點時不畫（沒有左右可言）",
+          all(not s["shown"] for s in jiggle if s["offset"] == 0),
+          str([s for s in jiggle if s["offset"] == 0]))
 
     # 上面三段拖曳把順序打亂了，後面的拆分／合併測試預期 d0, d1, d2。
     for wanted, name in enumerate(sorted(names(viewer))):
