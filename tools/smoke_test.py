@@ -2492,11 +2492,9 @@ def section_tab_dnd(args) -> None:
           [b._name for b in viewer.tab_bar._buttons] == names(viewer))
     check("放開後列內的指示線收起", not viewer.tab_bar._insert_marker.isVisible())
 
-    # 列內排序時，指示線畫在「使用者正往哪一邊拖」的那一側：
-    #   已離開原位 -> 比對現在的格子與按下時那一格
-    #   還在原位   -> 比對游標與**按下點**的左右（格子沒變，比不出方向）
-    # 原位那一段用按下點而不是分頁中心：抓取點可能落在分頁任何位置，用中心比
-    # 的話，同樣往右拖一點點，抓左半邊和抓右半邊會得到相反的結果。
+    # 列內排序只有一條規則：游標在按下點右邊就畫右緣、左邊就畫左緣，
+    # 不分有沒有離開原位。基準用按下點而不是分頁中心——抓取點可能落在分頁任何
+    # 位置，用中心比的話，同樣往右拖一點點，抓左半邊和抓右半邊會得到相反的結果。
     inbar = viewer.tab_bar
 
     def drag_along(from_index, to_index):
@@ -2534,9 +2532,9 @@ def section_tab_dnd(args) -> None:
             samples.append({
                 "slot": inbar._buttons.index(src),
                 # 前幾步可能還沒超過 startDragDistance，手勢根本還沒開始，
-                # 那時當然什麼都不該畫。用 _drag_origin 有沒有值來分辨，
+                # 那時當然什麼都不該畫。用 _drag_press_x 有沒有值來分辨，
                 # 而不是「跳過第一筆」那種看心情的規則。
-                "dragging": inbar._drag_origin is not None,
+                "dragging": inbar._drag_press_x is not None,
                 "shown": marker.isVisibleTo(inbar),
                 "line": marker.x() + marker.line_x(),
                 "left": src.x(),
@@ -2559,11 +2557,11 @@ def section_tab_dnd(args) -> None:
     check("往右拖：離開原位後指示線會出現",
           bool(moved_right) and all(s["shown"] for s in moved_right),
           str(moved_right[:2]))
-    check("往右拖：指示線畫在被拖分頁的**右**緣",
+    check("往右拖：游標在按下點右邊，指示線畫在**右**緣",
           all(abs(s["line"] - s["right"]) <= 1 for s in moved_right),
           str([(s["slot"], s["line"], s["right"]) for s in moved_right[:3]]))
     # 往右拖時，游標一路都在按下點右邊，所以連還沒換格子的那幾步也該畫右緣
-    check("往右拖：還在原位時就已經畫在右緣（跟著滑鼠方向）",
+    check("往右拖：還沒換格子時就已經畫在右緣（同一條規則）",
           bool(at_origin_right)
           and all(s["shown"] and abs(s["line"] - s["right"]) <= 1
                   for s in at_origin_right),
@@ -2586,10 +2584,10 @@ def section_tab_dnd(args) -> None:
     check("往左拖：離開原位後指示線會出現",
           bool(moved_left) and all(s["shown"] for s in moved_left),
           str(moved_left[:2]))
-    check("往左拖：指示線畫在被拖分頁的**左**緣",
+    check("往左拖：游標在按下點左邊，指示線畫在**左**緣",
           all(abs(s["line"] - s["left"]) <= 1 for s in moved_left),
           str([(s["slot"], s["line"], s["left"]) for s in moved_left[:3]]))
-    check("往左拖：還在原位時就已經畫在左緣（跟著滑鼠方向）",
+    check("往左拖：還沒換格子時就已經畫在左緣（同一條規則）",
           bool(at_origin_left)
           and all(s["shown"] and abs(s["line"] - s["left"]) <= 1
                   for s in at_origin_left),
@@ -2645,6 +2643,45 @@ def section_tab_dnd(args) -> None:
     check("游標正好回到按下點時不畫（沒有左右可言）",
           all(not s["shown"] for s in jiggle if s["offset"] == 0),
           str([s for s in jiggle if s["offset"] == 0]))
+
+    # --- 基準是「按下點」，不是「分頁中心」 ---------------------------------
+    # 上面每一段都抓分頁正中央，那時按下點正好等於中心，兩種基準給的答案一樣，
+    # 分不出來。這一段刻意抓左邊緣附近，再把游標移到「比按下點右、但仍在中心
+    # 左邊」的位置：按下點基準 -> 右緣，分頁中心基準 -> 左緣，結論相反。
+    off_src = inbar._buttons[1]
+    grab = QPoint(8, off_src.height() // 2)          # 靠左邊緣按下
+    off_start = off_src.mapToGlobal(grab)
+    app.sendEvent(off_src, QMouseEvent(
+        QEvent.Type.MouseButtonPress, QPointF(grab), QPointF(off_start),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier))
+    # 移到按下點右邊 24px：仍在這一格內（沒跨過鄰居中心），也仍在分頁中心左邊
+    off_to = QPoint(off_start.x() + 24, off_start.y())
+    app.sendEvent(off_src, QMouseEvent(
+        QEvent.Type.MouseMove, QPointF(off_src.mapFromGlobal(off_to)),
+        QPointF(off_to), Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier))
+    # 所有數值都要在**放開之前**取樣：放開會把指示線收起來，
+    # 拖到 check() 才讀 isVisibleTo 一定是 False（這裡踩過一次）。
+    off_marker = inbar._insert_marker
+    off_slot = inbar._buttons.index(off_src)
+    off_shown = off_marker.isVisibleTo(inbar)
+    off_line = off_marker.x() + off_marker.line_x()
+    off_left = off_src.x()
+    off_right = off_src.x() + off_src.width()
+    off_centre_x = off_src.mapToGlobal(off_src.rect().center()).x()
+    app.sendEvent(off_src, QMouseEvent(
+        QEvent.Type.MouseButtonRelease, QPointF(off_src.mapFromGlobal(off_to)),
+        QPointF(off_to), Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier))
+    pump(200)
+
+    check("前置：這一步沒有換格子，而且游標還在分頁中心的左邊",
+          off_slot == 1 and off_to.x() < off_centre_x,
+          f"格子 {off_slot}，游標 {off_to.x()} vs 中心 {off_centre_x}")
+    check("基準是按下點而不是分頁中心（抓左緣往右移一點 -> 右緣）",
+          off_shown and abs(off_line - off_right) <= 1,
+          f"線 {off_line}，左緣 {off_left}，右緣 {off_right}，顯示={off_shown}")
 
     # 上面三段拖曳把順序打亂了，後面的拆分／合併測試預期 d0, d1, d2。
     for wanted, name in enumerate(sorted(names(viewer))):
