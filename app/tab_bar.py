@@ -15,6 +15,12 @@
 - 兩種情況都用同一個 InsertMarker 標出「會插在哪兩個之間」。列內重排時它
   畫在被拖分頁自己的左緣——即時重排已經把它挪到目標槽位了，那條縫就是落點。
 
+【關閉鈕是覆蓋層，不進版面】
+關閉鈕若排在版面裡，滑鼠移進移出就會讓分頁寬度跳一下（未選取的分頁平常不顯示
+關閉鈕），整列跟著位移，很難瞄準。改成絕對定位疊在檔名右端：分頁寬度從此只由
+檔名決定，滑鼠怎麼動都不變。代價是叉叉會蓋到長檔名的尾巴，所以底下鋪一條
+與分頁同色的襯底（右段實色、左段漸層淡出），見 TabButton._layout_close。
+
 【拖曳期間絕對不能重建按鈕】
 按下分頁會觸發 activate_tab -> set_tabs。舊版 set_tabs 一律砍掉重建，
 被按住的那顆按鈕會在手勢進行中被銷毀，滑鼠抓取跟著消失，拖曳就死了。
@@ -45,6 +51,11 @@ from .title_bar import IconButton
 # 離開分頁列矩形四周多少邏輯像素才算「撕下來」。太小會誤觸，
 # 太大則拖不出去；瀏覽器實測大約就是這個量級。
 TEAR_OFF_MARGIN = 48
+
+# 分頁的框線寬度，和 styles.py 的 #tab / #tabActive 規則對應。關閉鈕的覆蓋層
+# 要讓開它們，否則會蓋掉作用中分頁頂端那條強調色，以及分頁之間的分隔線。
+_TAB_BORDER_TOP = 2
+_TAB_BORDER_RIGHT = 1
 
 
 class DragGhost(QWidget):
@@ -251,14 +262,68 @@ class TabButton(QFrame):
         )
         row.addWidget(self._label, 1)
 
-        self._close = IconButton("close", "tab.close", self, size=(18, 18))
+        # 襯底在下、關閉鈕在上，兩個都不進版面（見模組開頭）。襯底吃不到滑鼠，
+        # 否則它會擋住關閉鈕左邊那一段的點擊，也會蓋掉分頁本身的拖曳手勢。
+        self._backdrop = QFrame(self)
+        self._backdrop.setObjectName("tabCloseBackdrop")
+        self._backdrop.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+        self._close = IconButton(
+            "close", "tab.close", self,
+            size=(config.TAB_CLOSE_SIZE, config.TAB_CLOSE_SIZE),
+        )
         self._close.setObjectName("tabClose")
-        self._close.setIconSize(QSize(10, 10))
+        self._close.setIconSize(QSize(config.TAB_CLOSE_ICON, config.TAB_CLOSE_ICON))
         self._close.apply_theme(theme)
         self._close.clicked.connect(self.closeClicked)
         # 未選取的分頁平常不顯示關閉鈕，滑鼠移上去才出現，避免整列都是叉叉
-        self._close.setVisible(active)
-        row.addWidget(self._close)
+        self._show_close(active)
+
+    # -- 關閉鈕的覆蓋層 -------------------------------------------------------
+    def _show_close(self, visible: bool) -> None:
+        """關閉鈕與它的襯底一起顯示或收起——只顯示其中一個都是破圖。"""
+        self._backdrop.setVisible(visible)
+        self._close.setVisible(visible)
+        if visible:
+            self._layout_close()
+
+    def _layout_close(self) -> None:
+        """把關閉鈕與襯底放到右端。
+
+        襯底不能鋪滿整顆分頁：上緣 2px 是 border-top（作用中的分頁那條是強調
+        色），右緣 1px 是 border-right，子元件畫在框線之上，鋪過去會把兩條線
+        蓋掉。所以上下各讓開框線，右緣停在 width-1。
+        """
+        margin = config.TAB_CLOSE_MARGIN
+        size = config.TAB_CLOSE_SIZE
+        top = _TAB_BORDER_TOP
+        height = max(0, self.height() - top)
+        right = max(0, self.width() - _TAB_BORDER_RIGHT)
+        close_x = right - margin - size
+        self._close.setGeometry(
+            close_x, top + max(0, (height - size) // 2), size, size
+        )
+        backdrop_x = close_x - config.TAB_CLOSE_FADE
+        self._backdrop.setGeometry(
+            backdrop_x, top, max(0, right - backdrop_x), height
+        )
+        # 疊放順序：襯底要在**檔名之上**（它的工作就是把檔名尾巴蓋掉），
+        # 關閉鈕再疊在襯底之上。先 raise 襯底、再 raise 關閉鈕，順序不能反。
+        # 寫成 lower() 會把襯底壓到檔名底下，看起來就是「叉叉和字糊在一起」。
+        self._backdrop.raise_()
+        self._close.raise_()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        """分頁寬度變了就重排覆蓋層。
+
+        這裡**不能**用 isVisible() 當守衛。isVisible() 問的是「現在畫得到嗎」，
+        視窗還沒 show 之前一律是 False——而分頁拿到最終寬度的那一次 resize
+        正好發生在那個時候。守衛擋掉之後，覆蓋層就停在建構當下那個
+        sizeHint 寬度（實測 100，實際分頁 133），叉叉會落在檔名中間。
+        隱藏的元件照樣定位，沒有成本。
+        """
+        super().resizeEvent(event)
+        self._layout_close()
 
     # -- 樣式 ----------------------------------------------------------------
     def matches(self, name: str, path: str | None) -> bool:
@@ -278,11 +343,14 @@ class TabButton(QFrame):
         self._active = active
         self.setObjectName("tabActive" if active else "tab")
         self._label.setObjectName("tabLabelActive" if active else "tabLabel")
-        # objectName 變了要重跑 QSS 選擇器，否則外觀停在舊樣式
-        for widget in (self, self._label):
+        # objectName 變了要重跑 QSS 選擇器，否則外觀停在舊樣式。
+        # 襯底一定要一起重跑：它的顏色是用 `#tabActive QFrame#tabCloseBackdrop`
+        # 這種後代選擇器挑的，父層的 objectName 換了而它沒重跑，作用中的分頁
+        # 會頂著「非作用中」那個底色，接縫處看得出一塊色差。
+        for widget in (self, self._label, self._backdrop, self._close):
             widget.style().unpolish(widget)
             widget.style().polish(widget)
-        self._close.setVisible(active or self.underMouse())
+        self._show_close(active or self.underMouse())
 
     def apply_theme(self, theme: str) -> None:
         self._theme = theme
@@ -294,11 +362,11 @@ class TabButton(QFrame):
 
     # -- 滑鼠 ----------------------------------------------------------------
     def enterEvent(self, event) -> None:  # noqa: N802
-        self._close.setVisible(True)
+        self._show_close(True)
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:  # noqa: N802
-        self._close.setVisible(self._active)
+        self._show_close(self._active)
         super().leaveEvent(event)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802

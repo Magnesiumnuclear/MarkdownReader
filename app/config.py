@@ -190,6 +190,12 @@ TAB_INSERT_CAP_SIZE = 13      # 線上下兩端的三角帽邊長；也決定指
 TAB_MAX_WIDTH = 190
 TAB_MIN_WIDTH = 92
 TAB_LABEL_WIDTH = 130            # 檔名可用寬度，超過就中間省略
+# 關閉鈕是「疊在檔名上」的覆蓋層，不進版面——滑鼠移進移出不會改變分頁寬度。
+# 底下鋪一條與分頁同色的襯底（右段實色、左段漸層淡出），字才不會和叉叉糊在一起。
+TAB_CLOSE_SIZE = 18              # 關閉鈕邊長
+TAB_CLOSE_ICON = 10              # 叉叉圖示邊長
+TAB_CLOSE_MARGIN = 5             # 關閉鈕距分頁右緣
+TAB_CLOSE_FADE = 16              # 襯底左側漸層淡出的寬度
 
 KEY_RESTORE_TABS = "behavior/restoreTabs"
 KEY_OPEN_TABS = "session/openTabs"

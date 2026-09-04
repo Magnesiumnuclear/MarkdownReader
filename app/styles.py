@@ -109,6 +109,44 @@ def other_theme(theme: str) -> str:
     return "dark" if theme == "light" else "light"
 
 
+def _parse_colour(value: str) -> tuple[int, int, int, float]:
+    """把色票字串拆成 (r, g, b, alpha)。只認得本檔用到的兩種寫法。
+
+    色票裡的 hover_bg／pressed_bg 是半透明的 rgba()，疊在別的顏色上才是
+    眼睛看到的顏色。要在 QSS 裡鋪一塊「和分頁同色」的襯底就得先自己合成，
+    QSS 本身算不出這個。
+    """
+    text = value.strip()
+    if text.startswith("#"):
+        digits = text[1:]
+        return (
+            int(digits[0:2], 16), int(digits[2:4], 16), int(digits[4:6], 16), 1.0
+        )
+    if text.startswith("rgba"):
+        parts = [p.strip() for p in text[text.index("(") + 1:text.rindex(")")].split(",")]
+        return int(parts[0]), int(parts[1]), int(parts[2]), float(parts[3])
+    raise ValueError(f"不認識的色票寫法：{value}")
+
+
+def _blend(over: str, under: str) -> str:
+    """把半透明的 over 疊在不透明的 under 上，算出等效的 #rrggbb。"""
+    ored, ogreen, oblue, alpha = _parse_colour(over)
+    ured, ugreen, ublue, _ = _parse_colour(under)
+    mix = lambda a, b: round(a * alpha + b * (1 - alpha))  # noqa: E731
+    return f"#{mix(ored, ured):02x}{mix(ogreen, ugreen):02x}{mix(oblue, ublue):02x}"
+
+
+def _transparent(colour: str) -> str:
+    """同一個顏色的全透明版本。
+
+    漸層不能用 `transparent` 當起點：Qt 在非預乘的 RGBA 空間內插，
+    透明黑漸變到不透明白會從灰色走過去，淺色主題上會看到一條髒邊。
+    起點必須是「同色但 alpha=0」。
+    """
+    red, green, blue, _ = _parse_colour(colour)
+    return f"rgba({red}, {green}, {blue}, 0)"
+
+
 def _values(theme: str, language_code: str) -> dict[str, str]:
     """樣板替換值。
 
@@ -119,6 +157,17 @@ def _values(theme: str, language_code: str) -> dict[str, str]:
     values = dict(palette(theme))
     values["font_ui"] = font_ui(language_code)
     values["font_code"] = FONT_CODE
+    # 關閉鈕襯底要和它蓋住的那塊分頁同色。分頁有兩種底色：非作用中被 hover
+    # 時是半透明的 hover_bg 疊在分頁列的 surface 上（先合成才知道實色），
+    # 作用中則直接是 window_bg。
+    idle = _blend(values["hover_bg"], values["surface"])
+    values["tab_close_bg"] = idle
+    values["tab_close_bg_clear"] = _transparent(idle)
+    values["tab_close_bg_active"] = values["window_bg"]
+    values["tab_close_bg_active_clear"] = _transparent(values["window_bg"])
+    # 漸層要在關閉鈕的左緣就收成實色，不然叉叉底下還是半透明、字會透出來。
+    strip = config.TAB_CLOSE_FADE + config.TAB_CLOSE_SIZE + config.TAB_CLOSE_MARGIN
+    values["tab_close_fade_stop"] = f"{config.TAB_CLOSE_FADE / strip:.3f}"
     return values
 
 
@@ -209,6 +258,24 @@ QToolButton#tabClose, QToolButton#tabNew {
     padding: 0px;
 }
 QToolButton#tabClose:hover, QToolButton#tabNew:hover { background-color: $pressed_bg; }
+
+/* 關閉鈕的襯底：右段實色蓋住檔名尾巴，左段漸層淡出，接回分頁底色。
+   兩種底色分別對應「非作用中被 hover」與「作用中」，實色是先合成過的
+   （hover_bg 是半透明的，見 _values）。關閉鈕本身仍是透明底，hover 時
+   那塊半透明的 chip 疊在這層實色上，看起來和改版前一樣。 */
+QFrame#tabCloseBackdrop {
+    border: none;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 $tab_close_bg_clear,
+        stop:$tab_close_fade_stop $tab_close_bg,
+        stop:1 $tab_close_bg);
+}
+#tabActive QFrame#tabCloseBackdrop {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 $tab_close_bg_active_clear,
+        stop:$tab_close_fade_stop $tab_close_bg_active,
+        stop:1 $tab_close_bg_active);
+}
 
 /* 拖曳時標出分頁會插進哪個縫隙。這條規則一定要留在主視窗的 QSS 裡——
    指示線是主視窗的子元件，寫進拖曳幽靈那份（它是獨立頂層視窗、自己套一份

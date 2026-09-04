@@ -1448,7 +1448,9 @@ def section_language(args) -> None:
 # 區塊：分頁操作
 # ===========================================================================
 def section_tabs(args) -> None:
-    from PyQt6.QtCore import QEventLoop, QSettings, Qt, QTimer
+    import tempfile
+
+    from PyQt6.QtCore import QEventLoop, QRect, QSettings, Qt, QTimer
     from PyQt6.QtWidgets import QApplication
 
     app = QApplication.instance() or QApplication([])
@@ -1503,6 +1505,189 @@ def section_tabs(args) -> None:
         viewer.close_tab_at(len(viewer._tabs) - 1)
         pump(150)
     check("關到只剩一個分頁時分頁列仍顯示", viewer.tab_bar.isVisible())
+
+    # --- 關閉鈕是疊在檔名上的覆蓋層 -----------------------------------------
+    # 改版前關閉鈕排在版面裡：滑鼠移進未選取的分頁會讓它多出 24px，整列跟著
+    # 位移，很難瞄準。現在改成絕對定位疊在右端，寬度只由檔名決定。
+    from PyQt6.QtCore import QEvent, QPointF
+    from PyQt6.QtGui import QEnterEvent
+
+    from app import styles as _styles
+    from app import tab_bar as _tab_bar
+
+    long_name = "非常非常長的檔案名稱用來把整條分頁塞滿測試中間省略"
+    long_path = os.path.join(tempfile.mkdtemp(), long_name + ".md")
+    with open(long_path, "w", encoding="utf-8") as handle:
+        handle.write("# 長檔名\n\n內容。\n")
+    viewer.open_path(long_path, new_tab=True)
+    pump(400)
+
+    buttons = viewer.tab_bar._buttons
+    long_tab = buttons[-1]          # 剛開的是作用中的，關閉鈕一直看得到
+    idle_tab = buttons[0]
+
+    check("關閉鈕與襯底都不在版面裡（在版面裡就會撐寬分頁）",
+          viewer.tab_bar._buttons[0].layout().count() == 1,
+          f"版面裡有 {viewer.tab_bar._buttons[0].layout().count()} 個項目")
+
+    # 【這次改版的重點】滑鼠移進移出，寬度一格都不能變
+    widths_before = [b.width() for b in buttons]
+    centre = idle_tab.rect().center()
+    global_centre = idle_tab.mapToGlobal(centre)
+    app.sendEvent(idle_tab, QEnterEvent(
+        QPointF(centre), QPointF(global_centre), QPointF(global_centre)))
+    pump(250)
+    widths_hover = [b.width() for b in buttons]
+    check("滑鼠移進分頁不會改變任何分頁的寬度",
+          widths_before == widths_hover,
+          f"{widths_before} -> {widths_hover}")
+    check("滑鼠移進未選取的分頁才顯示關閉鈕", idle_tab._close.isVisibleTo(idle_tab))
+    app.sendEvent(idle_tab, QEvent(QEvent.Type.Leave))
+    pump(250)
+    check("滑鼠移出後寬度仍然一樣",
+          [b.width() for b in buttons] == widths_before,
+          f"{[b.width() for b in buttons]} vs {widths_before}")
+
+    # 幾何：貼右緣、讓開框線
+    close_rect = long_tab._close.geometry()
+    back_rect = long_tab._backdrop.geometry()
+    check("關閉鈕貼在分頁右緣（讓開 1px 的 border-right）",
+          close_rect.right() + 1 == long_tab.width()
+          - _tab_bar._TAB_BORDER_RIGHT - config.TAB_CLOSE_MARGIN,
+          f"右緣 {close_rect.right() + 1} 分頁寬 {long_tab.width()}")
+    check("襯底從關閉鈕再往左讓出漸層寬度，右緣到分頁邊界",
+          back_rect.left() == close_rect.left() - config.TAB_CLOSE_FADE
+          and back_rect.right() + 1 == long_tab.width() - _tab_bar._TAB_BORDER_RIGHT,
+          f"襯底 {back_rect} 關閉鈕 {close_rect}")
+    check("覆蓋層讓開頂端 2px 的 border-top（作用中分頁那條強調色不能被蓋掉）",
+          back_rect.top() == _tab_bar._TAB_BORDER_TOP,
+          f"襯底頂端 {back_rect.top()}")
+
+    # 疊放順序：襯底要在檔名之上、關閉鈕之下
+    order = [child.objectName() for child in long_tab.children()
+             if child.objectName() in
+             ("tabLabel", "tabLabelActive", "tabCloseBackdrop", "tabClose")]
+    check("疊放順序是 檔名 → 襯底 → 關閉鈕（襯底寫成 lower() 就會被字蓋住）",
+          order == ["tabLabelActive", "tabCloseBackdrop", "tabClose"], str(order))
+
+    # 像素：襯底真的把檔名尾巴蓋掉，而且叉叉看得見
+    def _tab_pixels(tab):
+        image = tab.grab().toImage()
+        ratio = image.width() / max(1, tab.width())
+        return image, ratio
+
+    def _ink_in(tab, rect, wanted):
+        image, ratio = _tab_pixels(tab)
+        return sum(
+            1
+            for y in range(int(rect.top() * ratio), int(rect.bottom() * ratio))
+            for x in range(int(rect.left() * ratio), int(rect.right() * ratio))
+            if image.pixelColor(x, y).name() in wanted
+        )
+
+    theme_now = viewer.tab_bar._theme
+    name_colours = {_styles.palette(theme_now)["text"].lower(),
+                    _styles.palette(theme_now)["text_muted"].lower()}
+    solid = QRect(close_rect.left(), back_rect.top(),
+                  back_rect.right() - close_rect.left() + 1, back_rect.height())
+    check("前置：這個檔名長到會撞上關閉鈕（不然遮蓋測不到）",
+          _ink_in(long_tab, QRect(0, back_rect.top(), back_rect.left(),
+                                  back_rect.height()), name_colours) > 0,
+          "襯底左邊沒有字，換一個更長的檔名")
+
+    def _masking_worst(tab):
+        """襯底的實色段裡，和實色底差最多的那個像素差多少（越小越好）。
+
+        量之前要先把叉叉收起來：色票裡 icon_active 和 text 是同一個色碼
+        （#1f2328），叉叉自己的像素會被算成「漏出來的檔名」。
+
+        逐欄掃過整個高度，不能只取中線：中文字的筆畫上下分佈不均，只看一列
+        會剛好落在字的空隙裡，遮蓋壞掉也量不出來。而且不能用「顏色完全相符」
+        來判斷——襯底若只遮一半，字會和底色混成一個中間色，和 text 的色碼並
+        不相等，數色碼的版本會綠得莫名其妙。
+        """
+        was_visible = tab._close.isVisibleTo(tab)
+        tab._close.setVisible(False)
+        pump(150)
+        image, ratio = _tab_pixels(tab)
+        tab._close.setVisible(was_visible)
+        pump(150)
+        back = tab._backdrop.geometry()
+        close = tab._close.geometry()
+        reference = image.pixelColor(
+            int((back.right() - 2) * ratio),
+            int((back.top() + back.height() // 2) * ratio),
+        ).lightness()
+        return max(
+            abs(image.pixelColor(int(x * ratio), int(y * ratio)).lightness()
+                - reference)
+            for x in range(close.left() + 1, back.right() - 1)
+            for y in range(back.top() + 1, back.bottom() - 1)
+        )
+
+    masked_image, masked_ratio = _tab_pixels(long_tab)
+    worst_active = _masking_worst(long_tab)
+    check("作用中的分頁：襯底把檔名尾巴蓋掉（整條都是實色，不是半透明）",
+          worst_active <= 6, f"最大亮度差 {worst_active}（>6 代表字透出來了）")
+
+    # 漸層存不存在只能從 QSS 判斷，不能量像素：淡出區底下沒有字的時候，
+    # 「透明疊在分頁底色上」和「實色」本來就一模一樣（襯底的實色就是分頁底色），
+    # 量出來永遠是「第 0 欄就實色」。改成檢查樣板算出來的 stop 位置。
+    backdrop_qss = re.search(
+        r"QFrame#tabCloseBackdrop\s*\{.*?stop:0\s.*?stop:([0-9.]+)",
+        _styles.build_qss(theme_now), re.S)
+    fade_stop = float(backdrop_qss.group(1)) if backdrop_qss else -1.0
+    check("襯底左側留了一段漸層（stop 落在 0 與 1 之間，不是硬邊）",
+          0.05 < fade_stop < 0.95, f"stop = {fade_stop}")
+
+    image, ratio = _tab_pixels(long_tab)
+    base = image.pixelColor(int((close_rect.left() + 1) * ratio),
+                            int((close_rect.top() + 1) * ratio))
+    glyph = sum(
+        1
+        for y in range(int(close_rect.top() * ratio), int(close_rect.bottom() * ratio))
+        for x in range(int(close_rect.left() * ratio), int(close_rect.right() * ratio))
+        if abs(image.pixelColor(x, y).lightness() - base.lightness()) > 25
+    )
+    check("叉叉真的畫在襯底上（不是被字蓋掉或畫在畫面外）", glyph > 10,
+          f"只有 {glyph} 個和襯底不同色的像素")
+
+    # 襯底的顏色是用 `#tabActive QFrame#tabCloseBackdrop` 這種後代選擇器挑的，
+    # 切換作用中分頁時如果沒有一起重跑選擇器，顏色會停在另一個狀態。
+    def _backdrop_colour(tab):
+        image, ratio = _tab_pixels(tab)
+        rect = tab._backdrop.geometry()
+        return image.pixelColor(int((rect.right() - 2) * ratio),
+                                int((rect.top() + rect.height() // 2) * ratio)).name()
+
+    active_colour = _backdrop_colour(long_tab)
+    viewer.activate_tab(0)
+    pump(300)
+    # 【不能讓「襯底被收起來」當成通過】切走之後關閉鈕本來就會收起來，
+    # 拿 isVisible 當逃生口的話這條會恆真（實測拿掉重跑選擇器那行，照樣全綠）。
+    # 強制把它顯示出來，兩個狀態都看得到，才比得出配色有沒有跟著換。
+    long_tab._show_close(True)
+    pump(200)
+    idle_colour = _backdrop_colour(long_tab)
+    check("切走之後襯底改用非作用中的底色（後代選擇器要跟著重跑）",
+          idle_colour != active_colour,
+          f"切換前後都是 {active_colour}")
+    # 非作用中走的是另一條 QSS 規則（`QFrame#tabCloseBackdrop`，沒有
+    # `#tabActive` 前綴），遮蓋要在這個狀態下也量一次——只量作用中的話，
+    # 把非作用中那條規則改壞了測試照樣全綠。
+    worst_idle = _masking_worst(long_tab)
+    check("非作用中被指著時：襯底一樣把檔名尾巴蓋掉",
+          worst_idle <= 6, f"最大亮度差 {worst_idle}")
+    long_tab._show_close(False)
+    viewer.activate_tab(len(viewer._tabs) - 1)
+    pump(300)
+    check("切回來又是作用中的底色",
+          _backdrop_colour(long_tab) == active_colour,
+          f"{_backdrop_colour(long_tab)} vs {active_colour}")
+
+    while len(viewer._tabs) > 1:
+        viewer.close_tab_at(len(viewer._tabs) - 1)
+        pump(150)
 
     # 回歸：標題列的 X 曾被誤接到 close_tab——開著多個分頁時按視窗的關閉鈕，
     # 視窗不關、只少一個分頁。視窗控制鈕必須關整個視窗。
