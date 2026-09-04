@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import re
 
+from PyQt6 import sip
 from PyQt6.QtCore import (
     QByteArray,
     QEvent,
@@ -142,21 +143,38 @@ class FramelessResizer(QObject):
     def _over_drag_control(self, global_x: int, global_y: int) -> bool:
         """游標是否落在需要讓開的控制項上。
 
-        名單是快照，成員可能在分頁關閉後失效。這個函式是從 eventFilter 呼叫的，
-        讓 RuntimeError 逸出等於直接中止行程，所以就地把失效的成員剔除。
-        呼叫端已經會在分頁增減時重新登記，這裡只是最後一道防線。
+        名單是快照，成員可能在分頁關閉或被別的視窗收養之後失效。這個函式是從
+        eventFilter 呼叫的，讓例外逸出等於直接中止行程，所以就地把失效的成員
+        剔除。呼叫端會在分頁增減時重新登記，這裡是最後一道防線。
+
+        兩個要點：
+
+        1. **先問 sip、不要先碰物件。** 舊版用 `widget.isVisible()` 探路、拿
+           RuntimeError 當「已銷毀」的訊號——那等於先解參照再祈禱。sip 沒來得及
+           把包裝標成已刪除時（C++ 端把物件連帶刪掉的情形），解出來的就是懸空
+           指標，直接 0xC0000005 硬崩潰，try/except 接不到。`sip.isdeleted()`
+           只問包裝自己的狀態，不會碰到 C++ 物件。
+
+        2. **只認還掛在本視窗底下的元件。** 分頁被別的視窗收養之後，它的捲軸
+           已經改屬別人；留在名單裡不只是髒資料——那個視窗一關，這裡就握著
+           懸空指標。順帶也修掉行為錯誤：本來會拿別人的捲軸位置去縮小本視窗的
+           縮放感應寬度。
         """
         alive: list[QWidget] = []
         hit = False
         for widget in self._drag_controls:
-            try:
-                visible = widget.isVisible()
-            except RuntimeError:
-                continue  # C++ 物件已被銷毀
-            alive.append(widget)
-            if not visible:
+            if sip.isdeleted(widget):
                 continue
-            rect = QRect(widget.mapToGlobal(QPoint(0, 0)), widget.size())
+            try:
+                if widget.window() is not self._window:
+                    continue
+                visible = widget.isVisible()
+                alive.append(widget)
+                if not visible:
+                    continue
+                rect = QRect(widget.mapToGlobal(QPoint(0, 0)), widget.size())
+            except RuntimeError:
+                continue  # 兩次檢查之間才被收掉，極少見但不能讓它逸出
             if rect.contains(global_x, global_y):
                 hit = True
         if len(alive) != len(self._drag_controls):
@@ -460,11 +478,13 @@ class MarkdownViewer(QWidget):
         C++ 物件就沒了，留下的 sip 包裝再被碰到會丟 RuntimeError——而那是在
         eventFilter 裡，PyQt6 視為致命，滑鼠一動行程就中止。
         """
+        # 名單一定要更新，即使視窗還沒顯示：交出分頁之後，舊名單裡的捲軸已經
+        # 是別的視窗的元件了，留著就是跨視窗的懸空參照。這一步很便宜。
+        self._resizer.set_drag_controls(self.findChildren(QScrollBar))
         if not self.isVisible():
-            # 還沒顯示時 showEvent 之後會做一次，這裡跳過省得白做
+            # 事件過濾器等 showEvent 再裝，還沒顯示時裝了也收不到滑鼠事件
             return
         self._resizer.refresh_targets()
-        self._resizer.set_drag_controls(self.findChildren(QScrollBar))
 
     def tab_count(self) -> int:
         return len(self._tabs)
@@ -518,8 +538,13 @@ class MarkdownViewer(QWidget):
         tab.browser.setParent(None)
 
         if not self._tabs:
-            # 空視窗：不再碰 self._tab（會 IndexError），交給呼叫端收尾
+            # 空視窗：不再碰 self._tab（會 IndexError），交給呼叫端收尾。
+            # 【但名單一定要更新】剛交出去的那個閱讀區的捲軸還在 _drag_controls
+            # 裡，而它現在屬於收養它的那個視窗。少了這一行，這個視窗的縮放器
+            # 就握著別人的元件——對方一關就是懸空指標。實測交出最後一個分頁後
+            # 六筆裡有兩筆是外來的。
             self._watch_files()
+            self._refresh_resizer_targets()
             return tab
 
         if index < self._active:

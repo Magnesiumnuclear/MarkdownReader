@@ -1933,7 +1933,7 @@ def section_window(args) -> None:
     check("移動滑鼠後仍存活", values.get("MOUSEMOVE_SURVIVED") == "1", out.strip())
 
     # --- 四邊四角與捲軸讓位 ---------------------------------------------------
-    from PyQt6.QtCore import QEventLoop, QSettings, Qt, QTimer
+    from PyQt6.QtCore import QEventLoop, QPoint, QSettings, Qt, QTimer
     from PyQt6.QtWidgets import QApplication
 
     app = QApplication.instance() or QApplication([])
@@ -2002,6 +2002,114 @@ def section_window(args) -> None:
 
     viewer.close()
     pump(300)
+
+    # --- 縮放器的名單不能留著別的視窗的元件 ---------------------------------
+    # FramelessResizer 用 _drag_controls 記著「縮放要讓開」的捲軸。這份名單是
+    # 快照：分頁被別的視窗收養之後，它的捲軸就改屬別人了。留著不只是髒資料
+    # ——對方視窗一關就是懸空指標，而懸空指標在 eventFilter 裡是 0xC0000005
+    # 硬崩潰，try/except 接不到。
+    #
+    # 這一條是確定性的：直接量名單的內容，不去賭那個間歇崩潰會不會發生。
+    from PyQt6.QtWidgets import QScrollBar as _QScrollBar
+
+    from app.window_manager import WindowManager as _WM
+
+    def _foreign(window):
+        """名單裡有幾個已經不屬於這個視窗。"""
+        mine = set(window.findChildren(_QScrollBar))
+        return [w for w in window._resizer._drag_controls if w not in mine]
+
+    manager_r = _WM()
+    keeper = manager_r.create_window(README)
+    keeper.open_path(SAMPLE, new_tab=True)
+    keeper.resize(700, 500)
+    keeper.show()
+    pump(500)
+    check("前置：縮放器登記到了捲軸",
+          len(keeper._resizer._drag_controls) > 0,
+          str(len(keeper._resizer._drag_controls)))
+
+    keeper._on_tab_detached(1, QPoint(1400, 820))
+    pump(400)
+    check("交出一個分頁後（視窗還有分頁）名單裡沒有別的視窗的元件",
+          not _foreign(keeper), str(_foreign(keeper)))
+
+    emptied = manager_r.create_window(SAMPLE)
+    emptied.resize(700, 500)
+    emptied.move(160, 160)
+    emptied.show()
+    pump(500)
+    before_n = len(emptied._resizer._drag_controls)
+    taken = emptied.take_tab(0)
+    pump(300)
+    # 【這條抓的是那個早退路徑】take_tab 在「視窗變空」時會提早 return，
+    # 舊版就這樣跳過了重新登記——實測六筆裡有兩筆變成外來元件。
+    check("交出**最後一個**分頁後名單裡也沒有別的視窗的元件",
+          not _foreign(emptied),
+          f"外來 {len(_foreign(emptied))} 筆，交出前共 {before_n} 筆")
+    check("前置：交出最後一個分頁確實會讓名單變短（不然上一條是恆真）",
+          len(emptied._resizer._drag_controls) < before_n,
+          f"{before_n} -> {len(emptied._resizer._drag_controls)}")
+
+    # 名單在視窗還沒顯示時也要更新：舊版整個 _refresh_resizer_targets 都被
+    # isVisible() 擋掉，交出分頁的時機剛好在隱藏之後就照樣留著外來元件。
+    hidden = manager_r.create_window(README)
+    hidden.resize(600, 400)
+    hidden.show()
+    pump(400)
+    hidden.open_path(SAMPLE, new_tab=True)
+    pump(300)
+    hidden.hide()
+    pump(200)
+    hidden._on_tab_detached(1, QPoint(1400, 900))
+    pump(400)
+    check("視窗隱藏時交出分頁，名單一樣不留外來元件",
+          not _foreign(hidden), str(_foreign(hidden)))
+
+    # 已被銷毀的包裝不能讓 eventFilter 爆掉
+    probe = manager_r.create_window(README)
+    probe.resize(600, 400)
+    probe.show()
+    pump(400)
+    from PyQt6 import sip as _sip
+    corpse = _QScrollBar(probe)
+    probe._resizer._drag_controls = list(probe._resizer._drag_controls) + [corpse]
+    _sip.delete(corpse)
+    crashed = False
+    try:
+        probe._resizer._over_drag_control(10, 10)
+    except Exception as exc:      # noqa: BLE001
+        crashed = True
+        detail = repr(exc)
+    check("名單裡混進已銷毀的包裝時，命中測試不會丟例外",
+          not crashed, detail if crashed else "")
+    check("已銷毀的包裝會被就地剔除",
+          all(not _sip.isdeleted(w) for w in probe._resizer._drag_controls))
+
+    # 直接把「別的視窗的」捲軸塞進名單，命中測試要把它剔掉。
+    # 上面那幾條走的是「重新登記」那條路（名單根本不會髒），這一條測的是
+    # 最後一道防線本身——名單真的髒掉時，命中測試會不會自己清乾淨。
+    other = manager_r.create_window(SAMPLE)
+    other.resize(500, 360)
+    other.move(520, 520)
+    other.show()
+    pump(400)
+    outsider = other.findChildren(_QScrollBar)[0]
+    probe._resizer._drag_controls = (
+        list(probe._resizer._drag_controls) + [outsider])
+    probe._resizer._over_drag_control(10, 10)
+    check("名單裡混進別的視窗的元件時，命中測試會把它剔除",
+          outsider not in probe._resizer._drag_controls,
+          f"還留著 {len(probe._resizer._drag_controls)} 筆")
+    check("剔除的只是外來的那個，本視窗的元件要留著",
+          all(w.window() is probe for w in probe._resizer._drag_controls)
+          and len(probe._resizer._drag_controls) > 0,
+          str(len(probe._resizer._drag_controls)))
+
+    for window in list(manager_r.windows()):
+        window.close()
+    pump(400)
+
     QSettings(config.ORG_NAME, config.APP_NAME).clear()
 
 
@@ -2384,46 +2492,130 @@ def section_tab_dnd(args) -> None:
           [b._name for b in viewer.tab_bar._buttons] == names(viewer))
     check("放開後列內的指示線收起", not viewer.tab_bar._insert_marker.isVisible())
 
-    # 列內排序途中也要看得到「會插在哪兩個之間」。即時重排已經把分頁挪到
-    # 目標槽位，所以線就畫在它自己的左緣——線的位置必須跟著它一起跑。
+    # 列內排序時，指示線畫在「相對按下時那一格」的那一側：往左走畫左緣、
+    # 往右走畫右緣、還在原位完全不畫。原位不畫是因為那時放開什麼都不會變，
+    # 畫一條線反而讓人以為順序會動。
     inbar = viewer.tab_bar
-    src2 = inbar._buttons[0]
-    start2 = src2.mapToGlobal(src2.rect().center())
-    app.sendEvent(src2, QMouseEvent(
-        QEvent.Type.MouseButtonPress, QPointF(src2.rect().center()),
-        QPointF(start2), Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
-        Qt.KeyboardModifier.NoModifier))
-    seen = []
-    target_x2 = inbar._buttons[2].mapToGlobal(
-        inbar._buttons[2].rect().center()).x()
-    for step_x in range(start2.x(), target_x2, 10):
-        app.sendEvent(src2, QMouseEvent(
-            QEvent.Type.MouseMove,
-            QPointF(src2.mapFromGlobal(QPoint(step_x, start2.y()))),
-            QPointF(step_x, start2.y()),
-            Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
+
+    def drag_along(from_index, to_index):
+        """把第 from_index 個分頁拖到第 to_index 個分頁，沿路取樣。
+
+        【手勢進行中絕對不要跑巢狀事件迴圈】這裡曾經每一步都 pump(30) 來等
+        版面更新，結果是後面的測試隨機以 0xC0000005 崩潰在
+        FramelessResizer._drag_controls——巢狀迴圈會把排隊中的 deleteLater
+        沖出來，在拖曳中途銷毀元件，留下懸空指標。改成不 pump：
+        _move_button 現在會自己 activate() 版面，buttons[i].x() 當場就是對的。
+        """
+        src = inbar._buttons[from_index]
+        origin_x = src.mapToGlobal(src.rect().center())
+        app.sendEvent(src, QMouseEvent(
+            QEvent.Type.MouseButtonPress, QPointF(src.rect().center()),
+            QPointF(origin_x), Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
+        target_btn = inbar._buttons[to_index]
+        if to_index > from_index:
+            # 往右要拖到目標格的**右緣**：被拖的分頁一往右走，其他分頁就同步
+            # 往左遞補，它們的中心跟著左移，只拖到中心點會少跨一格。
+            goal = target_btn.mapToGlobal(target_btn.rect().topRight()).x()
+        else:
+            goal = target_btn.mapToGlobal(target_btn.rect().center()).x()
+        stride = 10 if goal > origin_x.x() else -10
+        samples = []
+        for step_x in range(origin_x.x(), goal, stride):
+            app.sendEvent(src, QMouseEvent(
+                QEvent.Type.MouseMove,
+                QPointF(src.mapFromGlobal(QPoint(step_x, origin_x.y()))),
+                QPointF(step_x, origin_x.y()),
+                Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
+                Qt.KeyboardModifier.NoModifier))
+            marker = inbar._insert_marker
+            samples.append({
+                "slot": inbar._buttons.index(src),
+                "shown": marker.isVisibleTo(inbar),
+                "line": marker.x() + marker.line_x(),
+                "left": src.x(),
+                "right": src.x() + src.width(),
+            })
+        app.sendEvent(src, QMouseEvent(
+            QEvent.Type.MouseButtonRelease,
+            QPointF(src.mapFromGlobal(QPoint(goal, origin_x.y()))),
+            QPointF(goal, origin_x.y()),
+            Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
             Qt.KeyboardModifier.NoModifier))
-        if inbar._insert_marker.isVisible():
-            seen.append((
-                inbar._buttons.index(src2),
-                inbar._insert_marker.x() + inbar._insert_marker.line_x(),
-                src2.x(),
-            ))
-    check("列內拖曳排序途中會顯示指示線", bool(seen), str(seen[:3]))
-    check("指示線畫在被拖分頁的左緣（那就是它會插進去的縫）",
-          all(abs(line_x - btn_x) <= 1 for _slot, line_x, btn_x in seen),
-          str(seen[:3]))
-    check("跨過鄰居後指示線跟著換位置（不是釘在原地）",
-          len({slot for slot, _lx, _bx in seen}) > 1,
-          str(sorted({slot for slot, _lx, _bx in seen})))
-    app.sendEvent(src2, QMouseEvent(
+        pump(200)
+        return samples
+
+    # --- 往右拖：靠右 ---
+    right_samples = drag_along(0, 2)
+    moved_right = [s for s in right_samples if s["slot"] > 0]
+    at_origin_right = [s for s in right_samples if s["slot"] == 0]
+    check("往右拖：離開原位後指示線會出現",
+          bool(moved_right) and all(s["shown"] for s in moved_right),
+          str(moved_right[:2]))
+    check("往右拖：指示線畫在被拖分頁的**右**緣",
+          all(abs(s["line"] - s["right"]) <= 1 for s in moved_right),
+          str([(s["slot"], s["line"], s["right"]) for s in moved_right[:3]]))
+    check("往右拖：還在原位那幾步完全不畫",
+          all(not s["shown"] for s in at_origin_right),
+          str(at_origin_right[:2]))
+    check("往右拖：跨過鄰居後指示線跟著換位置",
+          len({s["slot"] for s in moved_right}) > 1,
+          str(sorted({s["slot"] for s in moved_right})))
+    check("列內排序放開後指示線收起",
+          not inbar._insert_marker.isVisibleTo(inbar))
+
+    # --- 往左拖：靠左 ---
+    # 上一段把第 0 格拖到第 2 格，所以現在從第 2 格往回拖
+    back_index = 2
+    left_samples = drag_along(back_index, 0)
+    moved_left = [s for s in left_samples if s["slot"] < back_index]
+    at_origin_left = [s for s in left_samples if s["slot"] == back_index]
+    check("往左拖：離開原位後指示線會出現",
+          bool(moved_left) and all(s["shown"] for s in moved_left),
+          str(moved_left[:2]))
+    check("往左拖：指示線畫在被拖分頁的**左**緣",
+          all(abs(s["line"] - s["left"]) <= 1 for s in moved_left),
+          str([(s["slot"], s["line"], s["left"]) for s in moved_left[:3]]))
+    check("往左拖：還在原位那幾步完全不畫",
+          all(not s["shown"] for s in at_origin_left),
+          str(at_origin_left[:2]))
+
+    # --- 在原位小幅晃動：從頭到尾都不該出現 ---
+    jiggle_src = inbar._buttons[1]
+    jiggle_start = jiggle_src.mapToGlobal(jiggle_src.rect().center())
+    app.sendEvent(jiggle_src, QMouseEvent(
+        QEvent.Type.MouseButtonPress, QPointF(jiggle_src.rect().center()),
+        QPointF(jiggle_start), Qt.MouseButton.LeftButton,
+        Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
+    jiggle_shown = []
+    for offset in (6, 12, 18, 12, 6, 0, -6, -12):
+        point = QPoint(jiggle_start.x() + offset, jiggle_start.y())
+        app.sendEvent(jiggle_src, QMouseEvent(
+            QEvent.Type.MouseMove, QPointF(jiggle_src.mapFromGlobal(point)),
+            QPointF(point), Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier))
+        jiggle_shown.append(
+            (inbar._buttons.index(jiggle_src),
+             inbar._insert_marker.isVisibleTo(inbar)))
+    app.sendEvent(jiggle_src, QMouseEvent(
         QEvent.Type.MouseButtonRelease,
-        QPointF(src2.mapFromGlobal(QPoint(target_x2, start2.y()))),
-        QPointF(target_x2, start2.y()),
+        QPointF(jiggle_src.mapFromGlobal(jiggle_start)), QPointF(jiggle_start),
         Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
         Qt.KeyboardModifier.NoModifier))
     pump(200)
-    check("列內排序放開後指示線收起", not inbar._insert_marker.isVisible())
+    check("在原位小幅晃動（沒跨過任何鄰居）從頭到尾不顯示指示線",
+          all(not shown for _slot, shown in jiggle_shown)
+          and len({slot for slot, _s in jiggle_shown}) == 1,
+          str(jiggle_shown))
+
+    # 上面三段拖曳把順序打亂了，後面的拆分／合併測試預期 d0, d1, d2。
+    for wanted, name in enumerate(sorted(names(viewer))):
+        viewer.move_tab(names(viewer).index(name), wanted)
+        pump(80)
+    viewer.activate_tab(0)
+    pump(150)
+    check("前置：拖曳測試後順序已復原成 d0, d1, d2",
+          names(viewer) == ["d0.md", "d1.md", "d2.md"], str(names(viewer)))
 
     # 容忍帶（列外 48px 內）仍會繼續重排，但線不能再畫在自己身上——
     # 那時游標可能正停在別的視窗的分頁列上，兩條線同時亮就分不清會插到哪。
@@ -4003,13 +4195,54 @@ def _run_sections_in_process(selected, args) -> int:
     return 1 if _FAIL else 0
 
 
+def _running_instance() -> bool:
+    """還有別的閱讀器實例活著嗎？
+
+    為什麼要擋：測試會直接讀寫真正的 QSettings（`HKCU\\Software\\SamHo\\
+    MarkdownReader`），也會佔用單一實例的具名管道。另一個實例同時在跑時，
+    兩邊會互相清設定——症狀是一整片「讀出來是 None」的失敗，看起來像功能壞了，
+    其實只是環境髒了。更糟的是實測會偶發 0xC0000005：乾淨的機器上單跑
+    分頁拖曳區塊 30 次沒有一次崩潰，故意留一個實例在跑則 6 次崩 1 次。
+
+    孤兒是自我延續的：區塊崩潰時它 spawn 的子行程會活下來，繼續污染後面每一輪。
+    所以這道檢查放在最前面，寧可不跑也不要產出一份看不懂的失敗清單。
+    """
+    from PyQt6.QtCore import QCoreApplication
+    from PyQt6.QtNetwork import QLocalSocket
+
+    if QCoreApplication.instance() is None:
+        QCoreApplication([])
+    probe = QLocalSocket()
+    probe.connectToServer(config.IPC_SERVER_NAME)
+    alive = probe.waitForConnected(300)
+    probe.abort()
+    return alive
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Markdown 閱讀器功能回歸測試")
     parser.add_argument("--only", default="", help="只跑名稱含這個字串的區塊")
     parser.add_argument("--list", action="store_true", help="列出所有區塊後結束")
     parser.add_argument("--runs", type=int, default=12,
                         help="穩定度測試的重複次數（預設 12）")
+    parser.add_argument(
+        "--ignore-running-instance", action="store_true",
+        help="即使偵測到別的實例在跑也照跑（結果不可信，只在確定無妨時用）",
+    )
     args = parser.parse_args()
+
+    if not args.ignore_running_instance and _running_instance():
+        print("偵測到另一個 Markdown 閱讀器實例正在執行。")
+        print("測試會讀寫真正的 QSettings 並佔用單一實例的管道，兩邊會打架：")
+        print("  * 一整片「設定讀出來是 None」的失敗")
+        print("  * 偶發 0xC0000005（乾淨機器 30 次不崩，留一個實例 6 次崩 1 次）")
+        print("請先關掉它再跑；崩潰留下的孤兒用這行清：")
+        print('  powershell -Command "Get-CimInstance Win32_Process -Filter '
+              "\"Name='python.exe' OR Name='py.exe'\" | Where-Object "
+              "{ $_.CommandLine -like '*probe*' } | ForEach-Object "
+              '{ Stop-Process -Id $_.ProcessId -Force }"')
+        print("確定無妨的話加 --ignore-running-instance 跳過這道檢查。")
+        return 2
 
     if args.list:
         for name, _ in SECTIONS:

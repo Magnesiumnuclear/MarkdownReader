@@ -12,8 +12,9 @@
 - 拖出列外（任一方向超過 TEAR_OFF_MARGIN）再放開 -> 發出 detachRequested，
   由視窗層決定是「拆成新視窗」還是「合併進游標下的另一個視窗」。
   分頁列自己不認識其他視窗，這個決定不屬於它。
-- 兩種情況都用同一個 InsertMarker 標出「會插在哪兩個之間」。列內重排時它
-  畫在被拖分頁自己的左緣——即時重排已經把它挪到目標槽位了，那條縫就是落點。
+- 兩種情況都用同一個 InsertMarker 標出「會插在哪兩個之間」。列內重排時畫在
+  被拖分頁**相對原位的那一側**：往左走畫左緣、往右走畫右緣、回到原位不畫
+  （見 _show_reorder_marker）。跨視窗那條由視窗層指定索引，不受這個規則影響。
 
 【關閉鈕是覆蓋層，不進版面】
 關閉鈕若排在版面裡，滑鼠移進移出就會讓分頁寬度跳一下（未選取的分頁平常不顯示
@@ -455,6 +456,9 @@ class TabBar(QFrame):
         self._theme = config.DEFAULT_THEME
         self._buttons: list[TabButton] = []
         self._drag_button: TabButton | None = None
+        # 按下的那一刻它排在第幾格。即時重排會一直改變它「現在」的位置，
+        # 但指示線要畫哪一側是拿現在和**原位**比出來的，所以原位要單獨記著。
+        self._drag_origin: int | None = None
         self._torn_off = False
         self._ghost: DragGhost | None = None
         # 由視窗層注入：callable(global_pos, outside_band) -> "merge"|"detach"|"none"。
@@ -568,6 +572,10 @@ class TabBar(QFrame):
     def _on_drag_started(self, button: TabButton) -> None:
         self._drag_button = button
         self._torn_off = False
+        try:
+            self._drag_origin = self._buttons.index(button)
+        except ValueError:
+            self._drag_origin = None
 
     def _on_drag_moved(self, global_pos: QPoint) -> None:
         button = self._drag_button
@@ -643,25 +651,57 @@ class TabBar(QFrame):
         if target != current:
             self._move_button(current, target)
             self.tabMoved.emit(current, target)
-        # 即時重排已經把它挪到目標槽位，所以「會插在哪」就是它自己現在的位置。
-        # 畫在它的左緣；拖到最後一格時左緣仍在最後一個縫上，語意不變。
-        #
         # 【只在游標真的落在本列上時才畫】容忍帶（列外 48px 內）也會走到這裡
         # 繼續重排，但那時游標可能正停在**別的視窗**的分頁列上、上面那段
         # 已經請 drop_intent_probe 在那邊畫了一條。不擋的話兩條線同時亮，
         # 使用者無從知道放開會插到哪一個。
         if on_bar:
-            self.show_insert_marker(self._buttons.index(button))
+            self._show_reorder_marker(button)
+        else:
+            self.hide_insert_marker()
+
+    def _show_reorder_marker(self, button: TabButton) -> None:
+        """列內重排：把指示線畫在「相對按下時那一格」的那一側。
+
+        即時重排已經把分頁挪到目標槽位，所以它現在佔的位置就是落點。線要畫
+        哪一側，看它相對原位往哪個方向走：
+
+            往左走   -> 畫在它的左緣（那正是它擠進去的那條縫）
+            往右走   -> 畫在它的右緣
+            還在原位 -> 完全不畫
+
+        原位不畫是刻意的：那一刻放開等於什麼都沒發生，畫一條線反而讓人以為
+        順序會變。這也順帶讓「按著不動微微晃」不會閃出一條線。
+
+        右緣＝下一格的左緣，所以傳 now + 1；now 是最後一格時 show_insert_marker
+        會退回「最後一個分頁的右緣」，語意一樣。
+        """
+        try:
+            now = self._buttons.index(button)
+        except ValueError:
+            self.hide_insert_marker()
+            return
+        origin = self._drag_origin
+        if origin is None or now == origin:
+            self.hide_insert_marker()
+            return
+        self.show_insert_marker(now if now < origin else now + 1)
 
     def _move_button(self, frm: int, to: int) -> None:
         button = self._buttons.pop(frm)
         self._buttons.insert(to, button)
         self._row.removeWidget(button)
         self._row.insertWidget(to, button)
+        # 立刻套用新版面。insertWidget 只是排程一次 LayoutRequest，在它跑完之前
+        # 每顆按鈕的 x() 都還是舊槽位的值——而插入指示線正是用 buttons[i].x()
+        # 定位的，晚一拍就會畫在隔壁那條縫上，而且要等下一次滑鼠移動才更正。
+        # 使用者跨過一個鄰居就停手時，線會一直停在錯的地方。
+        self._row.activate()
 
     def _on_drag_released(self, global_pos: QPoint) -> None:
         button = self._drag_button
         self._drag_button = None
+        self._drag_origin = None
         self._dispose_ghost()
         if self._torn_off:
             self._torn_off = False
@@ -706,6 +746,9 @@ class TabBar(QFrame):
         self._cancel_drag()
 
     def _cancel_drag(self) -> None:
+        # 原位和被拖的按鈕同生共死：留著上一輪的索引，下一次拖曳會拿錯世代的
+        # 格子來比，方向就會反過來。
+        self._drag_origin = None
         if self._drag_button is not None:
             self._drag_button.cancel_drag()
             self._drag_button = None
