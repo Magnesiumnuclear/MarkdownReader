@@ -1040,6 +1040,37 @@ py -3.13 tools/benchmark_startup.py
 `build.ps1` 兩種模式都會自動檢查相依套件、必要時產生圖示，並在結尾印出測試指令與
 註冊關聯的指令，不需要自己記參數。
 
+**不要繞過 `build.ps1` 直接跑 PyInstaller。** 資料夾版的 COLLECT 階段會把整個
+`dist\MarkdownReader-onedir\` 刪掉重建，`MarkdownOpen.exe` 一起消失；只有第 5 步
+會把它複製回去。少了它，檔案關聯指向的檔案不存在，症狀是 `.md` 的圖示變成白紙、
+雙擊完全沒反應，而且沒有任何錯誤訊息。
+
+#### 為什麼腳本裡的外部程式都包了一層 `Invoke-Native`
+
+PowerShell 5.1 在 `$ErrorActionPreference = "Stop"` 之下，外部程式**只要往 stderr
+寫一行**就會被包成 `NativeCommandError` 並當作終止錯誤。而 PyInstaller 的進度訊息
+全部走 stderr——於是打包才剛開始腳本就中斷，第 5 步永遠不會執行。這正是上面那個
+「關聯指向不存在的檔案」的成因，而且畫面上看起來只是一段紅字，很容易當成雜訊。
+
+同一個包裝還會讓 `$?` 變成 `$false`（即使程式回傳 0），而且 `$?` 會被後續任何一次
+賦值重設——原本第 5 步寫成 `$exe = …` 之後才 `if ($?)`，等於完全沒檢查 cmake 的成敗。
+
+所以腳本裡的外部程式一律經過 `Invoke-Native`：它把 `ErrorActionPreference` 暫時降成
+`Continue`、把 stderr 併進輸出流轉成字串（擷取輸出時才不會整片紅字），事後只看
+`$LASTEXITCODE`。判定因此比從前**更嚴格**而不是更寬鬆：
+
+| 情況 | 從前 | 現在 |
+|---|---|---|
+| PyInstaller 印進度到 stderr | 腳本中斷，第 5 步不執行 | 正常跑完 |
+| PyInstaller 真的失敗 | 靠最後的 `Test-Path` 才發現 | 第 4 步就地停、回傳 1 |
+| 產生圖示失敗 | 完全沒檢查 | 就地停 |
+| cmake 失敗 | `$?` 已被賦值重設，等於沒檢查 | 用 `$LASTEXITCODE` 判定 |
+| 打包成功 | 沿用最後一個外部程式的結束碼 | 明確 `exit 0` |
+
+`tools/smoke_test.py` 的「單一實例」區塊有一組靜態檢查釘住這些：BOM 還在、
+PyInstaller 沒有裸呼叫、沒有用 `$?` 判斷外部程式、失敗會 `exit 1`、第 5 步會把
+轉交器複製進 dist 的兩個位置。放在那一節是因為轉交器正是單一實例的快路徑。
+
 ### 為什麼第一步要先關掉程式
 
 程式還開著時 PyInstaller 無法覆寫執行檔，兩種打包方式都會失敗：
@@ -1184,6 +1215,7 @@ assets/icons/*.svg          所有 UI 圖示
 | **改了程式，雙擊開起來還是舊的** | 編到了另一個產物。確認關聯指向哪個版本，用對應的 `build.ps1` 或 `build.ps1 -OneDir`（見「改完程式之後的重新編譯流程」） |
 | **編譯失敗 `PermissionError: [WinError 5]`** | 程式還開著，執行檔被鎖住。先 `taskkill /F /IM MarkdownReader.exe` 再編譯 |
 | 雙擊 `.md` 跳「找不到應用程式」 | 關聯指向的檔案被刪掉或搬走了。重新編譯回原路徑即可，不需要重新註冊 |
+| **`.md` 圖示變白紙、雙擊完全沒反應** | `dist` 裡的 `MarkdownOpen.exe` 不見了——多半是繞過 `build.ps1` 直接跑 PyInstaller，資料夾版的 COLLECT 會把整個目錄刪掉重建。重跑 `build.ps1`，或從 `build\cmake\release\` 複製回去 |
 | 編輯 `build.ps1` 後出現 parser error、中文變亂碼 | `.ps1` 必須存成 **UTF-8 with BOM**。PowerShell 5.1 讀沒有 BOM 的檔案會當成 ANSI（繁中系統為 cp950），中文會壞掉並讓字串沒有結尾 |
 | 打包後圖示全部空白 | 確認打包指令有 `--add-data "assets;assets"` 與 `--hidden-import PyQt6.QtSvg` |
 | 程式沒有畫面就消失 | 查看 `%LOCALAPPDATA%\MarkdownReader\error.log`，未攔截的例外都會寫在這裡 |

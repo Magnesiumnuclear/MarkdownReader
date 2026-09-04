@@ -2046,6 +2046,56 @@ def section_single_instance(args) -> None:
               config.IPC_SERVER_NAME in pipe_line,
               pipe_line.strip() or "(找不到 kPipePath)")
 
+    # --- build.ps1 不能被 stderr 中斷 ---
+    # 為什麼這條在「單一實例」這一節：轉交器只有 build.ps1 的第 5 步會產出並
+    # 複製進 dist。腳本若在第 4 步中斷，第 5 步不會跑，dist 裡就沒有
+    # MarkdownOpen.exe——而檔案關聯正是指向它。症狀是 .md 圖示變白紙、雙擊
+    # 完全沒反應，也沒有任何錯誤訊息，等於單一實例的快路徑整條消失。真的發生過。
+    LF = chr(10)
+    build_script = os.path.join(PROJECT_ROOT, "build.ps1")
+    if os.path.isfile(build_script):
+        script_bytes = open(build_script, "rb").read()
+        check("build.ps1 存成 UTF-8 with BOM"
+              "（沒有 BOM 的話 PowerShell 5.1 當成 cp950，中文全毀）",
+              script_bytes.startswith(b"\xef\xbb\xbf"),
+              str(script_bytes[:4]))
+        ps1 = script_bytes.decode("utf-8-sig")
+
+        # 要連大括號一起比對：只找 "function Invoke-Native" 的話，
+        # 改名成 Invoke-NativeRenamed 也會通過（子字串）。
+        check("build.ps1 有 Invoke-Native（外部程式的統一入口）",
+              re.search(r"function\s+Invoke-Native\s*\{", ps1) is not None)
+        # PowerShell 5.1 在 $ErrorActionPreference = "Stop" 下，外部程式往 stderr
+        # 寫任何一行都會被包成終止錯誤。PyInstaller 的進度訊息全走 stderr。
+        bare_calls = [
+            line.strip() for line in ps1.splitlines()
+            if "PyInstaller" in line and "Invoke-Native" not in line
+            and not line.strip().startswith("#")
+            and ("py -3.13" in line or "& " in line)
+        ]
+        check("PyInstaller 一律經由 Invoke-Native 呼叫（裸呼叫會被 stderr 中斷）",
+              not bare_calls, str(bare_calls))
+        # $? 在外部程式之後不可靠：stderr 被包裝會讓它變 False，而且任何一次
+        # 賦值都會把它重設。唯一可信的是 $LASTEXITCODE。
+        # 只看會執行的行：說明為什麼別用 $? 的註解本身也含 $?，
+        # 不濾掉的話這條會被自己的文件釘死。
+        code_only = re.sub(r"<#.*?#>", "", ps1, flags=re.S)
+        code_only = LF.join(
+            line for line in code_only.splitlines()
+            if not line.strip().startswith("#")
+        )
+        check("不用 $? 判斷外部程式的成敗（改用 $LASTEXITCODE）",
+              "$?" not in code_only,
+              next((line.strip() for line in code_only.splitlines()
+                    if "$?" in line), ""))
+        check("PyInstaller 失敗會就地停，不讓第 5 步在半成品上跑",
+              "$packed -ne 0" in ps1 and "exit 1" in ps1)
+        check("第 5 步會把轉交器複製進 dist 的兩個位置",
+              'foreach ($dest in @("dist", "dist\\MarkdownReader-onedir"))' in ps1,
+              "找不到複製轉交器那一段")
+        check("成功時明確回 0（不然會沿用最後一個外部程式的結束碼）",
+              "exit 0" in ps1)
+
     pipe_name = f"MarkdownReaderSmokeTest.{os.getpid()}"
     original_pipe = config.IPC_SERVER_NAME
     config.IPC_SERVER_NAME = pipe_name
