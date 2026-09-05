@@ -2492,162 +2492,168 @@ def section_tab_dnd(args) -> None:
           [b._name for b in viewer.tab_bar._buttons] == names(viewer))
     check("放開後列內的指示線收起", not viewer.tab_bar._insert_marker.isVisible())
 
-    # 列內排序只有一條規則：游標在按下點右邊就畫右緣、左邊就畫左緣，
-    # 不分有沒有離開原位。基準用按下點而不是分頁中心——抓取點可能落在分頁任何
-    # 位置，用中心比的話，同樣往右拖一點點，抓左半邊和抓右半邊會得到相反的結果。
+    # 列內排序只有一條規則：游標落在被拖分頁的哪一半，就畫那一側的緣——
+    # 右半畫右緣、左半畫左緣。看的是游標**此刻**相對被拖分頁的位置，不是相對
+    # 按下點：往右拖到底再往回晃，一過中心就翻左緣，不會停在「你往右移過」。
     inbar = viewer.tab_bar
 
-    def drag_along(from_index, to_index):
-        """把第 from_index 個分頁拖到第 to_index 個分頁，沿路取樣。
+    def _side(sample):
+        """這一筆該畫哪一側：靠左緣傳 "L"、靠右緣傳 "R"、沒顯示傳 "-"。"""
+        if not sample["shown"]:
+            return "-"
+        if abs(sample["line"] - sample["left"]) <= 1:
+            return "L"
+        if abs(sample["line"] - sample["right"]) <= 1:
+            return "R"
+        return "?"
 
-        【手勢進行中絕對不要跑巢狀事件迴圈】這裡曾經每一步都 pump(30) 來等
-        版面更新，結果是後面的測試隨機以 0xC0000005 崩潰在
-        FramelessResizer._drag_controls——巢狀迴圈會把排隊中的 deleteLater
-        沖出來，在拖曳中途銷毀元件，留下懸空指標。改成不 pump：
-        _move_button 現在會自己 activate() 版面，buttons[i].x() 當場就是對的。
+    def sweep(src, xs):
+        """按下 src，游標依序移到 xs 這些全域 x，每一步取樣，最後放開。
+
+        【手勢進行中絕對不要跑巢狀事件迴圈】這裡曾經每一步 pump(30)，害後面的
+        測試隨機 0xC0000005 崩在 FramelessResizer——巢狀迴圈把排隊的 deleteLater
+        沖出來，拖曳中途銷毀元件留下懸空指標。改成不 pump：_move_button 會自己
+        activate() 版面，buttons[i].x() 當場就是對的。
         """
-        src = inbar._buttons[from_index]
-        origin_x = src.mapToGlobal(src.rect().center())
+        y = src.mapToGlobal(src.rect().center()).y()
         app.sendEvent(src, QMouseEvent(
             QEvent.Type.MouseButtonPress, QPointF(src.rect().center()),
-            QPointF(origin_x), Qt.MouseButton.LeftButton,
-            Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
-        target_btn = inbar._buttons[to_index]
-        if to_index > from_index:
-            # 往右要拖到目標格的**右緣**：被拖的分頁一往右走，其他分頁就同步
-            # 往左遞補，它們的中心跟著左移，只拖到中心點會少跨一格。
-            goal = target_btn.mapToGlobal(target_btn.rect().topRight()).x()
-        else:
-            goal = target_btn.mapToGlobal(target_btn.rect().center()).x()
-        stride = 10 if goal > origin_x.x() else -10
+            QPointF(src.mapToGlobal(src.rect().center())),
+            Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier))
+        bar_left = inbar.mapToGlobal(inbar.rect().topLeft()).x()
+        bar_right = bar_left + inbar.rect().width()
         samples = []
-        for step_x in range(origin_x.x(), goal, stride):
+        for raw_gx in xs:
+            gx = max(bar_left + 6, min(raw_gx, bar_right - 6))
+            pt = QPoint(gx, y)
             app.sendEvent(src, QMouseEvent(
-                QEvent.Type.MouseMove,
-                QPointF(src.mapFromGlobal(QPoint(step_x, origin_x.y()))),
-                QPointF(step_x, origin_x.y()),
-                Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
+                QEvent.Type.MouseMove, QPointF(src.mapFromGlobal(pt)),
+                QPointF(pt), Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
                 Qt.KeyboardModifier.NoModifier))
             marker = inbar._insert_marker
+            strip_x = inbar._strip.mapFromGlobal(pt).x()
             samples.append({
                 "slot": inbar._buttons.index(src),
-                # 前幾步可能還沒超過 startDragDistance，手勢根本還沒開始，
-                # 那時當然什麼都不該畫。用 _drag_press_x 有沒有值來分辨，
-                # 而不是「跳過第一筆」那種看心情的規則。
-                "dragging": inbar._drag_press_x is not None,
+                # 手勢還沒真的開始（沒超過 startDragDistance）時 _drag_button 是
+                # None，那時什麼都不該畫。用它當旗標，不用「跳過第一筆」的土法。
+                "dragging": inbar._drag_button is not None,
                 "shown": marker.isVisibleTo(inbar),
                 "line": marker.x() + marker.line_x(),
                 "left": src.x(),
                 "right": src.x() + src.width(),
+                # 游標此刻相對被拖分頁中心：>0 在右半、<0 在左半
+                "rel": strip_x - (src.x() + src.width() // 2),
             })
         app.sendEvent(src, QMouseEvent(
-            QEvent.Type.MouseButtonRelease,
-            QPointF(src.mapFromGlobal(QPoint(goal, origin_x.y()))),
-            QPointF(goal, origin_x.y()),
-            Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
+            QEvent.Type.MouseButtonRelease, QPointF(src.mapFromGlobal(pt)),
+            QPointF(pt), Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
             Qt.KeyboardModifier.NoModifier))
         pump(200)
         return samples
 
-    # --- 往右拖：靠右 ---
-    right_samples = drag_along(0, 2)
-    moved_right = [s for s in right_samples if s["slot"] > 0 and s["dragging"]]
-    at_origin_right = [
-        s for s in right_samples if s["slot"] == 0 and s["dragging"]]
+    def _rule_holds(samples):
+        """有顯示的每一筆，側邊都要吻合「游標落在哪一半」。中心線±2px 的模糊帶
+        不計（版面剛換槽位時中心會抖一兩像素）。"""
+        bad = []
+        for s in samples:
+            if not s["dragging"] or not s["shown"] or abs(s["rel"]) <= 2:
+                continue
+            want = "R" if s["rel"] > 0 else "L"
+            if _side(s) != want:
+                bad.append((s["slot"], s["rel"], _side(s), want))
+        return bad
+
+    src0 = inbar._buttons[0]
+    base = src0.mapToGlobal(src0.rect().center()).x()
+
+    # --- 往右拖：游標一路在被拖分頁右半 -> 一路右緣 ---
+    right_samples = sweep(src0, list(range(base, base + 400, 8)))
+    active_right = [s for s in right_samples if s["dragging"] and s["shown"]]
     check("往右拖：離開原位後指示線會出現",
-          bool(moved_right) and all(s["shown"] for s in moved_right),
-          str(moved_right[:2]))
-    check("往右拖：游標在按下點右邊，指示線畫在**右**緣",
-          all(abs(s["line"] - s["right"]) <= 1 for s in moved_right),
-          str([(s["slot"], s["line"], s["right"]) for s in moved_right[:3]]))
-    # 往右拖時，游標一路都在按下點右邊，所以連還沒換格子的那幾步也該畫右緣
-    check("往右拖：還沒換格子時就已經畫在右緣（同一條規則）",
-          bool(at_origin_right)
-          and all(s["shown"] and abs(s["line"] - s["right"]) <= 1
-                  for s in at_origin_right),
-          str([(s["slot"], s["shown"], s["line"], s["right"])
-               for s in at_origin_right[:3]]))
+          bool(active_right) and any(s["slot"] > 0 for s in active_right),
+          str([(s["slot"], _side(s)) for s in active_right[:3]]))
+    check("往右拖：游標在被拖分頁右半，指示線畫在**右**緣",
+          all(_side(s) == "R" for s in active_right),
+          str([(s["slot"], _side(s), s["rel"]) for s in active_right[:4]]))
     check("往右拖：跨過鄰居後指示線跟著換位置",
-          len({s["slot"] for s in moved_right}) > 1,
-          str(sorted({s["slot"] for s in moved_right})))
+          len({s["slot"] for s in active_right}) > 1,
+          str(sorted({s["slot"] for s in active_right})))
     check("列內排序放開後指示線收起",
           not inbar._insert_marker.isVisibleTo(inbar))
 
-    # --- 往左拖：靠左 ---
-    # 上一段把第 0 格拖到第 2 格，所以現在從第 2 格往回拖
-    back_index = 2
-    left_samples = drag_along(back_index, 0)
-    moved_left = [
-        s for s in left_samples if s["slot"] < back_index and s["dragging"]]
-    at_origin_left = [
-        s for s in left_samples if s["slot"] == back_index and s["dragging"]]
-    check("往左拖：離開原位後指示線會出現",
-          bool(moved_left) and all(s["shown"] for s in moved_left),
-          str(moved_left[:2]))
-    check("往左拖：游標在按下點左邊，指示線畫在**左**緣",
-          all(abs(s["line"] - s["left"]) <= 1 for s in moved_left),
-          str([(s["slot"], s["line"], s["left"]) for s in moved_left[:3]]))
-    check("往左拖：還沒換格子時就已經畫在左緣（同一條規則）",
-          bool(at_origin_left)
-          and all(s["shown"] and abs(s["line"] - s["left"]) <= 1
-                  for s in at_origin_left),
-          str([(s["slot"], s["shown"], s["line"], s["left"])
-               for s in at_origin_left[:3]]))
+    # --- 往左拖回來：游標一路在左半 -> 一路左緣 ---
+    src_now = next(b for b in inbar._buttons if b is src0)
+    left_from = src_now.mapToGlobal(src_now.rect().center()).x()
+    left_samples = sweep(src_now, list(range(left_from, left_from - 400, -8)))
+    active_left = [s for s in left_samples if s["dragging"] and s["shown"]]
+    check("往左拖：游標在被拖分頁左半，指示線畫在**左**緣",
+          bool(active_left) and all(_side(s) == "L" for s in active_left),
+          str([(s["slot"], _side(s), s["rel"]) for s in active_left[:4]]))
 
-    # --- 在原位左右晃動：指示線要跟著滑鼠換邊 ---
-    # 這一段完全不跨過鄰居（位移都小於半個分頁寬），所以格子從頭到尾不變，
-    # 唯一的依據就是游標在按下點的哪一邊。
-    jiggle_src = inbar._buttons[1]
-    jiggle_start = jiggle_src.mapToGlobal(jiggle_src.rect().center())
-    app.sendEvent(jiggle_src, QMouseEvent(
-        QEvent.Type.MouseButtonPress, QPointF(jiggle_src.rect().center()),
-        QPointF(jiggle_start), Qt.MouseButton.LeftButton,
+    # --- 往右拖到底再往回晃：關鍵——一過中心就翻左緣，不停在「往右移過」---
+    # 這條抓的正是使用者要的：以游標當下位置判左右，而不是相對按下點。
+    src_r = inbar._buttons[0]
+    r_base = src_r.mapToGlobal(src_r.rect().center()).x()
+    forward = list(range(r_base, r_base + 400, 8))
+    backward = list(range(r_base + 400, r_base - 20, -8))
+    reverse_samples = sweep(src_r, forward + backward)
+    check("往右拖再往回晃：任何時刻的側邊都吻合游標落在哪一半",
+          not _rule_holds(reverse_samples),
+          str(_rule_holds(reverse_samples)[:4]))
+    # 回晃途中一定要出現「曾經右緣、後來左緣」，才證明它真的翻過來
+    active_rev = [_side(s) for s in reverse_samples if s["dragging"] and s["shown"]]
+    check("往右拖再往回晃：側邊確實從右緣翻成左緣（不是一路右緣）",
+          "R" in active_rev and "L" in active_rev
+          and active_rev.index("L") > active_rev.index("R"),
+          str(active_rev))
+
+    # --- 在中心線附近左右晃：右半右緣、左半左緣、正中不畫 ---
+    jig = inbar._buttons[1]
+    jig_centre = jig.mapToGlobal(jig.rect().center())
+    app.sendEvent(jig, QMouseEvent(
+        QEvent.Type.MouseButtonPress, QPointF(jig.rect().center()),
+        QPointF(jig_centre), Qt.MouseButton.LeftButton,
         Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
     jiggle = []
-    # 第一步要夠大才會超過拖曳起始距離，手勢真正開始
     for offset in (20, 28, 20, 0, -20, -28, -20):
-        point = QPoint(jiggle_start.x() + offset, jiggle_start.y())
-        app.sendEvent(jiggle_src, QMouseEvent(
-            QEvent.Type.MouseMove, QPointF(jiggle_src.mapFromGlobal(point)),
+        point = QPoint(jig_centre.x() + offset, jig_centre.y())
+        app.sendEvent(jig, QMouseEvent(
+            QEvent.Type.MouseMove, QPointF(jig.mapFromGlobal(point)),
             QPointF(point), Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
             Qt.KeyboardModifier.NoModifier))
         marker = inbar._insert_marker
         jiggle.append({
             "offset": offset,
-            "slot": inbar._buttons.index(jiggle_src),
+            "slot": inbar._buttons.index(jig),
             "shown": marker.isVisibleTo(inbar),
             "line": marker.x() + marker.line_x(),
-            "left": jiggle_src.x(),
-            "right": jiggle_src.x() + jiggle_src.width(),
+            "left": jig.x(),
+            "right": jig.x() + jig.width(),
         })
-    app.sendEvent(jiggle_src, QMouseEvent(
+    app.sendEvent(jig, QMouseEvent(
         QEvent.Type.MouseButtonRelease,
-        QPointF(jiggle_src.mapFromGlobal(jiggle_start)), QPointF(jiggle_start),
+        QPointF(jig.mapFromGlobal(jig_centre)), QPointF(jig_centre),
         Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
         Qt.KeyboardModifier.NoModifier))
     pump(200)
-
-    check("前置：原位晃動全程沒有換過格子（不然測到的是另一條規則）",
+    check("前置：中心線附近晃動全程沒有換過格子（不然測到的是別的東西）",
           len({s["slot"] for s in jiggle}) == 1,
           str(sorted({s["slot"] for s in jiggle})))
-    check("原位往右晃：畫在右緣",
-          all(s["shown"] and abs(s["line"] - s["right"]) <= 1
-              for s in jiggle if s["offset"] > 0),
-          str([(s["offset"], s["shown"], s["line"], s["right"])
-               for s in jiggle if s["offset"] > 0]))
-    check("原位往左晃：畫在左緣",
-          all(s["shown"] and abs(s["line"] - s["left"]) <= 1
-              for s in jiggle if s["offset"] < 0),
-          str([(s["offset"], s["shown"], s["line"], s["left"])
-               for s in jiggle if s["offset"] < 0]))
-    check("游標正好回到按下點時不畫（沒有左右可言）",
-          all(not s["shown"] for s in jiggle if s["offset"] == 0),
-          str([s for s in jiggle if s["offset"] == 0]))
+    check("游標在中心右邊：畫右緣",
+          all(_side(s) == "R" for s in jiggle if s["offset"] > 0),
+          str([(s["offset"], _side(s)) for s in jiggle if s["offset"] > 0]))
+    check("游標在中心左邊：畫左緣",
+          all(_side(s) == "L" for s in jiggle if s["offset"] < 0),
+          str([(s["offset"], _side(s)) for s in jiggle if s["offset"] < 0]))
+    check("游標落在正中心：仍顯示一側（拖曳中不會 flicker 成空白）",
+          all(s["shown"] for s in jiggle if s["offset"] == 0),
+          str([(s["offset"], _side(s)) for s in jiggle if s["offset"] == 0]))
 
-    # --- 基準是「按下點」，不是「分頁中心」 ---------------------------------
-    # 上面每一段都抓分頁正中央，那時按下點正好等於中心，兩種基準給的答案一樣，
-    # 分不出來。這一段刻意抓左邊緣附近，再把游標移到「比按下點右、但仍在中心
-    # 左邊」的位置：按下點基準 -> 右緣，分頁中心基準 -> 左緣，結論相反。
+    # --- 基準是「被拖分頁中心」，不是「按下點」 -----------------------------
+    # 抓分頁左邊緣按下，再把游標移到「比按下點右、但仍在分頁中心左邊」。
+    # 中心基準 -> 左緣（游標在左半）；若還用按下點基準 -> 右緣。結論相反，
+    # 這條專門把「不是按下點」釘住。
     off_src = inbar._buttons[1]
     grab = QPoint(8, off_src.height() // 2)          # 靠左邊緣按下
     off_start = off_src.mapToGlobal(grab)
@@ -2655,14 +2661,11 @@ def section_tab_dnd(args) -> None:
         QEvent.Type.MouseButtonPress, QPointF(grab), QPointF(off_start),
         Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
         Qt.KeyboardModifier.NoModifier))
-    # 移到按下點右邊 24px：仍在這一格內（沒跨過鄰居中心），也仍在分頁中心左邊
     off_to = QPoint(off_start.x() + 24, off_start.y())
     app.sendEvent(off_src, QMouseEvent(
         QEvent.Type.MouseMove, QPointF(off_src.mapFromGlobal(off_to)),
         QPointF(off_to), Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
         Qt.KeyboardModifier.NoModifier))
-    # 所有數值都要在**放開之前**取樣：放開會把指示線收起來，
-    # 拖到 check() 才讀 isVisibleTo 一定是 False（這裡踩過一次）。
     off_marker = inbar._insert_marker
     off_slot = inbar._buttons.index(off_src)
     off_shown = off_marker.isVisibleTo(inbar)
@@ -2675,12 +2678,11 @@ def section_tab_dnd(args) -> None:
         QPointF(off_to), Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
         Qt.KeyboardModifier.NoModifier))
     pump(200)
-
     check("前置：這一步沒有換格子，而且游標還在分頁中心的左邊",
           off_slot == 1 and off_to.x() < off_centre_x,
           f"格子 {off_slot}，游標 {off_to.x()} vs 中心 {off_centre_x}")
-    check("基準是按下點而不是分頁中心（抓左緣往右移一點 -> 右緣）",
-          off_shown and abs(off_line - off_right) <= 1,
+    check("基準是被拖分頁中心（抓左緣往右移到中心左側 -> 仍是左緣）",
+          off_shown and abs(off_line - off_left) <= 1,
           f"線 {off_line}，左緣 {off_left}，右緣 {off_right}，顯示={off_shown}")
 
     # 上面三段拖曳把順序打亂了，後面的拆分／合併測試預期 d0, d1, d2。

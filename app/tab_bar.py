@@ -13,8 +13,9 @@
   由視窗層決定是「拆成新視窗」還是「合併進游標下的另一個視窗」。
   分頁列自己不認識其他視窗，這個決定不屬於它。
 - 兩種情況都用同一個 InsertMarker 標出「會插在哪兩個之間」。列內重排時只有
-  一條規則：**滑鼠相對按下點在右邊就畫右緣、在左邊就畫左緣**（見
-  _show_reorder_marker）。跨視窗那條由視窗層指定索引，不受這個規則影響。
+  一條規則：**游標落在被拖分頁的哪一半，就畫那一側的緣**——右半畫右緣、左半
+  畫左緣，拖曳中一律顯示一側（見 _show_reorder_marker）。跨視窗那條由視窗層
+  指定索引，不受影響。
 
 【關閉鈕是覆蓋層，不進版面】
 關閉鈕若排在版面裡，滑鼠移進移出就會讓分頁寬度跳一下（未選取的分頁平常不顯示
@@ -418,13 +419,6 @@ class TabButton(QFrame):
             return
         super().mouseReleaseEvent(event)
 
-    def press_x(self) -> int | None:
-        """按下當下的全域 x；拖曳中用來判斷滑鼠往左還是往右移。
-
-        回傳 None 代表現在沒有進行中的手勢（放開或取消後會清掉）。
-        """
-        return None if self._press_pos is None else self._press_pos.x()
-
     def grab_offset(self) -> QPoint:
         """按下時游標落在這顆分頁內的位置；拖曳幽靈靠它維持相對跟隨。
 
@@ -465,9 +459,6 @@ class TabBar(QFrame):
         self._drag_button: TabButton | None = None
         # 按下的那一刻它排在第幾格。即時重排會一直改變它「現在」的位置，
         # 但指示線要畫哪一側是拿現在和**原位**比出來的，所以原位要單獨記著。
-        # 按下當下的全域 x。指示線畫哪一側，全靠現在的游標和它比。
-        # 同時兼任「手勢有沒有真的開始」的旗標：超過 startDragDistance 才會有值。
-        self._drag_press_x: int | None = None
         self._torn_off = False
         self._ghost: DragGhost | None = None
         # 由視窗層注入：callable(global_pos, outside_band) -> "merge"|"detach"|"none"。
@@ -581,7 +572,6 @@ class TabBar(QFrame):
     def _on_drag_started(self, button: TabButton) -> None:
         self._drag_button = button
         self._torn_off = False
-        self._drag_press_x = button.press_x()
 
     def _on_drag_moved(self, global_pos: QPoint) -> None:
         button = self._drag_button
@@ -667,35 +657,35 @@ class TabBar(QFrame):
             self.hide_insert_marker()
 
     def _show_reorder_marker(self, button: TabButton, global_pos: QPoint) -> None:
-        """列內重排：指示線畫在「滑鼠相對按下點」的那一側。
+        """列內重排：指示線畫在「游標落在被拖分頁哪一半」的那一側。
 
-            游標在按下點右邊 -> 畫這格的右緣
-            游標在按下點左邊 -> 畫這格的左緣
-            正好在按下點上   -> 不畫（沒有左右可言）
+            游標在被拖分頁的右半（含正中心）-> 畫這格的右緣
+            游標在被拖分頁的左半           -> 畫這格的左緣
 
-        只有這一條規則，不分「有沒有離開原位」。以前那版還會比對「現在的格子
-        vs 按下時那一格」，多一個特例卻幾乎不會給出不同答案：重排的目標格是
-        游標 x 的單調函數，游標往右一定不會換到更左的格子，所以兩種判斷在一般
-        拖曳過程中一致。既然一致，留著特例只是多一份要維護的狀態。
+        拖曳進行中一律顯示一側，不設「正中心不畫」的中性帶——那需要像素精準的
+        相等判斷（分頁寬是偶數，中心落在兩像素之間），實際上永遠不會剛好命中，
+        徒增一個測不準的分支。正中心歸右半，簡單且不會 flicker。
 
-        基準刻意用**按下點**而不是分頁中心：抓取點可能落在分頁的任何位置，拿
-        中心比的話，同樣往右拖一點點，抓左半邊和抓右半邊會得到相反的結果。
-        按下點才是使用者心裡的起點。
+        判斷的是**游標此刻相對被拖分頁的位置**，不是相對按下點。差別只在「往右
+        拖到底之後再往回晃」：按下點版會一直停在右緣（只顯示「你從起點往右
+        移」），中心版一往回越過中心就翻成左緣，貼著游標當下在哪。使用者要的是
+        後者——「以滑鼠相對位置是左還是右」。
+
+        因為列內即時重排會把被拖分頁一路挪到游標下，指示線本來就貼在它的邊上；
+        這條規則只決定貼哪一邊。用被拖分頁自己的中心當界，抓取點落在哪裡都一樣
+        （抓左半或右半不影響），純看游標現在偏哪邊。
 
         右緣＝下一格的左緣，所以傳 now + 1；now 是最後一格時 show_insert_marker
         會退回「最後一個分頁的右緣」，語意一樣。
         """
-        press_x = self._drag_press_x
-        if press_x is None or global_pos.x() == press_x:
-            # press_x 是 None 代表手勢還沒真的開始（沒超過 startDragDistance）
-            self.hide_insert_marker()
-            return
         try:
             now = self._buttons.index(button)
         except ValueError:
             self.hide_insert_marker()
             return
-        self.show_insert_marker(now + 1 if global_pos.x() > press_x else now)
+        strip_x = self._strip.mapFromGlobal(global_pos).x()
+        centre = button.x() + button.width() // 2
+        self.show_insert_marker(now + 1 if strip_x >= centre else now)
 
     def _move_button(self, frm: int, to: int) -> None:
         button = self._buttons.pop(frm)
@@ -711,7 +701,6 @@ class TabBar(QFrame):
     def _on_drag_released(self, global_pos: QPoint) -> None:
         button = self._drag_button
         self._drag_button = None
-        self._drag_press_x = None
         self._dispose_ghost()
         if self._torn_off:
             self._torn_off = False
@@ -756,9 +745,6 @@ class TabBar(QFrame):
         self._cancel_drag()
 
     def _cancel_drag(self) -> None:
-        # 按下點和被拖的按鈕同生共死：留著上一輪的座標，下一次拖曳會拿錯世代的
-        # 基準來比，方向就會反過來。
-        self._drag_press_x = None
         if self._drag_button is not None:
             self._drag_button.cancel_drag()
             self._drag_button = None
