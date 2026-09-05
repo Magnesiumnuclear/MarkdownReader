@@ -178,6 +178,27 @@ def read_text_file(path: str) -> tuple[str, DocumentMeta]:
 
 
 # --- Markdown 轉換 ----------------------------------------------------------
+def meta_for_pasted(text: str) -> DocumentMeta:
+    """替「貼上的內容」造一份 DocumentMeta。
+
+    分頁靠 meta is None 來決定要畫歡迎頁還是文件（見 DocumentTab.build_html），
+    所以貼上的內容也得有 meta，否則永遠停在歡迎頁。
+
+    path 留空字串而不是 None：DocumentMeta.path 宣告是 str，而狀態列直接把它
+    丟給 status_path_label；空字串會顯示成「沒有路徑」，正是貼上內容的實情。
+    編碼欄填 UTF-8——剪貼簿給的已經是解好的 str，這裡標的是「存成檔案時會是
+    什麼」，而不是解碼過程。
+    """
+    return DocumentMeta(
+        path="",
+        encoding="UTF-8",
+        size_bytes=len(text.encode("utf-8")),
+        modified=datetime.now(),
+        char_count=len(text),
+        line_count=text.count("\n") + 1,
+    )
+
+
 def _build_converter(theme: str) -> markdown.Markdown:
     extensions: list = ["extra", "sane_lists", "toc"]
     configs: dict = {}
@@ -353,7 +374,7 @@ def render_error(error: DocumentError, path: str = "") -> str:
 # 歡迎頁的快速鍵列。兩欄都進語言檔：按鍵名稱多半兩種語言相同，
 # 但「Alt + 左方向鍵」在英文是 "Alt + Left"，不能只翻說明那一欄。
 _WELCOME_SHORTCUTS = (
-    "open", "newTab", "closeTab", "switchTab", "reload", "find",
+    "open", "newTab", "paste", "closeTab", "switchTab", "reload", "find",
     "settings", "theme", "pin", "zoom", "back", "maximize", "escape",
 )
 
@@ -381,6 +402,7 @@ def render_welcome() -> str:
     body = [
         "<h1>" + html.escape(t("app.displayName")) + "</h1>",
         _notice("noticecell", t("welcome.dropHint")),
+        _notice("noticecell", t("welcome.pasteHint")),
         "<h2>" + html.escape(t("welcome.shortcuts")) + "</h2>",
         "".join(table),
     ]

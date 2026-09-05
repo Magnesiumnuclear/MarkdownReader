@@ -271,6 +271,7 @@ def section_rendering(args) -> None:
             app.processEvents()
 
     from app import styles
+    from app.language import t
     from app.viewer import MarkdownViewer
 
     QSettings(config.ORG_NAME, config.APP_NAME).clear()
@@ -1583,8 +1584,13 @@ def section_language(args) -> None:
 def section_tabs(args) -> None:
     import tempfile
 
-    from PyQt6.QtCore import QEventLoop, QRect, QSettings, Qt, QTimer
+    from PyQt6.QtCore import (
+        QEvent, QEventLoop, QPoint, QPointF, QRect, QSettings, Qt, QTimer,
+    )
+    from PyQt6.QtGui import QMouseEvent
     from PyQt6.QtWidgets import QApplication
+
+    NL = chr(10)
 
     app = QApplication.instance() or QApplication([])
 
@@ -1595,6 +1601,7 @@ def section_tabs(args) -> None:
         for _ in range(3):
             app.processEvents()
 
+    from app.language import t
     from app.viewer import MarkdownViewer
 
     QSettings(config.ORG_NAME, config.APP_NAME).clear()
@@ -1837,6 +1844,153 @@ def section_tabs(args) -> None:
           f"視窗仍在，分頁 {tabs_before} -> {len(viewer._tabs)}")
     if not closed:
         viewer.close()
+    pump(300)
+
+    # --- 「＋」是一顆按鈕兩個功能：主區開新分頁、右側箭頭展開選單 ---------
+    # 改版前這顆按鈕接的是 open_dialog，和它自己的提示「開新分頁 (Ctrl+T)」
+    # 對不上——按下去跳出的是開檔對話框。
+    from app.title_bar import SplitIconButton as _Split
+
+    v3 = MarkdownViewer()
+    v3.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+    v3.resize(1000, 700)
+    v3.show()
+    pump(400)
+    plus = v3.tab_bar.new_button
+    check("「＋」是分割按鈕，右側有展開選單",
+          isinstance(plus, _Split) and len(plus.menu_widget().actions()) == 1,
+          f"{type(plus).__name__} 選單 {len(plus.menu_widget().actions())} 項")
+    check("展開選單那一項是「開啟檔案」",
+          plus.menu_widget().actions()[0].text() == t("tab.openFile"),
+          plus.menu_widget().actions()[0].text())
+    check("展開區在按鈕最右側、寬度容得下箭頭",
+          plus._expander_rect().x() == plus.width() - _Split.EXPANDER_WIDTH
+          and plus.width() > _Split.EXPANDER_WIDTH,
+          f"展開區 x={plus._expander_rect().x()} 按鈕寬={plus.width()}")
+
+    # 【檔案對話框一律換成替身】QFileDialog.getOpenFileName 是 modal，真的彈
+    # 出來就沒有人會去關它，整個測試永遠卡住。這裡踩過一次：某個突變把「＋」
+    # 主區域接回 open_dialog，測試一點下去就掛死二十分鐘。
+    # 換成替身之後，「有沒有開對話框」反而變成可以直接斷言的訊號——
+    # 主區域誤開對話框（正是改版前的行為）當場就會被抓到。
+    from PyQt6.QtWidgets import QFileDialog as _QFileDialog
+
+    dialog_calls: list = []
+    _real_get_open = _QFileDialog.getOpenFileName
+    _QFileDialog.getOpenFileName = staticmethod(
+        lambda *a, **k: (dialog_calls.append(1), ("", ""))[1]
+    )
+    # 選單的 exec 同樣會跑巢狀迴圈等人選，換成替身只記錄「開在哪」
+    popped: list = []
+    plus.menu_widget().exec = lambda *a, **k: popped.append(a[0] if a else None)
+    new_hits: list = []
+    open_hits: list = []
+    v3.tab_bar.newTabRequested.connect(lambda: new_hits.append(1))
+    v3.tab_bar.openFileRequested.connect(lambda: open_hits.append(1))
+
+    def click_plus(x_in_button):
+        point = QPoint(x_in_button, plus.height() // 2)
+        target = plus.mapToGlobal(point)
+        for kind, held in (
+            (QEvent.Type.MouseButtonPress, Qt.MouseButton.LeftButton),
+            (QEvent.Type.MouseButtonRelease, Qt.MouseButton.NoButton),
+        ):
+            app.sendEvent(plus, QMouseEvent(
+                kind, QPointF(point), QPointF(target),
+                Qt.MouseButton.LeftButton, held, Qt.KeyboardModifier.NoModifier))
+        pump(120)
+
+    tabs_before_click = v3.tab_count()
+    click_plus(10)
+    check("點主區域＝開新分頁（不是開檔對話框）",
+          len(new_hits) == 1 and not popped and not dialog_calls
+          and v3.tab_count() == tabs_before_click + 1,
+          f"new={len(new_hits)} 選單={len(popped)} 對話框={len(dialog_calls)} "
+          f"分頁 {tabs_before_click}->{v3.tab_count()}")
+    click_plus(plus.width() - 5)
+    check("點右側箭頭＝展開選單，不會順手開新分頁",
+          len(popped) == 1 and len(new_hits) == 1,
+          f"選單={len(popped)} new={len(new_hits)}")
+    check("選單開在按鈕正下方",
+          bool(popped) and popped[0].y()
+          == plus.mapToGlobal(QPoint(0, plus.height())).y(),
+          str(popped[:1]))
+    plus.menu_widget().actions()[0].trigger()
+    pump(120)
+    check("選單項送出 openFileRequested 並開啟檔案對話框",
+          len(open_hits) == 1 and len(dialog_calls) == 1,
+          f"signal={open_hits} 對話框={len(dialog_calls)}")
+    _QFileDialog.getOpenFileName = _real_get_open
+
+    # --- 空白分頁可以直接貼上 Markdown 原始碼 -----------------------------
+    while v3.tab_count() > 1:
+        v3.close_tab_at(v3.tab_count() - 1)
+        pump(100)
+    v3.new_tab()
+    pump(200)
+    check("貼上前是歡迎頁，分頁名為「新分頁」",
+          v3._tab.display_name == t("tab.newTab") and not v3._tab.pasted
+          and v3._tab.meta is None)
+    check("歡迎頁有提示可以直接貼上",
+          "Ctrl+V" in v3.browser.document().toPlainText(),
+          v3.browser.document().toPlainText()[:80])
+
+    QApplication.clipboard().setText(
+        "# 貼上的標題" + NL + NL + "這是 **粗體** 內文。" + NL)
+    v3.paste_markdown()
+    pump(300)
+    pasted_text = v3.browser.document().toPlainText()
+    check("貼上後真的渲染成 Markdown（星號被吃掉、內容出現）",
+          "貼上的標題" in pasted_text and "粗體" in pasted_text
+          and "**" not in pasted_text,
+          pasted_text[:80])
+    check("貼上的分頁改名、標記為貼上、沒有檔案路徑",
+          v3._tab.display_name == t("tab.pasted") and v3._tab.pasted
+          and v3._tab.path is None and v3._tab.meta is not None,
+          f"名稱={v3._tab.display_name} pasted={v3._tab.pasted} "
+          f"path={v3._tab.path}")
+
+    QApplication.clipboard().setText("# 第二次貼上" + NL)
+    v3.paste_markdown()
+    pump(300)
+    again = v3.browser.document().toPlainText()
+    check("再貼一次會覆蓋原本的內容",
+          "第二次貼上" in again and "貼上的標題" not in again, again[:60])
+
+    # 正在讀檔案的分頁不能被貼上蓋掉
+    v3.open_path(SAMPLE, new_tab=True)
+    pump(300)
+    QApplication.clipboard().setText("# 不該出現的內容" + NL)
+    v3.paste_markdown()
+    pump(200)
+    check("已開檔案的分頁不會被 Ctrl+V 覆蓋",
+          "不該出現的內容" not in v3.browser.document().toPlainText()
+          and v3._tab.path is not None)
+
+    # 搜尋框有焦點時 Ctrl+V 是它的貼上，不能被視窗的捷徑吃掉
+    v3.show_find()
+    pump(200)
+    v3.find_bar.input.setFocus()
+    pump(150)
+    QApplication.clipboard().setText("搜尋關鍵字")
+    v3.paste_markdown()
+    pump(200)
+    check("焦點在搜尋框時，Ctrl+V 貼進搜尋框而不是分頁",
+          v3.find_bar.input.text() == "搜尋關鍵字",
+          repr(v3.find_bar.input.text()))
+    v3.find_bar.deactivate()
+    pump(150)
+
+    # 貼上的分頁沒有路徑，工作階段本來就只存有路徑的分頁
+    v3.set_restore_tabs(True)
+    v3._save_session()
+    saved_paths = QSettings(config.ORG_NAME, config.APP_NAME).value(
+        config.KEY_OPEN_TABS, [], type=list)
+    check("貼上的分頁不會被寫進工作階段（重開不還原）",
+          all(p for p in saved_paths) and len(saved_paths) < v3.tab_count(),
+          f"存了 {saved_paths}，分頁數 {v3.tab_count()}")
+    v3.set_restore_tabs(False)
+    v3.close()
     pump(300)
     QSettings(config.ORG_NAME, config.APP_NAME).clear()
 

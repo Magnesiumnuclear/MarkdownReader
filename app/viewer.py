@@ -722,6 +722,31 @@ class MarkdownViewer(QWidget):
         self._show_welcome()
         self._sync_tab_bar()
 
+    def paste_markdown(self) -> None:
+        """把剪貼簿裡的 Markdown 原始碼貼進目前分頁並渲染。
+
+        只對「沒有檔案路徑」的分頁生效——正在讀某個檔案時按 Ctrl+V 不該把
+        它的內容換掉。貼上的分頁本身沒有路徑，所以可以再貼一次覆蓋。
+
+        【搜尋框的 Ctrl+V 不能被吃掉】這是掛在視窗上的 QShortcut，即使焦點
+        在搜尋框裡也會先被它攔下。焦點在搜尋框時就把貼上轉交回去，否則
+        「複製一段文字、貼進搜尋框」會整個失效。
+        """
+        if self.find_bar.input.hasFocus():
+            self.find_bar.input.paste()
+            return
+        if self._tab.path:
+            return
+        text = QApplication.clipboard().text()
+        if not text.strip():
+            self._set_status(t("status.pasteEmpty"))
+            return
+        self._tab.set_pasted(text)
+        self._render(preserve_scroll=False)
+        self._update_titles(self._tab.display_name)
+        self._update_status()
+        self._sync_tab_bar()
+
     def close_tab(self) -> None:
         """關閉作用中的分頁；只剩一個時關閉視窗。"""
         self.close_tab_at(self._active)
@@ -891,7 +916,11 @@ class MarkdownViewer(QWidget):
         self.tab_bar.detachRequested.connect(self._on_tab_detached)
         self.tab_bar.drop_intent_probe = self._drag_intent_at
         self.tab_bar.drag_ended = self._clear_insert_markers
-        self.tab_bar.newTabRequested.connect(self.open_dialog)
+        # 「＋」的主區域＝開新分頁（可直接貼上），右側展開選單＝開啟檔案。
+        # 以前 newTabRequested 接的是 open_dialog，和它自己的提示文字
+        #「開新分頁 (Ctrl+T)」對不上——按下去跳出的是開檔對話框。
+        self.tab_bar.newTabRequested.connect(self.new_tab)
+        self.tab_bar.openFileRequested.connect(self.open_dialog)
 
         self.settings_panel.languageModeChanged.connect(self.set_language_mode)
         self.settings_panel.themeModeChanged.connect(self.set_theme_mode)
@@ -922,8 +951,10 @@ class MarkdownViewer(QWidget):
             ("Ctrl+/", self.toggle_status_bar),
             ("Alt+Left", self.go_back),
             ("F11", self.toggle_maximized),
-            # Ctrl+T 對應分頁列的「＋」，兩個入口行為一致；要直接挑檔案用 Ctrl+O
+            # Ctrl+T 對應分頁列「＋」的主區域，兩個入口行為一致；
+            # 要直接挑檔案用 Ctrl+O，或按「＋」右側的展開箭頭。
             ("Ctrl+T", self.new_tab),
+            ("Ctrl+V", self.paste_markdown),
             ("Ctrl+W", self.close_tab),
             ("Ctrl+Tab", self.next_tab),
             ("Ctrl+Shift+Tab", self.previous_tab),

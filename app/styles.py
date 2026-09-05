@@ -259,6 +259,23 @@ QToolButton#tabClose, QToolButton#tabNew {
 }
 QToolButton#tabClose:hover, QToolButton#tabNew:hover { background-color: $pressed_bg; }
 
+/* 「＋」右側展開的選單。全專案只有這一處用 QMenu，樣式不寫的話會是系統原生
+   外觀，和無邊框自繪的其他部分格格不入。QSS 沿 QObject 的親子鏈傳遞，選單
+   的 parent 是分頁列上的按鈕，所以吃得到視窗這份樣式。 */
+QMenu {
+    background-color: $surface;
+    border: 1px solid $border;
+    border-radius: 6px;
+    padding: 4px;
+}
+QMenu::item {
+    background-color: transparent;
+    color: $text;
+    padding: 6px 14px;
+    border-radius: 4px;
+}
+QMenu::item:selected { background-color: $hover_bg; }
+
 /* 關閉鈕的襯底：右段實色蓋住檔名尾巴，左段漸層淡出，接回分頁底色。
    兩種底色分別對應「非作用中被 hover」與「作用中」，實色是先合成過的
    （hover_bg 是半透明的，見 _values）。關閉鈕本身仍是透明底，hover 時

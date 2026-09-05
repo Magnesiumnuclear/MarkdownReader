@@ -34,6 +34,9 @@ class DocumentTab:
         self.file_stamp: tuple[float, int] | None = None
         self.pending_anchor: str = ""
 
+        # 內容是貼上來的（沒有檔案路徑）。分頁標題與工作階段都要看這個旗標：
+        # 貼上的分頁刻意不寫進工作階段——還原機制存的是路徑清單，沒有路徑可存。
+        self.pasted: bool = False
         self.loaded: bool = False             # 是否已讀進檔案內容
         self.dirty: bool = True               # 是否需要重新渲染
         # 跨視窗搬移時暫存的捲動比例：take_tab 寫入、adopt_tab 讀走後清空
@@ -59,13 +62,34 @@ class DocumentTab:
     def display_name(self) -> str:
         if self.path:
             return os.path.basename(self.path) or self.path
+        if self.pasted:
+            return t("tab.pasted")
         return t("tab.newTab")
+
+    # -- 貼上的內容 ----------------------------------------------------------
+    def set_pasted(self, text: str) -> None:
+        """把剪貼簿來的 Markdown 原始碼當成這個分頁的內容。
+
+        造一份合成的 meta，build_html 才會走文件路徑而不是歡迎頁。清掉 path
+        與 error，並讓 HTML 快取自然失效——快取鍵比對的是「文字物件的識別」
+        （見 build_html），換上新的字串物件就等於失效，不必手動清。
+        """
+        self.text = text
+        self.meta = document.meta_for_pasted(text)
+        self.error = None
+        self.path = None
+        self.file_stamp = None
+        self.pasted = True
+        self.loaded = True
+        self.dirty = True
+        self.history.clear()
 
     # -- 讀檔 ----------------------------------------------------------------
     def load(self) -> None:
         """把檔案讀進來；失敗時記錄錯誤，不拋出。"""
         self.loaded = True
         self.dirty = True
+        self.pasted = False
         if not self.path:
             self.text, self.meta, self.error, self.file_stamp = "", None, None, None
             return
