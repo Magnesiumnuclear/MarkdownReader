@@ -61,6 +61,7 @@ README = os.path.join(PROJECT_ROOT, "README.md")
 
 _PASS: list[str] = []
 _FAIL: list[tuple[str, str]] = []
+_SKIP: list[str] = []
 
 
 def check(label: str, condition: bool, detail: str = "") -> bool:
@@ -70,6 +71,72 @@ def check(label: str, condition: bool, detail: str = "") -> bool:
         _FAIL.append((label, detail))
         print(f"    [FAIL] {label}" + (f"  -- {detail}" if detail else ""))
     return bool(condition)
+
+
+# _enter_offscreen 建的 QApplication 得抓在模組層：QApplication([]) 建完不留
+# 參考會被垃圾回收，平台外掛跟著卸載，之後區塊自建的新 QApplication 只看得到
+# 環境變數裡「不帶 configfile」的 offscreen——虛擬螢幕縮回預設的 800x800，
+# 內文邊距那幾條就紅了（踩過一次）。
+_OFFSCREEN_APP = None
+
+
+def _offscreen() -> bool:
+    from PyQt6.QtCore import QCoreApplication
+    from PyQt6.QtGui import QGuiApplication
+
+    app = QCoreApplication.instance()
+    if isinstance(app, QGuiApplication):
+        return app.platformName() == "offscreen"
+    return os.environ.get("QT_QPA_PLATFORM", "").startswith("offscreen")
+
+
+def onscreen_only(label: str) -> bool:
+    """這條查的是真視窗系統（原生 HWND、硬體游標、原生 z-order）。
+
+    offscreen 虛擬螢幕上沒有這些東西可問，硬跑只會拿假把手換假答案。
+    跳過並明講、記進 _SKIP，不假裝通過——加 --onscreen 才會驗。
+    """
+    if not _offscreen():
+        return True
+    _SKIP.append(label)
+    print(f"    [僅實機] {label} —— offscreen 沒有原生視窗系統，--onscreen 才驗")
+    return False
+
+
+def _enter_offscreen() -> None:
+    """切到 offscreen 虛擬螢幕：視窗全畫在記憶體裡，不佔畫面也不搶焦點。
+
+    兩個坑：
+    1. 預設虛擬螢幕只有 800x800，比測試開的視窗還小，幾何全被夾扁
+       （內文邊距、搜尋列拖曳的斷言直接紅）——用 configfile 描述一個
+       1920x1080 的螢幕。
+    2. platform 字串以冒號分隔選項，Windows 磁碟機代號的冒號會把路徑
+       截斷，configfile 只吃相對路徑——所以先 chdir 到設定檔的資料夾建
+       QApplication（建構當下才讀檔），建完再走回來。
+    最後把環境變數改回不帶 configfile 的「offscreen」：測試還會 spawn 別的
+    行程（探針、本體實例），它們的工作目錄裡沒有那個檔，繼承了反而找不到；
+    它們用不到大螢幕，預設尺寸就夠。
+    """
+    import json
+    import tempfile
+
+    from PyQt6.QtWidgets import QApplication
+
+    cfg_dir = tempfile.mkdtemp(prefix="mdreader-offscreen-")
+    with open(os.path.join(cfg_dir, "screen.json"), "w", encoding="utf-8") as fh:
+        json.dump({"screens": [{"name": "virt", "x": 0, "y": 0,
+                                "width": 1920, "height": 1080,
+                                "logicalDpi": 96, "logicalBaseDpi": 96,
+                                "dpr": 1.0}]}, fh)
+    os.environ["QT_QPA_PLATFORM"] = "offscreen:configfile=screen.json"
+    cwd = os.getcwd()
+    os.chdir(cfg_dir)
+    try:
+        global _OFFSCREEN_APP
+        _OFFSCREEN_APP = QApplication([])
+    finally:
+        os.chdir(cwd)
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 
 # --- QSettings 備份與還原 ---------------------------------------------------
@@ -229,8 +296,9 @@ def section_rendering(args) -> None:
     handle_id = int(viewer.winId())
     viewer.set_always_on_top(True)
     pump(200)
-    check("釘選最上層真的生效（查 WS_EX_TOPMOST，不是只看 API 回傳值）",
-          win32.is_topmost(handle_id))
+    if onscreen_only("釘選最上層真的生效（查 WS_EX_TOPMOST，不是只看 API 回傳值）"):
+        check("釘選最上層真的生效（查 WS_EX_TOPMOST，不是只看 API 回傳值）",
+              win32.is_topmost(handle_id))
     viewer.set_always_on_top(False)
     pump(200)
 
@@ -2302,16 +2370,30 @@ def section_single_instance(args) -> None:
         deadline = _t.perf_counter() + 30
         window = None
         _u32 = _ct.windll.user32
-        while _t.perf_counter() < deadline:
-            # 用和程式同一個翻譯來源組標題，而不是寫死字串。
-            # 【這同時是「標題後綴陷阱」的回歸測試】Qt 在 Windows 上若發現
-            # windowTitle 沒有以 applicationDisplayName 結尾，會自動補一段
-            # " - <displayName>"。main.py 與 viewer._update_titles 的來源一旦
-            # 分家，實際標題就會多出後綴，這裡的精確比對立刻紅燈。
-            window = _u32.FindWindowW(None, _expected_title("sample.md"))
-            if window:
-                break
-            _t.sleep(0.05)
+        if _offscreen():
+            # offscreen 沒有原生視窗標題可找，改探單一實例管道：連得上就是
+            # 本體起來了。「標題後綴陷阱」的精確標題比對只有實機驗得到，
+            # 由下面的 onscreen_only 明講跳過。
+            from PyQt6.QtNetwork import QLocalSocket
+            while _t.perf_counter() < deadline:
+                sock = QLocalSocket()
+                sock.connectToServer(config.IPC_SERVER_NAME)
+                if sock.waitForConnected(200):
+                    sock.abort()
+                    window = 1
+                    break
+                _t.sleep(0.05)
+        else:
+            while _t.perf_counter() < deadline:
+                # 用和程式同一個翻譯來源組標題，而不是寫死字串。
+                # 【這同時是「標題後綴陷阱」的回歸測試】Qt 在 Windows 上若發現
+                # windowTitle 沒有以 applicationDisplayName 結尾，會自動補一段
+                # " - <displayName>"。main.py 與 viewer._update_titles 的來源
+                # 一旦分家，實際標題就會多出後綴，這裡的精確比對立刻紅燈。
+                window = _u32.FindWindowW(None, _expected_title("sample.md"))
+                if window:
+                    break
+                _t.sleep(0.05)
         if not window:
             check("忙碌背靠背回歸：第一個視窗有起來", False)
             app_proc.kill()
@@ -2330,10 +2412,15 @@ def section_single_instance(args) -> None:
                     proc.kill()
             _t.sleep(2.0)
             alive = app_proc.poll() is None
-            got_tab = bool(_u32.FindWindowW(None, _expected_title("README.md")))
             check("本體忙碌時三連發轉交不會讓它崩潰", alive,
                   "" if alive else f"結束碼 {app_proc.poll() & 0xFFFFFFFF:#x}")
-            check("忙碌解除後轉交的檔案有開出來", got_tab)
+            check("三個轉交器都順利交棒（結束碼 0）",
+                  all(p.returncode == 0 for p in senders),
+                  str([p.returncode for p in senders]))
+            if onscreen_only("忙碌解除後轉交的檔案有開出來（查原生視窗標題）"):
+                got_tab = bool(
+                    _u32.FindWindowW(None, _expected_title("README.md")))
+                check("忙碌解除後轉交的檔案有開出來（查原生視窗標題）", got_tab)
             if alive:
                 app_proc.terminate()
             try:
@@ -2798,9 +2885,14 @@ def section_tab_dnd(args) -> None:
             )
             return hits / dpr
 
-        # 上帽避開分頁那條 2px 的上框（量 y=4），下帽量倒數第 3 列
-        return width_at(4), width_at(config.TAB_HEIGHT // 2), \
-            width_at(config.TAB_HEIGHT - 3)
+        # 帽子掃一段列取最寬，不押單一列：三角形落在整數像素網格上，
+        # 每一列「純強調色」的核心寬度會隨 DPR 跳動——實機縮放下 y=4 夠寬，
+        # offscreen 的 DPR=1 同一列只剩 4px，差 1px 就紅。取帶內最寬後兩種
+        # 平台都穩，而帽子沒畫出來時整段仍只有線寬，照樣抓得到。
+        # 上帽從 y=3 起，避開作用中分頁那條 2px 的強調色上框。
+        top = max(width_at(y) for y in range(3, 8))
+        bottom = max(width_at(config.TAB_HEIGHT - y) for y in range(3, 8))
+        return top, width_at(config.TAB_HEIGHT // 2), bottom
 
     line_width = config.TAB_INSERT_MARKER_WIDTH
     top_w, mid_w, bottom_w = marker_row_widths(viewer)
@@ -3236,9 +3328,13 @@ def section_tab_dnd(args) -> None:
     # 環境前置：此刻幽靈還不存在，這條紅只可能是桌面環境——探測點被別的
     # 視窗（含另一份併行測試）蓋住、或無前景權——不是機制回歸。
     # 紅的話守門三條直接略過，免得跟著紅誤導成命中測試壞了。
-    env_ok = _wm.top_level_widget_at(probe) is host
-    check("守門前置：host 是探測點的最上層（紅＝環境遮擋，非機制回歸）",
-          env_ok, type(_wm.top_level_widget_at(probe)).__name__)
+    # 這一組問的是原生 WindowFromPoint 的 z-order，offscreen 整組僅實機。
+    if onscreen_only("守門前置＋幽靈命中測試（查原生 z-order 的那四條）"):
+        env_ok = _wm.top_level_widget_at(probe) is host
+        check("守門前置：host 是探測點的最上層（紅＝環境遮擋，非機制回歸）",
+              env_ok, type(_wm.top_level_widget_at(probe)).__name__)
+    else:
+        env_ok = False
     if env_ok:
         host.activate_tab(0)
         pump(200)
@@ -3263,7 +3359,7 @@ def section_tab_dnd(args) -> None:
               repr(manager4.drop_target_at(probe, exclude=host)))
         release_at(btn, QPoint(start.x(), bar.mapToGlobal(bar.rect().center()).y()))
         pump(300)
-    else:
+    elif not _offscreen():
         print("    [略過] 桌面環境遮住探測點，守門三條未執行")
 
     # --- 對照組：底下的視窗露出來時，合併照樣要成立 -------------------------
@@ -3282,21 +3378,23 @@ def section_tab_dnd(args) -> None:
     # 會一起紅，這條負責指出是換算壞了、還是命中測試壞了。
     # 注意：單螢幕機器上原點是 (0,0)，「每螢幕原點守恆」與「天真全域乘 dpr」
     # 輸出相同，這條只驗得到縮放係數；多螢幕的原點項只有多螢幕機器驗得到。
-    import ctypes as _ctypes
-    from ctypes import wintypes as _wintypes
+    if onscreen_only("邏輯座標換算與 GetCursorPos 一致（每軸誤差 ≤2px）"):
+        import ctypes as _ctypes
+        from ctypes import wintypes as _wintypes
 
-    from PyQt6.QtGui import QCursor as _QCursor
+        from PyQt6.QtGui import QCursor as _QCursor
 
-    _u32 = _ctypes.windll.user32
-    _u32.GetCursorPos.argtypes = [_ctypes.POINTER(_wintypes.POINT)]
-    _u32.GetCursorPos.restype = _wintypes.BOOL
-    _pt = _wintypes.POINT()
-    _u32.GetCursorPos(_ctypes.byref(_pt))
-    _converted = _wm._native_point(_QCursor.pos())
-    check("邏輯座標換算與 GetCursorPos 一致（每軸誤差 ≤2px）",
-          _converted is not None
-          and abs(_converted[0] - _pt.x) <= 2 and abs(_converted[1] - _pt.y) <= 2,
-          f"converted={_converted} native={(_pt.x, _pt.y)}")
+        _u32 = _ctypes.windll.user32
+        _u32.GetCursorPos.argtypes = [_ctypes.POINTER(_wintypes.POINT)]
+        _u32.GetCursorPos.restype = _wintypes.BOOL
+        _pt = _wintypes.POINT()
+        _u32.GetCursorPos(_ctypes.byref(_pt))
+        _converted = _wm._native_point(_QCursor.pos())
+        check("邏輯座標換算與 GetCursorPos 一致（每軸誤差 ≤2px）",
+              _converted is not None
+              and abs(_converted[0] - _pt.x) <= 2
+              and abs(_converted[1] - _pt.y) <= 2,
+              f"converted={_converted} native={(_pt.x, _pt.y)}")
 
     # --- 指示線殘留：拖去 B 畫了線、拖回自己列上放開 -------------------------
     # 兩窗並排、列同高時，滑鼠可以一步從 B 的列跳回本列，中間點永遠不會落在
@@ -4265,6 +4363,9 @@ def _run_sections_in_process(selected, args) -> int:
     total = len(_PASS) + len(_FAIL)
     print()
     print(f"===== {len(_PASS)} / {total} 通過 =====")
+    if _SKIP:
+        print(f"（另有 {len(_SKIP)} 項僅實機，offscreen 模式跳過；"
+              f"加 --onscreen 在真螢幕上驗）")
     if _FAIL:
         print("失敗項目：")
         for label, detail in _FAIL:
@@ -4306,7 +4407,15 @@ def main() -> int:
         "--ignore-running-instance", action="store_true",
         help="即使偵測到別的實例在跑也照跑（結果不可信，只在確定無妨時用）",
     )
+    parser.add_argument(
+        "--onscreen", action="store_true",
+        help="在真實螢幕上開視窗跑（預設走 offscreen 虛擬螢幕，不佔畫面；"
+             "只有原生視窗系統的那幾條檢查需要這個模式）",
+    )
     args = parser.parse_args()
+
+    if not args.onscreen:
+        _enter_offscreen()
 
     if not args.ignore_running_instance and _running_instance():
         print("偵測到另一個 Markdown 閱讀器實例正在執行。")
@@ -4341,15 +4450,19 @@ def main() -> int:
     # 副作用是每個區塊各付一次 Qt 啟動成本（約多十幾秒）。
     import re as _re
 
-    total_pass = total_all = 0
+    total_pass = total_all = total_skip = 0
     failed_sections: list[str] = []
     for name, _func in SECTIONS:
         proc = subprocess.run(
             [sys.executable, "-u", os.path.abspath(__file__),
-             "--only", name, "--runs", str(args.runs)],
+             "--only", name, "--runs", str(args.runs)]
+            + (["--onscreen"] if args.onscreen else []),
             capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
         body = proc.stdout.rstrip()
+        skip_note = _re.search(r"另有 (\d+) 項僅實機", body)
+        if skip_note:
+            total_skip += int(skip_note.group(1))
         summary = _re.search(r"===== (\d+) / (\d+) 通過", body)
         if proc.returncode == 0 and summary:
             total_pass += int(summary.group(1))
@@ -4371,6 +4484,9 @@ def main() -> int:
     print()
     print(f"===== {total_pass} / {total_all} 通過，"
           f"{len(failed_sections)} 個區塊失敗 =====")
+    if total_skip:
+        print(f"（另有 {total_skip} 項僅實機，offscreen 模式跳過；"
+              f"加 --onscreen 在真螢幕上驗）")
     return 1 if failed_sections else 0
 
 
