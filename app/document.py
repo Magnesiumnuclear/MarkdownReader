@@ -203,6 +203,27 @@ def _build_converter(theme: str) -> markdown.Markdown:
 # 註腳與參考連結，而且 htmlStash 的編號會對不上，程式碼區塊會整段錯位。
 _CONVERTERS: dict[str, markdown.Markdown] = {}
 
+# 會被當成獨立快取鍵的主題全集。以 Pygments 配色表的鍵為準：主題只有被
+# 這張表辨認，轉換結果才可能不同——不在表上的值全部退回 "default" 配色。
+KNOWN_THEMES: tuple[str, ...] = tuple(styles.PYGMENTS_STYLE)
+
+
+def theme_sensitive(html: str) -> bool:
+    """這份轉換結果會不會隨主題不同而不同。
+
+    主題唯一流進轉換的地方是程式碼高亮（_build_converter 把 pygments_style
+    依主題挑色，顏色以 inline style 寫死在輸出裡）。而所有程式碼區塊都會被
+    QtRichTextExtension 改寫成 td.codecell——輸出裡連一個 codecell 都沒有，
+    就代表沒有任何高亮輸出，兩個主題產生的 HTML 逐位元組相同。
+
+    判定方向刻意保守：內文碰巧含「codecell」字樣會被誤判成敏感，代價只是
+    多付一次轉換；反過來誤判不敏感會讓程式碼顏色套錯主題，所以標記只認
+    「不在就一定安全」的那一邊。沒裝 Pygments 時高亮整個不存在，一律不敏感。
+    """
+    if not PYGMENTS_AVAILABLE:
+        return False
+    return "codecell" in html
+
 
 def markdown_to_html(text: str, theme: str) -> str:
     """把 Markdown 原始碼轉成 Qt 相容的 HTML 片段。"""

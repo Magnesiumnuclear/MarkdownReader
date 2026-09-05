@@ -122,6 +122,13 @@ class DocumentTab:
         - 主題要入鍵：程式碼高亮的顏色是用 inline style 寫死在 HTML 裡的
           （codehilite noclasses），換主題必須重新轉換。
         兩個主題各留一份，切回上一個主題就是直接命中。
+
+        【例外：沒有高亮輸出的文件，換主題不重轉】
+        主題唯一影響的輸出就是高亮顏色（document.theme_sensitive 的說明），
+        所以無程式碼的文件在兩個主題下的 HTML 逐位元組相同——轉完直接把同
+        一份登記到所有主題鍵，換主題（含系統入夜自動切換）就是直接命中，
+        省掉整份 Markdown 重轉（1MB 文件實測 518ms）。判定保守：有 codecell
+        就照舊每主題各轉一次。
         """
         if self.error is not None:
             return document.render_error(self.error, self.path or "")
@@ -132,7 +139,11 @@ class DocumentTab:
         if cached is not None and cached[0] is self.text:
             return cached[1]
         rendered = document.render_document(self.text, self.meta, theme)
-        self._html_cache[theme] = (self.text, rendered)
+        if document.theme_sensitive(rendered):
+            self._html_cache[theme] = (self.text, rendered)
+        else:
+            for any_theme in document.KNOWN_THEMES:
+                self._html_cache[any_theme] = (self.text, rendered)
         return rendered
 
     # -- 捲動位置 ------------------------------------------------------------

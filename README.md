@@ -844,6 +844,15 @@ if cached is not None and cached[0] is self.text:
 的錯誤會表現成「檔案改了但畫面沒更新」，比慢還糟。兩個主題各留一份，
 來回切換都是命中。
 
+**無高亮輸出的文件換主題不重轉。** 主題唯一流進轉換的地方是程式碼高亮的
+配色（`codehilite` 把顏色以 inline style 寫死）。所有程式碼區塊都會被改寫成
+`td.codecell`——輸出裡連一個 `codecell` 都沒有，就代表沒有任何高亮輸出，
+兩個主題產生的 HTML 逐位元組相同。因此 `build_html` 轉完會先問
+`document.theme_sensitive()`：不敏感就把同一份 HTML 登記到所有主題鍵，
+換主題（含系統入夜自動切換）直接命中，省掉整份 Markdown 重轉（1MB 文件
+約 518ms、3000 行文件約 200ms）。判定方向刻意保守：有 `codecell` 就照舊
+每主題各轉一次，寧可多轉也不讓程式碼顏色套錯主題。
+
 同時 `document.markdown_to_html()` 改為重用 `markdown.Markdown` 實例。
 **重用一定要先 `reset()`**：該物件會累積註腳、參考連結、toc 與 htmlStash
 （本專案用來把 fenced code 抽出再包成表格的暫存區）。少了 reset，第二份
@@ -1126,10 +1135,22 @@ py -3.13 tools/benchmark_startup.py
 ## 設定成 `.md` 的開啟程式
 
 ```bash
-py -3.13 tools/install_association.py --target "D:\software\Customize-Open-File\md\dist\MarkdownReader.exe"
+py -3.13 tools/install_association.py --target "D:\software\Customize-Open-File\md\dist\MarkdownReader-onedir\MarkdownOpen.exe"
 ```
 
-不指定 `--target` 時會自動找 `dist\MarkdownReader.exe`；找不到就退回開發模式（用 `pythonw.exe` 執行 `main.py`）。
+不指定 `--target` 時會**依開檔速度自動挑** `dist` 裡最快的目標，優先序如下（見 `resolve_target`）：
+
+| 順位 | 目標 | 冷啟動 | 本體已開著時再開檔 |
+|---|---|---|---|
+| 1 | `MarkdownReader-onedir\MarkdownOpen.exe`（資料夾版轉交器） | ~710ms | **~10ms** |
+| 2 | `MarkdownOpen.exe`（dist 根目錄的轉交器） | 走 onefile | **~10ms** |
+| 3 | `MarkdownReader-onedir\MarkdownReader.exe`（資料夾版本體） | ~710ms | ~170ms |
+| 4 | `MarkdownReader.exe`（單一 exe） | ~1300ms | ~1000ms（每次先自解壓，會印警告） |
+
+以前這裡只認第 4 個（`dist\MarkdownReader.exe`），照本文件跑無參數安裝，就把
+每天最常見的動作——**本體已經開著、再雙擊一個 `.md`**——綁在最慢的路徑上
+（每次先自解壓約一秒，而轉交器只要約 10ms）。轉交器排最前面正是為了那個動作。
+全都找不到才退回開發模式（用 `pythonw.exe` 執行 `main.py`）。
 
 這個腳本**只寫入 `HKCU\Software\Classes`**，不需要系統管理員權限，而且可以完整還原：
 

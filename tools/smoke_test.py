@@ -1049,8 +1049,15 @@ def section_render_cache(args) -> None:
           tab.build_html(viewer._theme) is first_html)
 
     other_theme = "light" if viewer._theme == "dark" else "dark"
-    check("換主題不會命中舊快取",
-          tab.build_html(other_theme) is not first_html)
+    # 換主題要不要重轉，取決於這份文件有沒有高亮輸出（theme_sensitive）：
+    # 有 -> 各主題各留一份；沒有 -> 共用同一份、省整份重轉。兩側的確定性
+    # 行為已由上面「無程式碼／含程式碼」兩個固定文件釘死，這裡驗的是
+    # 「真實檔案走的路必須和判定一致」，不隨檔案內容變動而失效。
+    check("換主題是否重轉，與 theme_sensitive 的判定一致",
+          (tab.build_html(other_theme) is first_html)
+          == (not document.theme_sensitive(first_html)),
+          f"敏感={document.theme_sensitive(first_html)}，"
+          f"共用={tab.build_html(other_theme) is first_html}")
     check("兩個主題各留一份，切回原主題直接命中",
           tab.build_html(viewer._theme) is first_html)
 
@@ -1274,6 +1281,64 @@ def section_render_cache(args) -> None:
 
     viewer.close()
     pump(300)
+
+    # --- 無高亮輸出的文件，換主題不重轉 -------------------------------------
+    # 主題唯一流進轉換的地方是程式碼高亮的配色；輸出裡連一個 codecell 都
+    # 沒有的文件，兩個主題的 HTML 逐位元組相同，重轉純屬白工（3000 行文件
+    # 實測約 200ms/次，1MB 文件 518ms）。這組釘住三件事：
+    #   1. 無程式碼 -> 換主題直接命中快取（不重轉、兩鍵共用同一份物件）
+    #   2. 含程式碼 -> 照舊各轉一次，且兩份 HTML 真的不同（顏色不同）
+    #   3. 判定方向保守 -> theme_sensitive 只在輸出含 codecell 時為真
+    from datetime import datetime as _dt
+
+    from app.document_tab import DocumentTab as _DT
+
+    _plain = NL.join(f"## 標 {i}" + NL + NL + f"內文 {i}" for i in range(60))
+    _coded = _plain + NL + NL + "```python" + NL + "def f():" + NL + "    return 1" + NL + "```" + NL
+
+    _convert_calls = []
+    _orig_convert = document.markdown_to_html
+
+    def _counting(text, theme):
+        _convert_calls.append(theme)
+        return _orig_convert(text, theme)
+
+    def _theme_tab(text):
+        tab = _DT.__new__(_DT)
+        tab.error = None
+        tab.text = text
+        tab.meta = document.DocumentMeta(
+            path="x.md", encoding="utf-8", size_bytes=len(text),
+            modified=_dt(2026, 1, 1), char_count=len(text), line_count=60)
+        tab._html_cache = {}
+        return tab
+
+    document.markdown_to_html = _counting
+    try:
+        plain_tab = _theme_tab(_plain)
+        _convert_calls.clear()
+        plain_light = plain_tab.build_html("light")
+        plain_dark = plain_tab.build_html("dark")
+        check("無程式碼文件換主題：不重轉（一次轉換、兩鍵共用同一份）",
+              len(_convert_calls) == 1 and plain_dark is plain_light,
+              f"轉了 {len(_convert_calls)} 次，共用={plain_dark is plain_light}")
+
+        coded_tab = _theme_tab(_coded)
+        _convert_calls.clear()
+        coded_light = coded_tab.build_html("light")
+        coded_dark = coded_tab.build_html("dark")
+        check("含程式碼文件換主題：照舊各轉一次，且兩份 HTML 不同",
+              len(_convert_calls) == 2 and coded_light != coded_dark,
+              f"轉了 {len(_convert_calls)} 次，相同={coded_light == coded_dark}")
+    finally:
+        document.markdown_to_html = _orig_convert
+
+    check("theme_sensitive 判定方向：有 codecell 才算敏感",
+          document.theme_sensitive(coded_light)
+          and not document.theme_sensitive(plain_light),
+          f"含程式碼={document.theme_sensitive(coded_light)}，"
+          f"無程式碼={document.theme_sensitive(plain_light)}")
+
     QSettings(config.ORG_NAME, config.APP_NAME).clear()
 
 
@@ -2271,6 +2336,60 @@ def section_single_instance(args) -> None:
               "找不到複製轉交器那一段")
         check("成功時明確回 0（不然會沿用最後一個外部程式的結束碼）",
               "exit 0" in ps1)
+
+    # --- 檔案關聯目標的自動解析：速度階梯 -----------------------------------
+    # resolve_target 無參數時曾經只認 dist\MarkdownReader.exe（onefile），
+    # 照文件跑無參數安裝就把「本體開著、再雙擊 .md」綁在最慢的路徑上
+    # （每次先自解壓，約一秒；轉交器 ~10ms）。這組檢查釘住優先序：
+    # onedir 轉交器 > dist 轉交器 > onedir 本體 > onefile 本體 > 開發模式。
+    import contextlib
+    import io as _io
+    import importlib.util as _ilu
+    spec = _ilu.spec_from_file_location(
+        "install_association", os.path.join(PROJECT_ROOT, "tools",
+                                            "install_association.py"))
+    assoc = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(assoc)
+    _dist = os.path.join(PROJECT_ROOT, "dist")
+    _tiers = [
+        os.path.join(_dist, "MarkdownReader-onedir", "MarkdownOpen.exe"),
+        os.path.join(_dist, "MarkdownOpen.exe"),
+        os.path.join(_dist, "MarkdownReader-onedir", "MarkdownReader.exe"),
+        os.path.join(_dist, "MarkdownReader.exe"),
+    ]
+
+    def _resolve_with(existing):
+        """把 isfile 換成假清單後解析，回傳 (目標, 命令列, 印出的文字)。"""
+        real = assoc.os.path.isfile
+        table = {os.path.normcase(p) for p in existing}
+        assoc.os.path.isfile = lambda p: os.path.normcase(p) in table
+        buf = _io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                target, command = assoc.resolve_target(None)
+        finally:
+            assoc.os.path.isfile = real
+        return target, command, buf.getvalue()
+
+    t, _c, _o = _resolve_with(_tiers)
+    check("關聯解析①：四個目標都在時挑 onedir 轉交器（開著時 ~10ms）",
+          t == _tiers[0], t)
+    t, _c, _o = _resolve_with(_tiers[1:])
+    check("關聯解析②：沒有 onedir 轉交器時退到 dist 根目錄的轉交器",
+          t == _tiers[1], t)
+    t, _c, _o = _resolve_with(_tiers[2:])
+    check("關聯解析③：只剩本體時挑 onedir（冷啟動快近一倍）",
+          t == _tiers[2], t)
+    t, _c, warned = _resolve_with(_tiers[3:])
+    check("關聯解析④：只有 onefile 時仍可用，但要印自解壓警告",
+          t == _tiers[3] and "自解壓" in warned, f"{t} / 印出={warned[:40]}")
+    _t, cmd, _o = _resolve_with([])
+    check("關聯解析⑤：dist 全空時退回開發模式（pythonw + main.py）",
+          "main.py" in cmd, cmd)
+    explicit_t, explicit_c = assoc.resolve_target(
+        os.path.join(PROJECT_ROOT, "tools", "install_association.py"))
+    check("關聯解析⑥：--target 明確指定時照用、不走階梯",
+          explicit_t.endswith("install_association.py"), explicit_c)
 
     pipe_name = f"MarkdownReaderSmokeTest.{os.getpid()}"
     original_pipe = config.IPC_SERVER_NAME

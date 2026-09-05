@@ -3,7 +3,7 @@
 執行後，Markdown 檔案的「開啟檔案」清單裡就會出現本程式，圖示也會套用。
 
 用法：
-    py -3.13 tools/install_association.py                 # 自動找 dist\\MarkdownReader.exe，找不到就用開發模式
+    py -3.13 tools/install_association.py                 # 自動挑 dist 裡最快的目標（見 resolve_target），找不到就用開發模式
     py -3.13 tools/install_association.py --target "D:\\app\\MarkdownReader.exe"
     py -3.13 tools/install_association.py --set-default   # 一併嘗試設為預設開啟程式
     py -3.13 tools/install_association.py --uninstall     # 完整移除
@@ -38,7 +38,11 @@ def _project_root() -> str:
 
 
 def resolve_target(explicit: str | None) -> tuple[str, str]:
-    """決定要註冊的執行指令，回傳 (顯示用說明, 完整命令列樣板)。"""
+    """決定要註冊的執行指令，回傳 (顯示用說明, 完整命令列樣板)。
+
+    無 --target 時自動偵測，優先序見函式內的階梯註解——排序的依據是
+    「雙擊 .md 的實際等待時間」，尤其是本體已開著的二次開檔。
+    """
     if explicit:
         exe = os.path.abspath(explicit)
         if not os.path.isfile(exe):
@@ -46,9 +50,31 @@ def resolve_target(explicit: str | None) -> tuple[str, str]:
         return exe, f'"{exe}" "%1"'
 
     root = _project_root()
-    packaged = os.path.join(root, "dist", "MarkdownReader.exe")
-    if os.path.isfile(packaged):
-        return packaged, f'"{packaged}" "%1"'
+    dist = os.path.join(root, "dist")
+    # 依「開檔速度」排優先序，不是隨便挑一個存在的：
+    #   1. onedir 轉交器   冷啟動 ~710ms，本體已開著時 ~10ms
+    #   2. dist 根轉交器   已開著時一樣 ~10ms，冷啟動走 onefile
+    #   3. onedir 本體     冷 ~710ms，已開著時走單一實例交接 ~170ms
+    #   4. onefile 本體    冷 ~1300ms；已開著時還得先自解壓，~1000ms 起跳
+    # 以前這裡只認 dist\MarkdownReader.exe（onefile），照文件跑無參數安裝
+    # 就把每天最常見的動作（本體開著、再雙擊一個 .md）綁在最慢的路徑上。
+    # 轉交器是個不到 40KB 的原生程式，接上管道把路徑丟過去就退出，
+    # 不用付任何直譯器或解壓成本——所以排最前面。
+    ladder = [
+        os.path.join(dist, "MarkdownReader-onedir", "MarkdownOpen.exe"),
+        os.path.join(dist, "MarkdownOpen.exe"),
+        os.path.join(dist, "MarkdownReader-onedir", "MarkdownReader.exe"),
+        os.path.join(dist, "MarkdownReader.exe"),
+    ]
+    for exe in ladder:
+        if os.path.isfile(exe):
+            if exe == ladder[-1]:
+                print(
+                    "注意：只找到 onefile 版，本體已開著時再開檔每次都要先"
+                    "自解壓（約一秒）。建議先跑 .\\build.ps1 -OneDir 產生"
+                    "較快的目標後重新執行本安裝。"
+                )
+            return exe, f'"{exe}" "%1"'
 
     # 開發模式：用 pythonw.exe 執行 main.py，才不會跳出主控台視窗
     pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
