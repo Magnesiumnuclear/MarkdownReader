@@ -8,14 +8,15 @@
 
 | 分類 | 內容 |
 |------|------|
-| 開檔 | 接收 Windows 傳入的命令列路徑、`Ctrl+O` 選檔、拖放檔案到視窗 |
+| 開檔 | 接收 Windows 傳入的命令列路徑、`Ctrl+O` 選檔、拖放檔案到視窗；空白分頁可直接 `Ctrl+V` 貼上 Markdown 原始碼立刻排版 |
+| 安裝 | 安裝檔（每使用者、免系統管理員、關聯指向原生轉交器、可就地升級與乾淨反安裝）與可攜版 zip，由 `build.ps1 -Installer` 一鍵產出 |
 | 排版 | GitHub 風格 CSS、程式碼語法高亮、表格、任務清單、註腳、定義清單、刪除線、Mermaid 流程圖與序列圖（內嵌畫出） |
 | 視窗 | 無邊框 + 自訂標題列、拖曳移動（保留 Aero Snap）、四邊四角縮放、雙擊最大化 |
 | 閱讀 | 深淺色主題切換、字級縮放、`Ctrl+F` 搜尋並高亮全部符合項（可切換區分大小寫／全字；連 Mermaid 圖表裡的字都找得到；搜尋列是浮動面板，可拖到任何位置）、狀態列資訊 |
 | 設定 | 覆蓋式設定面板（`Ctrl+,`）：主題模式、字級、行高、內文寬度、行為開關，一鍵恢復預設 |
 | 主題 | 預設跟隨 Windows 深淺色設定並即時同步，也可手動鎖定淺色或深色 |
 | 語言 | 繁體中文 / English，預設跟隨系統；切換後所有開著的視窗立刻更新 |
-| 分頁 | 多分頁閱讀、中鍵關閉、分頁列可橫向捲動；可選擇記住上次開著的分頁 |
+| 分頁 | 多分頁閱讀、中鍵關閉、分頁列可橫向捲動；「＋」是一顆按鈕兩個功能（主區域開新分頁、右側箭頭展開「開啟檔案」）；可選擇記住上次開著的分頁 |
 | 單一實例 | 再雙擊 `.md` 會開在既有視窗的新分頁，而不是另開一個程式 |
 | 便利 | 釘選最上層、存檔後自動重載並保留閱讀位置、本機 `.md` 連結開在新分頁、點狀態列的路徑可在檔案總管中選取該檔、滑鼠移到連結上即在狀態列顯示目標 |
 | 穩健 | 多重編碼偵測（UTF-8 / BOM / cp950 / Big5 / GBK）、檔案鎖定重試、友善錯誤頁 |
@@ -763,10 +764,13 @@ rect = QRect(widget.mapToGlobal(QPoint(0, 0)), widget.size())   # 沒有 try
 
 轉交本身的成本也很低，實測（扣掉量測工具本身的開銷）：
 
-| 打包方式 | 雙擊第二個檔案到分頁出現 |
+| 關聯指向 | 雙擊第二個檔案到分頁出現 |
 |---|---|
-| 資料夾版 | **約 171 ms** |
-| 單一 exe | 約 1,064 ms |
+| 原生轉交器（`MarkdownOpen.exe`） | **約 12 ms**（量測地板本身就 13 ms） |
+| 資料夾版本體 | 約 172 ms |
+| 單一 exe 本體 | 約 1,112 ms |
+
+（2026-09 以 `tools/benchmark_handoff.py` 重測，各 8 次中位數。）
 
 單一 exe 慢的原因和冷啟動一樣——即使只是要送一個路徑然後結束，也得先把整包
 解壓到 `%TEMP%`。**常用檔案關聯的話，資料夾版的差距在這裡比冷啟動更有感。**
@@ -949,7 +953,8 @@ py -3.13 -m PyInstaller --noconfirm --clean build.spec
 powershell -ExecutionPolicy Bypass -File build.ps1
 ```
 
-`build.ps1` 也支援 `-OneDir`（資料夾版）與 `-Clean`（先清除舊產物）。
+`build.ps1` 也支援 `-OneDir`（資料夾版）、`-Clean`（先清除舊產物）與 `-Installer`（把資料夾版做成
+安裝檔＋可攜版 zip，見「安裝檔」一節）。
 
 ### 純 CLI 形式（不使用 spec）
 
@@ -985,8 +990,11 @@ py -3.13 -m PyInstaller --noconfirm --clean --onefile --windowed --noupx --name 
 
 | 打包方式 | 冷啟動到視窗出現 | 已開著時再雙擊一個檔 | 體積 | 行程數 |
 |---|---|---|---|---|
-| 單一 exe（`--onefile`） | **1,387 ms** | **1,064 ms** | 31.3 MB（單檔） | 2（啟動器 + 本體） |
-| 資料夾版（`--onedir`） | **625 ms** | **171 ms** | 73 MB（資料夾） | 1 |
+| 單一 exe（`--onefile`） | **1,173 ms** | **1,112 ms** | 31.5 MB（單檔） | 2（啟動器 + 本體） |
+| 資料夾版（`--onedir`） | **576 ms** | **172 ms** | 74 MB（資料夾） | 1 |
+| 資料夾版 ＋ 原生轉交器 | 576 ms | **12 ms** | 同上 ＋ 37 KB | 1 |
+
+（2026-09 重測；第三列就是安裝檔與 `install_association.py` 無參數時預設指向的目標，見「原生轉交器」一節。）
 
 差距的來源很單純：單一 exe 每次啟動都要把整包約 30 MB 解壓到 `%TEMP%`，資料夾版直接載入現成檔案。
 
@@ -1005,11 +1013,13 @@ powershell -ExecutionPolicy Bypass -File build.ps1 -OneDir
 
 輸出在 `dist\MarkdownReader-onedir\MarkdownReader.exe`。刻意不用預設的 `dist\MarkdownReader\`，是為了避免和單一 exe 的 `dist\MarkdownReader.exe` 只差一個副檔名而相鄰——清理或搬移時很容易誤刪對方。
 
-換成資料夾版之後，記得重新指向檔案關聯：
+換成資料夾版之後，記得重新指向檔案關聯——不帶參數就會自動挑最快的目標（資料夾版的轉交器）：
 
 ```bash
-py -3.13 tools/install_association.py --target "D:\software\Customize-Open-File\md\dist\MarkdownReader-onedir\MarkdownReader.exe"
+py -3.13 tools/install_association.py
 ```
+
+要給一般使用者的話，直接做成安裝檔（`build.ps1 -Installer`），關聯由安裝檔負責，見「安裝檔」一節。
 
 ### 啟動速度是怎麼調的
 
@@ -1294,10 +1304,15 @@ py -3.13 tools/benchmark_startup.py
 ```
 
 第二行的打包方式要**對應你的關聯指向哪個版本**（見下方），第三行順便確認這次改動
-沒有把啟動拖慢。
+沒有把啟動拖慢。要交付給別人時再加第四步：
 
-`build.ps1` 兩種模式都會自動檢查相依套件、必要時產生圖示，並在結尾印出測試指令與
-註冊關聯的指令，不需要自己記參數。
+```bash
+powershell -ExecutionPolicy Bypass -File build.ps1 -Installer
+```
+
+`build.ps1` 的打包模式都會自動檢查相依套件、必要時產生圖示，並在結尾印出測試指令與
+註冊關聯的指令，不需要自己記參數；`-Installer` 則不重新打包，只把已產出的資料夾版
+做成安裝檔與可攜版 zip（前置檢查缺一即停，見「安裝檔」一節）。
 
 **不要繞過 `build.ps1` 直接跑 PyInstaller。** 資料夾版的 COLLECT 階段會把整個
 `dist\MarkdownReader-onedir\` 刪掉重建，`MarkdownOpen.exe` 一起消失；只有第 5 步
@@ -1345,8 +1360,10 @@ PermissionError: [WinError 5] 存取被拒。: '...\dist\MarkdownReader.exe'
 
 | 關聯指向 | 必須用的指令 |
 |---|---|
+| `dist\MarkdownReader-onedir\MarkdownOpen.exe`（資料夾版的轉交器，無參數安裝的預設） | `build.ps1 -OneDir` |
+| `dist\MarkdownReader-onedir\MarkdownReader.exe`（資料夾版本體） | `build.ps1 -OneDir` |
 | `dist\MarkdownReader.exe`（單一 exe） | `build.ps1`（不加參數） |
-| `dist\MarkdownReader-onedir\MarkdownReader.exe`（資料夾版） | `build.ps1 -OneDir` |
+| `%LOCALAPPDATA%\Programs\MarkdownReader\MarkdownOpen.exe`（安裝版） | `build.ps1 -OneDir` 再 `build.ps1 -Installer`，然後重新執行安裝檔（就地升級） |
 
 **用錯的那個編譯，關聯指向的檔案不會被更新，而且完全沒有錯誤訊息。**實際會看到：
 
@@ -1373,6 +1390,7 @@ reg query "HKCU\Software\Classes\MarkdownReader.md\shell\open\command"
 | 換打包方式（單一 exe ↔ 資料夾版） | **要**，路徑變了 |
 | 搬移或更名 `dist/` 底下的檔案 | **要** |
 | 換了應用程式圖示 | 不用，但檔案總管可能顯示舊圖示；重跑一次會呼叫 `SHChangeNotify` 刷新 |
+| 這台機器裝了安裝檔 | **不要跑**——兩者寫同一個 ProgID，任一邊反安裝會摧毀另一邊；關聯交給安裝檔與它的反安裝器 |
 
 若關聯指向的檔案被刪掉或搬走，雙擊 `.md` 會跳出「找不到應用程式」。重新編譯回原
 路徑即可恢復，不需要重新註冊。
@@ -1389,6 +1407,11 @@ reg query "HKCU\Software\Classes\MarkdownReader.md\shell\open\command"
 
 ```
 main.py                     進入點：sys.argv、QApplication、全域例外攔截
+build.spec                  PyInstaller 設定（排除清單、DLL 過濾、版本資源）
+build.ps1                   打包腳本：五步驟打包；-Installer 另走「三道前置檢查→ISCC→可攜版 zip」
+installer/
+  MarkdownReader.iss        Inno Setup 腳本：每使用者、只寫 HKCU、關聯指向轉交器、反安裝旗標矩陣
+  ChineseTraditional.isl    繁中語言檔（vendored，安裝器本身不附帶）
 app/
   config.py                 常數（識別名稱、副檔名、尺寸、QSettings 鍵名）
   resources.py              資源路徑解析（相容 PyInstaller）
@@ -1398,13 +1421,13 @@ app/
   document.py               安全讀檔（編碼偵測、鎖定重試）+ Markdown 轉換
   qt_html.py                把 Markdown 輸出改寫成 Qt 能正確呈現的 HTML
   language.py               介面語言：t() 查表、跟隨系統、Qt 內建翻譯
-  title_bar.py              自訂標題列（拖曳、控制按鈕）
+  title_bar.py              自訂標題列（拖曳、控制按鈕）；IconButton 與分割按鈕 SplitIconButton（主區域＋展開箭頭）
   find_bar.py               Ctrl+F 搜尋列
   settings_panel.py         Ctrl+, 覆蓋式設定面板
   browser.py                閱讀區元件（核取方塊資源、圖片縮放、破圖佔位、Mermaid 圖片）
   mermaid/                  Mermaid 子集渲染器（model 契約、flowchart、layout、sequence、paint）
-  document_tab.py           單一分頁的狀態（內容、捲動位置、歷史、延後載入旗標）
-  tab_bar.py                分頁列與分頁按鈕、拖曳縮影（相對抓取點跟隨）、插入位置指示
+  document_tab.py           單一分頁的狀態（內容、貼上的內容、捲動位置、歷史、延後載入旗標、主題鍵 HTML 快取）
+  tab_bar.py                分頁列與分頁按鈕、「＋」分割按鈕、拖曳縮影（相對抓取點跟隨）、插入位置指示、關閉鈕覆蓋層
   single_instance.py        具名管道：把路徑交給既有實例
   window_manager.py         多視窗管理（分頁拆分/合併、單一實例路由、放置命中測試）
   viewer.py                 無邊框主視窗、分頁管理、邊緣縮放、檔案監看、快捷鍵
@@ -1419,6 +1442,8 @@ tools/
   render_baseline.json      基準線數據（與機器相關）
   smoke_test.py             功能回歸測試（每項對應一個真的發生過的問題）
   benchmark_handoff.py      轉交速度量測（轉交器 vs 直接啟動本體）
+  sandbox_acceptance.ps1    安裝檔的沙盒驗收：真安裝檔在 Sandboxie 裡裝／關聯啟動／執行中升級／反安裝（29 項）
+  sandbox_regdump.cmd       上者在沙盒內執行的登錄傾印小工具
 src_cpp/md_open/            原生轉交器（Win32，38 KB，見「原生轉交器」一節）
 .vscode/                    轉交器的 C++ 開發環境（IntelliSense、Ctrl+Shift+B 建置、F5 gdb 除錯）
 languages/*.json            介面字串（zh_TW / en，鍵扁平、兩檔逐鍵對齊）
