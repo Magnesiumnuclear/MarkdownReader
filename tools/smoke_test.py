@@ -2545,6 +2545,95 @@ def section_single_instance(args) -> None:
     check("關聯解析⑥：--target 明確指定時照用、不走階梯",
           explicit_t.endswith("install_association.py"), explicit_c)
 
+    # --- 安裝檔腳本的靜態檢查 -------------------------------------------------
+    # 動態安裝／反安裝（「安裝檔」區塊）要有 ISCC 與打包產物，offscreen/CI 大多
+    # 會 [略過]；真正可靠的護欄是這裡對 .iss 與 build.ps1 字面做的斷言，每一條
+    # 都有對應的突變會讓它變紅。只看會生效的行——註解裡會提到「不能用
+    # uninsdeletekey」這類字樣，不濾掉會被自己的說明釘死。
+    iss_path = os.path.join(PROJECT_ROOT, "installer", "MarkdownReader.iss")
+    isl_path = os.path.join(PROJECT_ROOT, "installer", "ChineseTraditional.isl")
+    check("安裝檔：腳本存在（installer\\MarkdownReader.iss）", os.path.isfile(iss_path))
+    iss_raw = open(iss_path, encoding="utf-8-sig").read() if os.path.isfile(iss_path) else ""
+    iss = LF.join(line for line in iss_raw.splitlines()
+                  if not line.lstrip().startswith(";"))
+    ps1_text = open(os.path.join(PROJECT_ROOT, "build.ps1"),
+                    encoding="utf-8-sig").read()
+
+    def _setup_value(key):
+        found = re.search(r"(?m)^" + re.escape(key) + r"\s*=\s*(.+?)\s*$", iss)
+        return found.group(1) if found else None
+
+    check("安裝檔：每使用者安裝、免系統管理員（PrivilegesRequired=lowest）",
+          _setup_value("PrivilegesRequired") == "lowest",
+          str(_setup_value("PrivilegesRequired")))
+    check("安裝檔：AppId 是固定 GUID（同一個才會就地升級）",
+          re.search(r'#define AppId "\{\{[0-9A-F-]{36}\}"', iss) is not None)
+    check("安裝檔：ChangesAssociations=yes（通知檔案總管重整關聯）",
+          _setup_value("ChangesAssociations") == "yes")
+    check("安裝檔：CloseApplications=yes（升級前請本體關閉）",
+          _setup_value("CloseApplications") == "yes")
+    check("安裝檔：64 位元安裝模式",
+          _setup_value("ArchitecturesInstallIn64BitMode") == "x64compatible")
+    check("安裝檔：AppVersion 沒有預設值，未定義就 #error（版本只能來自 build.ps1）",
+          re.search(r"#ifndef AppVersion\s*\n\s*#error", iss) is not None)
+    check("安裝檔：[Files] 明列 MarkdownOpen.exe（來源缺檔要讓 ISCC 直接失敗）",
+          re.search(r'Source:\s*"\{#SourceDir\}\\MarkdownOpen\.exe"', iss) is not None)
+    check("安裝檔：升級前整包清 {app}\\_internal（殘留舊版 Qt 外掛會當機）",
+          re.search(r'\[InstallDelete\]\s*\n\s*Type:\s*filesandordirs;\s*'
+                    r'Name:\s*"\{app\}\\_internal"', iss) is not None)
+    check("安裝檔：關聯 command 指向轉交器，字面與 install_association 相同",
+          r'"""{app}\MarkdownOpen.exe"" ""%1"""' in iss
+          and r'{app}\MarkdownReader.exe"" ""%1' not in iss)
+    check("安裝檔：DefaultIcon 也指向轉交器", r'{app}\MarkdownOpen.exe,0' in iss)
+    owp_exts = set(re.findall(r'\{#ClassesRoot\}\\(\.[a-z]+)\\OpenWithProgids', iss))
+    fa_exts = set(re.findall(
+        r'FileAssociations";\s*ValueType:\s*string;\s*ValueName:\s*"(\.[a-z]+)"', iss))
+    check("安裝檔：OpenWithProgids 的副檔名與 config.MARKDOWN_SUFFIXES 逐一相符",
+          owp_exts == set(config.MARKDOWN_SUFFIXES),
+          f"差集 {sorted(owp_exts ^ set(config.MARKDOWN_SUFFIXES))}")
+    check("安裝檔：Capabilities\\FileAssociations 的副檔名與 config 逐一相符",
+          fa_exts == set(config.MARKDOWN_SUFFIXES),
+          f"差集 {sorted(fa_exts ^ set(config.MARKDOWN_SUFFIXES))}")
+    # 反安裝旗標矩陣：三種鍵配三種旗標，錯一個就會砍到使用者的東西
+    progid_line = next((line for line in iss.splitlines()
+                        if r'Subkey: "{#ClassesRoot}\{#ProgId}"' in line), "")
+    check("安裝檔：ProgID 整棵用 uninsdeletekey（整棵都是我們的）",
+          "uninsdeletekey" in progid_line, progid_line[-70:])
+    owp_lines = [line for line in iss.splitlines() if r'\OpenWithProgids"' in line]
+    check("安裝檔：副檔名底下只刪自己的值（uninsdeletevalue），鍵空了才清",
+          bool(owp_lines) and all("uninsdeletevalue" in line
+                                  and "uninsdeletekeyifempty" in line
+                                  for line in owp_lines),
+          str([line[-70:] for line in owp_lines
+               if "uninsdeletevalue" not in line][:2]))
+    check("安裝檔：副檔名那一層絕不出現 uninsdeletekey（那是使用者的鍵）",
+          not any(re.search(r"\buninsdeletekey\b", line) for line in owp_lines))
+    reg_root_lines = [line for line in iss.splitlines()
+                      if r'Subkey: "{#AppRegRoot}' in line]
+    check("安裝檔：QSettings 的父鍵不出現 uninsdeletekey（只能砍 Capabilities 子樹）",
+          bool(reg_root_lines) and all(
+              r"\Capabilities" in line or "uninsdeletekey" not in line
+              for line in reg_root_lines))
+    check("安裝檔：全部只寫 HKCU，不碰 HKLM",
+          "HKLM" not in iss and "Root: HKA" not in iss and "Root: HKCU" in iss)
+    check("安裝檔：繁中語言檔 vendored 且以相對路徑引用",
+          os.path.isfile(isl_path)
+          and 'MessagesFile: "ChineseTraditional.isl"' in iss)
+    check("安裝檔：不寫副檔名預設值（UserChoice 下無效，反安裝也難處理）",
+          re.search(r'Subkey:\s*"\{#ClassesRoot\}\\\.[a-z]+";', iss) is None)
+    check("安裝檔：反安裝時詢問是否移除設定，預設保留",
+          "CustomMessage('RemoveSettings')" in iss and "IDNO) = IDYES" in iss)
+    check("build.ps1 -Installer：三道前置檢查都在（onedir 本體、轉交器、ISCC）",
+          all(marker in ps1_text for marker in (
+              r'dist\MarkdownReader-onedir\MarkdownReader.exe"',
+              r'dist\MarkdownReader-onedir\MarkdownOpen.exe"',
+              "ISCC.exe")))
+    check("build.ps1 -Installer：ISCC 經 Invoke-Native 呼叫並檢查 $LASTEXITCODE",
+          re.search(r"Invoke-Native -File \$iscc[^\n]*\n\s*if \(\$LASTEXITCODE -ne 0\)",
+                    ps1_text) is not None)
+    check("build.ps1 -Installer：版本只接受純數字三段",
+          r'(\d+\.\d+\.\d+)' in ps1_text)
+
     pipe_name = f"MarkdownReaderSmokeTest.{os.getpid()}"
     original_pipe = config.IPC_SERVER_NAME
     config.IPC_SERVER_NAME = pipe_name
@@ -4601,6 +4690,151 @@ def section_mermaid(args) -> None:
     mermaid.clear_caches()
 
 
+# ===========================================================================
+# 區塊：安裝檔
+# ===========================================================================
+def section_installer(args) -> None:
+    """安裝檔的動態檢查：編譯測試變體、靜默安裝到暫存目錄、驗證、靜默反安裝、驗證。
+
+    【完全不碰真正的關聯】測試變體把登錄根改到 HKCU\\Software\\SamHoTest、
+    AppId 與群組名也換掉，所以就算開發機上裝著正式版，也不會被當成升級、
+    不會被覆蓋、更不會在反安裝時被連坐刪除。先前用「reg export 備份、跑完 import
+    還原」的想法不成立——import 是合併不是回滾，救不回被刪掉的鍵。
+
+    需要 Inno Setup 6 的 ISCC.exe 與已打包的 dist\\MarkdownReader-onedir（含轉交器）；
+    沒有就印 [略過] 明講並記進僅實機清單，不假裝通過。
+    """
+    import shutil
+    import subprocess
+    import tempfile
+    import time
+    import winreg
+
+    candidates = (
+        os.path.join(os.environ.get("ProgramFiles(x86)", ""), "Inno Setup 6", "ISCC.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Inno Setup 6", "ISCC.exe"),
+    )
+    iscc = next((p for p in candidates if os.path.isfile(p)), None)
+    onedir = os.path.join(PROJECT_ROOT, "dist", "MarkdownReader-onedir")
+    if iscc is None or not os.path.isfile(os.path.join(onedir, "MarkdownOpen.exe")):
+        label = "安裝檔動態檢查（需要 Inno Setup 6 與 dist\\MarkdownReader-onedir 含轉交器）"
+        _SKIP.append(label)
+        print(f"    [略過] {label}")
+        return
+
+    test_root = r"Software\SamHoTest"
+
+    def reg_value(subkey, name):
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, subkey) as key:
+                return winreg.QueryValueEx(key, name)[0]
+        except OSError:
+            return None
+
+    def reg_key_exists(subkey):
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, subkey):
+                return True
+        except OSError:
+            return False
+
+    def reg_delete_tree(subkey):
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, subkey, 0, winreg.KEY_READ) as key:
+                children = []
+                index = 0
+                while True:
+                    try:
+                        children.append(winreg.EnumKey(key, index))
+                        index += 1
+                    except OSError:
+                        break
+        except FileNotFoundError:
+            return
+        for child in children:
+            reg_delete_tree(subkey + "\\" + child)
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, subkey)
+
+    real_key = r"Software\Classes\MarkdownReader.md\shell\open\command"
+    real_before = reg_value(real_key, "")
+    tmp = tempfile.mkdtemp(prefix="mdr-installer-")
+    app_dir = os.path.join(tmp, "app")
+    try:
+        compile_args = [
+            iscc, "/Q", "/DAppVersion=9.9.9",
+            "/DAppId={{0E7C1F6A-2D3B-4C2B-9A1D-5E6F7A8B9C0D}",
+            "/DGroupName=MarkdownReader-Test",
+            "/DClassesRoot=" + test_root + r"\Classes",
+            "/DAppRegRoot=" + test_root + r"\MarkdownReader",
+            "/DRegisteredAppsKey=" + test_root + r"\RegisteredApplications",
+            "/DUserDataDir=" + os.path.join(tmp, "userdata"),
+            "/DOutputDir=" + tmp,
+            "/DOutputBaseFilename=Setup-test",
+            os.path.join(PROJECT_ROOT, "installer", "MarkdownReader.iss"),
+        ]
+        compiled = subprocess.run(compile_args, capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", timeout=300)
+        check("安裝檔動態：測試變體可編譯（登錄根改到 SamHoTest）",
+              compiled.returncode == 0, (compiled.stdout + compiled.stderr)[-300:])
+        if compiled.returncode != 0:
+            return
+        setup = os.path.join(tmp, "Setup-test.exe")
+        installed = subprocess.run(
+            [setup, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=" + app_dir],
+            timeout=300)
+        check("安裝檔動態：靜默安裝結束碼 0", installed.returncode == 0,
+              str(installed.returncode))
+        check("安裝檔動態：本體、轉交器、反安裝器、_internal 都裝進去",
+              all(os.path.isfile(os.path.join(app_dir, name))
+                  for name in ("MarkdownReader.exe", "MarkdownOpen.exe", "unins000.exe"))
+              and os.path.isdir(os.path.join(app_dir, "_internal")))
+        command = reg_value(test_root + r"\Classes\MarkdownReader.md\shell\open\command", "")
+        check("安裝檔動態：關聯 command 指向安裝目錄的轉交器",
+              command == '"' + os.path.join(app_dir, "MarkdownOpen.exe") + '" "%1"',
+              str(command))
+        check("安裝檔動態：六個副檔名的 OpenWithProgids 都登記了",
+              all(reg_value(test_root + r"\Classes\{}\OpenWithProgids".format(ext),
+                            "MarkdownReader.md") is not None
+                  for ext in config.MARKDOWN_SUFFIXES))
+        check("安裝檔動態：Capabilities 與 RegisteredApplications 齊全",
+              reg_value(test_root + r"\MarkdownReader\Capabilities", "ApplicationName")
+              == "Markdown Reader"
+              and reg_value(test_root + r"\MarkdownReader\Capabilities\FileAssociations", ".md")
+              == "MarkdownReader.md"
+              and reg_value(test_root + r"\RegisteredApplications", "MarkdownReader")
+              == test_root + r"\MarkdownReader\Capabilities")
+        check("安裝檔動態：真正的關聯完全沒被動到",
+              reg_value(real_key, "") == real_before, str(reg_value(real_key, "")))
+
+        removed = subprocess.run(
+            [os.path.join(app_dir, "unins000.exe"), "/VERYSILENT", "/SUPPRESSMSGBOXES",
+             "/NORESTART"], timeout=300)
+        check("安裝檔動態：靜默反安裝結束碼 0", removed.returncode == 0,
+              str(removed.returncode))
+        # 反安裝器會先把自己複製到暫存目錄再接手，原行程先退出；等它真的收完尾
+        for _ in range(75):
+            if (not os.path.isfile(os.path.join(app_dir, "MarkdownReader.exe"))
+                    and not reg_key_exists(test_root + r"\Classes\MarkdownReader.md")):
+                break
+            time.sleep(0.2)
+        check("安裝檔動態：反安裝後 ProgID 整棵刪除",
+              not reg_key_exists(test_root + r"\Classes\MarkdownReader.md"))
+        check("安裝檔動態：反安裝後副檔名鍵本身保留、空掉的 OpenWithProgids 清掉",
+              reg_key_exists(test_root + r"\Classes\.md")
+              and not reg_key_exists(test_root + r"\Classes\.md\OpenWithProgids"))
+        check("安裝檔動態：反安裝後 Capabilities 刪、設定父鍵保留（預設不清設定）",
+              not reg_key_exists(test_root + r"\MarkdownReader\Capabilities")
+              and reg_key_exists(test_root + r"\MarkdownReader"))
+        check("安裝檔動態：反安裝後 RegisteredApplications 的值刪掉",
+              reg_value(test_root + r"\RegisteredApplications", "MarkdownReader") is None)
+        check("安裝檔動態：反安裝後檔案清空",
+              not os.path.isfile(os.path.join(app_dir, "MarkdownReader.exe"))
+              and not os.path.isdir(os.path.join(app_dir, "_internal")))
+    finally:
+        reg_delete_tree(test_root)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 SECTIONS = [
     ("渲染與閱讀", section_rendering),
     ("渲染快取", section_render_cache),
@@ -4612,6 +4846,7 @@ SECTIONS = [
     ("視窗與邊緣縮放", section_window),
     ("單一實例", section_single_instance),
     ("關閉穩定度", section_teardown),
+    ("安裝檔", section_installer),
 ]
 
 

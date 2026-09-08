@@ -1046,9 +1046,9 @@ py -3.13 tools/smoke_test.py
 | `--list` | 列出所有區塊 |
 | `--runs 20` | 提高關閉穩定度測試的重複次數（預設 12） |
 
-涵蓋十個區塊：渲染與閱讀、渲染快取、Mermaid 圖表、介面語言、分頁操作、
+涵蓋十一個區塊：渲染與閱讀、渲染快取、Mermaid 圖表、介面語言、分頁操作、
 分頁狀態還原、分頁拖曳（移動／拆分／合併）、視窗與邊緣縮放、單一實例、
-關閉穩定度。`--onscreen` 全開共 **422 項**；offscreen 模式跑其中 **415 項**，
+關閉穩定度、安裝檔。`--onscreen` 全開共 **483 項**；offscreen 模式跑其中 **476 項**，
 剩下 7 項問的是真視窗系統——WS_EX_TOPMOST 原生樣式、原生 z-order 的幽靈
 命中測試（四條）、GetCursorPos 座標換算、原生視窗標題比對——虛擬螢幕上
 沒有這些東西可問，硬跑只會拿假把手換假答案。跳過的每一條都印 `[僅實機]`
@@ -1161,6 +1161,78 @@ py -3.13 tools/benchmark_startup.py
 - 除了和基準線比對，另有絕對上限（例如資料夾版 1800ms）當作沒有基準線時的保底。
 - `tools/startup_baseline.json` 記錄的是**某台機器上**的數字，換機器一定不同；
   換機器時先跑一次 `--update-baseline` 重新建立。
+
+---
+
+## 安裝檔
+
+```bash
+.\build.ps1 -OneDir        # 先產出資料夾版（安裝檔只裝這一種，冷啟動比單一 exe 快一倍）
+.\build.ps1 -Installer     # 產出 dist\MarkdownReader-Setup-<版本>.exe 與可攜版 zip
+```
+
+需要 Inno Setup 6：`winget install JRSoftware.InnoSetup`。腳本在 `installer\MarkdownReader.iss`。
+
+### 它做什麼
+
+- **每使用者安裝、免系統管理員**（`PrivilegesRequired=lowest`），預設裝到
+  `%LOCALAPPDATA%\Programs\MarkdownReader`。
+- **只寫 HKCU**：ProgID、六個副檔名的「開啟檔案」清單，以及 Default Programs 登錄
+  （`Capabilities`＋`RegisteredApplications`，讓程式出現在 Windows「預設應用程式」清單）。
+  關聯指向**轉交器** `MarkdownOpen.exe`——本體已開著時再開檔約 10ms。
+- 開始功能表捷徑必建；桌面捷徑可選（預設不勾）。安裝介面繁中／英文跟隨系統；
+  繁中語言檔 vendored 在 `installer\ChineseTraditional.isl`（安裝器本身不附帶）。
+- **就地升級**：同一個 AppId。升級前整包清 `{app}\_internal`——Inno 不會刪未列出
+  的舊檔，殘留的舊版 Qt 外掛會被掃描載入而當機。本體執行中會透過 Restart Manager
+  請你先關閉（`CloseApplications=yes`）。
+- **反安裝只刪我們的**：ProgID 整棵、副檔名底下自己那個值、`Capabilities` 子樹、
+  `RegisteredApplications` 的值。使用者的副檔名鍵與 QSettings **保留**，除非在反安裝
+  時對「一併移除設定」答「是」（那也會刪 `%LOCALAPPDATA%\MarkdownReader`）；靜默
+  反安裝一律保留。
+
+反安裝旗標的分配是整件事最容易出錯的地方，三種鍵配三種旗標：
+
+| 鍵 | 旗標 | 為什麼 |
+|---|---|---|
+| `Classes\MarkdownReader.md` 整棵 | `uninsdeletekey` | 整棵都是我們的 |
+| `Classes\<ext>\OpenWithProgids` 的**值** | `uninsdeletevalue uninsdeletekeyifempty` | 只刪自己的值，鍵空了才順手清 |
+| `Classes\<ext>` 本身 | **不寫、不刪** | 那是使用者的鍵，裡面有別的程式的登記 |
+| `SamHo\MarkdownReader\Capabilities` | `uninsdeletekey`（只此子樹） | 父鍵是 QSettings，砍到就把承諾保留的設定一起刪了 |
+
+### 三道 fail-fast
+
+`-Installer` 在呼叫 ISCC 之前先擋，缺一即結束碼 1：資料夾版不存在；**轉交器不存在**
+（它是條件式編譯，缺 g++/CMake 的機器打包不會有——沒這道門，安裝檔會把關聯指向
+不存在的檔案：白紙圖示、雙擊沒反應、還沒有任何錯誤訊息）；找不到 ISCC。
+版本只接受純數字三段（`app\__init__.py` 的 `__version__`），`.iss` 對 `AppVersion`
+沒有預設值、未定義直接 `#error`；本體 exe 的版本資源（`build.spec`）與安裝檔同源。
+
+### 與 `install_association.py` 擇一
+
+兩者寫**同一個** ProgID 與同一組副檔名鍵，只是指向不同位置；任一邊的反安裝都會
+整棵刪掉，摧毀另一邊。那支腳本的定位是「從原始碼執行」與「可攜版」；裝了安裝檔的
+機器，關聯交給安裝檔與它的反安裝器，不要再跑腳本。
+
+### 已知限制
+
+- 未簽章：安裝檔與本體 exe 首次執行都會被 SmartScreen 攔「未知的發行者」，不只安裝檔。
+- 改安裝目錄、或從可攜版搬到安裝版，舊目錄不會被清。
+- 即使 Default Programs 登錄齊全，Windows 的 UserChoice 仍讓程式無法自行搶下預設，
+  只是出現在清單供手動選（和 `install_association.py` 的說明一致）。
+
+### 測試
+
+- **靜態檢查**在「單一實例」區塊：旗標矩陣、副檔名兩處列舉逐一比對
+  `config.MARKDOWN_SUFFIXES`、command 字面與腳本相同、只出現 HKCU、`[Files]` 明列
+  轉交器、`[InstallDelete]` 清 `_internal`、`build.ps1` 的三道前置檢查與 ISCC 結束碼
+  判定……每一條都有一個突變會讓它變紅。這是可靠的護欄——動態檢查在 offscreen/CI
+  多半會跳過。
+- **動態檢查**在「安裝檔」區塊：編譯**測試變體**（登錄根改到 `HKCU\Software\SamHoTest`、
+  不同的 AppId 與群組名）、靜默安裝到暫存目錄、驗證檔案與登錄、靜默反安裝、驗證只刪
+  我們的——**全程不碰真正的關聯**，並斷言真正的關聯前後相同。沒有 ISCC 或打包產物
+  時印 `[略過]` 明講。
+- **手動驗收清單**（動態檢查刻意不做的，因為要真的開 GUI 且動真正的登錄）：
+  本體執行中做升級與反安裝的提示流程；換安裝目錄；乾淨機器上雙擊 `.md` 確認圖示與開啟。
 
 ---
 

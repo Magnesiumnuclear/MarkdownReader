@@ -3,12 +3,15 @@
 #   .\build.ps1              單一 exe（隱藏主控台）
 #   .\build.ps1 -OneDir      資料夾版（啟動快很多，建議用於檔案關聯）
 #   .\build.ps1 -Clean       打包前先清掉 build/ 與 dist/
+#   .\build.ps1 -Installer   把資料夾版做成安裝檔＋可攜版 zip（需先 -OneDir；需要 Inno Setup 6）
 #
 # 需求：py -3.13 -m pip install -r requirements.txt
+#       安裝檔另需 winget install JRSoftware.InnoSetup
 
 param(
     [switch]$OneDir,
-    [switch]$Clean
+    [switch]$Clean,
+    [switch]$Installer
 )
 
 $ErrorActionPreference = "Stop"
@@ -49,6 +52,71 @@ function Invoke-Native {
     } finally {
         $ErrorActionPreference = $previous
     }
+}
+
+# --- 安裝檔模式（-Installer）------------------------------------------------
+# 不重新打包：只把已產出的 dist\MarkdownReader-onedir 做成安裝檔與可攜版 zip。
+# 三道前置檢查缺一即停，第二道最重要——轉交器是條件式編譯（第 5 步缺 g++/CMake
+# 會略過），沒有它安裝檔會把 .md 關聯指向不存在的檔案：白紙圖示、雙擊沒反應，
+# 而且完全沒有錯誤訊息。
+if ($Installer) {
+    Write-Host "=== Markdown 閱讀器安裝檔 ===" -ForegroundColor Cyan
+
+    # 版本單一來源 app\__init__.py。只接受純數字三段：ISCC 的 VersionInfoVersion
+    # 只吃數字點分，1.0.0-beta 這種要到編譯時才爆，這裡先擋。
+    $initText = Get-Content -Path "app\__init__.py" -Raw -Encoding UTF8
+    if ($initText -notmatch '(?m)^__version__\s*=\s*"(\d+\.\d+\.\d+)"') {
+        Write-Host "app\__init__.py 找不到純數字三段的 __version__（例如 1.0.0）" -ForegroundColor Red
+        exit 1
+    }
+    $version = $Matches[1]
+
+    $onedirExe = "dist\MarkdownReader-onedir\MarkdownReader.exe"
+    $launcher = "dist\MarkdownReader-onedir\MarkdownOpen.exe"
+    if (-not (Test-Path $onedirExe)) {
+        Write-Host "找不到 $onedirExe。先跑 .\build.ps1 -OneDir 產出資料夾版。" -ForegroundColor Red
+        exit 1
+    }
+    if (-not (Test-Path $launcher)) {
+        Write-Host "找不到 $launcher：轉交器沒編出來（需要 MSYS2 UCRT64 的 g++ 與 CMake）。" -ForegroundColor Red
+        Write-Host "沒有轉交器的安裝檔會把 .md 關聯指向不存在的檔案，拒絕繼續。" -ForegroundColor Red
+        exit 1
+    }
+    $isccCandidates = @(
+        "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+        "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+    )
+    $iscc = $isccCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $iscc) {
+        Write-Host "找不到 Inno Setup 6 的 ISCC.exe。安裝：winget install JRSoftware.InnoSetup" -ForegroundColor Red
+        exit 1
+    }
+
+    Write-Host "`n[1/2] 編譯安裝檔（版本 $version）..."
+    Write-Host "  ISCC：$iscc"
+    Invoke-Native -File $iscc -Arguments @("/Q", "/DAppVersion=$version", "installer\MarkdownReader.iss")
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "ISCC 失敗（結束碼 $LASTEXITCODE）" -ForegroundColor Red
+        exit 1
+    }
+    $setup = "dist\MarkdownReader-Setup-$version.exe"
+    if (-not (Test-Path $setup)) {
+        Write-Host "ISCC 回 0 卻找不到 $setup" -ForegroundColor Red
+        exit 1
+    }
+
+    Write-Host "`n[2/2] 打包可攜版 zip..."
+    $zip = "dist\MarkdownReader-$version-portable.zip"
+    if (Test-Path $zip) { Remove-Item -Force $zip }
+    Compress-Archive -Path "dist\MarkdownReader-onedir\*" -DestinationPath $zip
+
+    $setupMb = "{0:N1}" -f ((Get-Item $setup).Length / 1MB)
+    $zipMb = "{0:N1}" -f ((Get-Item $zip).Length / 1MB)
+    Write-Host "`n安裝檔：$setup（$setupMb MB）" -ForegroundColor Green
+    Write-Host "可攜版：$zip（$zipMb MB）" -ForegroundColor Green
+    Write-Host "`n安裝檔與 tools\install_association.py 寫同一組 .md 關聯，同一台機器請擇一使用。"
+    # 明確回 0（理由同下方打包流程的結尾）
+    exit 0
 }
 
 Write-Host "=== Markdown 閱讀器打包 ===" -ForegroundColor Cyan

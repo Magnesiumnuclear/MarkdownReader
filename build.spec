@@ -20,6 +20,50 @@ import os
 #     $env:MDREADER_ONEDIR = "1"; py -3.13 -m PyInstaller --noconfirm --clean build.spec
 ONEFILE = os.environ.get("MDREADER_ONEDIR", "") != "1"
 
+import re
+
+from PyInstaller.utils.win32.versioninfo import (
+    FixedFileInfo,
+    StringFileInfo,
+    StringStruct,
+    StringTable,
+    VarFileInfo,
+    VarStruct,
+    VSVersionInfo,
+)
+
+
+def _read_version() -> tuple:
+    """版本單一來源 app/__init__.py；只接受純數字三段（版本資源只吃數字）。"""
+    root = globals().get("SPECPATH") or os.getcwd()
+    with open(os.path.join(root, "app", "__init__.py"), encoding="utf-8") as handle:
+        match = re.search(r'^__version__\s*=\s*"(\d+)\.(\d+)\.(\d+)"', handle.read(), re.M)
+    if not match:
+        raise SystemExit("app/__init__.py 找不到純數字三段的 __version__（例如 1.0.0）")
+    return tuple(int(part) for part in match.groups())
+
+
+_VERSION = _read_version()
+_VERSION_TEXT = "%d.%d.%d.0" % _VERSION
+# exe 的版本資源（檔案總管「內容 › 詳細資料」看得到）。本體與安裝檔的版本都從
+# 同一個 __version__ 來：安裝檔那邊由 build.ps1 -Installer 讀同一個檔再傳給 ISCC。
+VERSION_INFO = VSVersionInfo(
+    ffi=FixedFileInfo(filevers=_VERSION + (0,), prodvers=_VERSION + (0,)),
+    kids=[
+        StringFileInfo([
+            StringTable("040904B0", [
+                StringStruct("CompanyName", "SamHo"),
+                StringStruct("FileDescription", "Markdown Reader"),
+                StringStruct("FileVersion", _VERSION_TEXT),
+                StringStruct("ProductName", "Markdown Reader"),
+                StringStruct("ProductVersion", _VERSION_TEXT),
+                StringStruct("OriginalFilename", "MarkdownReader.exe"),
+            ]),
+        ]),
+        VarFileInfo([VarStruct("Translation", [0x0409, 1200])]),
+    ],
+)
+
 # 用不到的 Python 模組。
 # 特別注意 PIL / numpy：pygments.formatters.img 會 import PIL，PIL 的 hook 又
 # 把 numpy 一起拉進來，光這兩個就會讓 exe 多出約 12MB（含 20MB 的 OpenBLAS）。
@@ -127,6 +171,7 @@ if ONEFILE:
         codesign_identity=None,
         entitlements_file=None,
         icon=["assets/app.ico"],
+        version=VERSION_INFO,
     )
 else:
     exe = EXE(
@@ -142,6 +187,7 @@ else:
         console=False,
         disable_windowed_traceback=False,
         icon=["assets/app.ico"],
+        version=VERSION_INFO,
     )
     # 資料夾刻意命名為 MarkdownReader-onedir，而不是預設的 MarkdownReader：
     # 單一 exe 版的輸出是 dist\MarkdownReader.exe，兩者若只差一個副檔名而相鄰，

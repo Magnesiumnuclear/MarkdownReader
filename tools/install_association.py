@@ -13,6 +13,13 @@ Windows 10/11 以 UserChoice 雜湊保護預設程式設定，第三方程式無
 登錄檔強制指定。若 .md 先前已被其他程式關聯，--set-default 不會生效，請改用
     右鍵 .md 檔 → 開啟檔案 → 選擇其他應用程式 → 勾選「一律使用此應用程式」
 此時清單中已經有本程式（因為 ProgID 已註冊完成）。
+
+【與安裝檔擇一，不要並用】
+安裝檔（build.ps1 -Installer 產出的 MarkdownReader-Setup-*.exe）寫的是**同一個**
+ProgID（MarkdownReader.md）與同一組副檔名鍵，只是指向安裝目錄。兩邊都做整棵
+刪除：安裝檔的反安裝會清掉這支腳本註冊的關聯，這支腳本的 --uninstall 也會清掉
+安裝版的。這支腳本的定位是「從原始碼執行」與「可攜版（解壓 zip）」；裝了安裝檔
+的機器，關聯交給安裝檔與它的反安裝器管理，不要再跑這支腳本。
 """
 
 from __future__ import annotations
