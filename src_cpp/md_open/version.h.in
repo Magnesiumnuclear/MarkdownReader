@@ -1,0 +1,5 @@
+// 由 CMake 從 app/__init__.py 的 __version__ 產生，不要手動編輯，也不要納入版控。
+// 版本號的單一來源就是那一行；轉交器以前把版本寫死在 app.rc，升版時忘了改，
+// 於是 1.1.0 的安裝檔裡裝著一個標示 1.0.0.0 的執行檔。
+#define APP_VERSION_CSV @APP_VERSION_CSV@
+#define APP_VERSION_STR "@APP_VERSION_STR@"

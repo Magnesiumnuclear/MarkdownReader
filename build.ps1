@@ -82,6 +82,15 @@ if ($Installer) {
         Write-Host "沒有轉交器的安裝檔會把 .md 關聯指向不存在的檔案，拒絕繼續。" -ForegroundColor Red
         exit 1
     }
+    # 第四道：資料夾版產物的版本要和 __version__ 一致。只檢查「檔案在不在」的話，
+    # 拿一份舊的 onedir 也會照編，做出「檔名與 DisplayVersion 是新版、裝進去的
+    # 執行檔卻是舊版」的安裝檔——而且完全看不出來。
+    $onedirVer = (Get-Item $onedirExe).VersionInfo.FileVersion
+    if ($onedirVer -notmatch "^$([regex]::Escape($version))(\.|$)") {
+        Write-Host "資料夾版產物的版本是 $onedirVer，但 __version__ 是 $version。" -ForegroundColor Red
+        Write-Host "先跑 .\build.ps1 -OneDir 重新產出，再打包安裝檔。" -ForegroundColor Red
+        exit 1
+    }
     $isccCandidates = @(
         "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
         "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"

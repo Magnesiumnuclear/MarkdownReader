@@ -7,9 +7,14 @@
 
 1 ICON "../../assets/app.ico"
 
+// 版本號不在這裡寫死：version.h 由 CMake 從 app/__init__.py 的 __version__ 產生
+// （見 CMakeLists.txt）。以前寫死在這裡，升版時沒人記得改，1.1.0 的安裝檔裡
+// 就裝著一個標示 1.0.0.0 的轉交器。
+#include "version.h"
+
 1 VERSIONINFO
-FILEVERSION     1,0,0,0
-PRODUCTVERSION  1,0,0,0
+FILEVERSION     APP_VERSION_CSV
+PRODUCTVERSION  APP_VERSION_CSV
 BEGIN
     BLOCK "StringFileInfo"
     BEGIN
@@ -17,7 +22,7 @@ BEGIN
         BEGIN
             VALUE "FileDescription", "Markdown 閱讀器啟動器"
             VALUE "ProductName", "Markdown 閱讀器"
-            VALUE "FileVersion", "1.0.0.0"
+            VALUE "FileVersion", APP_VERSION_STR
             VALUE "OriginalFilename", "MarkdownOpen.exe"
         END
     END

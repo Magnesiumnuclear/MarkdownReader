@@ -30,7 +30,8 @@ param(
     [string]$Box = "DefaultBox",
     [string]$SandboxieDir = "",
     [string]$SandboxRoot = "",
-    [string]$Setup = ""
+    [string]$Setup = "",
+    [string]$UpgradeFrom = ""
 )
 $ErrorActionPreference = "Continue"
 $repo = Split-Path $PSScriptRoot -Parent
@@ -47,6 +48,14 @@ if (-not (Test-Path $Setup)) {
     Write-Host "找不到安裝檔 $Setup，先跑 .\build.ps1 -Installer" -ForegroundColor Red
     exit 1
 }
+# -UpgradeFrom 指定舊版安裝檔時，步驟 1 先裝那一版、步驟 3 才升到 $Setup——
+# 那才是使用者真正會走的路。不指定就沿用同一個安裝檔（同版本重裝），兩條都要能過。
+$baseSetup = if ($UpgradeFrom) { $UpgradeFrom } else { $Setup }
+if (-not (Test-Path $baseSetup)) {
+    Write-Host "找不到 -UpgradeFrom 指定的舊版安裝檔 $baseSetup" -ForegroundColor Red
+    exit 1
+}
+$baseVersion = if ((Split-Path $baseSetup -Leaf) -match '(\d+\.\d+\.\d+)') { $Matches[1] } else { $version }
 
 # --- Sandboxie 位置：參數 > 開始功能表捷徑 > Program Files ------------------------------
 if (-not $SandboxieDir) {
@@ -144,8 +153,8 @@ Write-Host "=== Sandboxie 驗收：$Setup → 沙盒 $Box ===" -ForegroundColor 
 Write-Host "== 0. 清空沙盒 =="
 Check "開跑前沙盒是空的" (SbxDelete) $SandboxRoot
 
-Write-Host "== 1. 靜默安裝（真正的安裝檔、真正的登錄根）=="
-$rc = Sbx @("`"$Setup`"", "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART") 300
+Write-Host "== 1. 靜默安裝（真正的安裝檔、真正的登錄根）：$baseVersion =="
+$rc = Sbx @("`"$baseSetup`"", "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART") 300
 Check "靜默安裝結束碼 0" ($rc -eq 0) "rc=$rc"
 $launcher = Get-ChildItem $SandboxRoot -Recurse -Filter "MarkdownOpen.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
 $appDirHost = if ($launcher) { $launcher.DirectoryName } else { "" }
@@ -163,7 +172,7 @@ if ($otherApps.Count -gt 0) {
 }
 Check "Capabilities 齊全（ApplicationName）" ((Section $d1 "cap") -match "ApplicationName\s+REG_SZ\s+Markdown Reader") ""
 Check "RegisteredApplications 的值存在" ((Section $d1 "regapps") -match "Software\\SamHo\\MarkdownReader\\Capabilities") ""
-Check "Uninstall 項存在且 DisplayVersion 正確" ((Section $d1 "uninstall") -match "DisplayVersion\s+REG_SZ\s+$([regex]::Escape($version))") ""
+Check "Uninstall 項存在且 DisplayVersion 正確" ((Section $d1 "uninstall") -match "DisplayVersion\s+REG_SZ\s+$([regex]::Escape($baseVersion))") ""
 
 Write-Host "== 2. 在沙盒裡靠檔案關聯開 sample.md =="
 Get-Process -Name MarkdownReader -ErrorAction SilentlyContinue | Stop-Process -Force
@@ -181,7 +190,7 @@ if ($appProc) { try { $exePath = $appProc.Path } catch { $exePath = "" } }
 Check "起來的是安裝版那份，不是 dist" ($exePath -like "*Programs\MarkdownReader\MarkdownReader.exe") $exePath
 Start-Sleep -Seconds 2
 
-Write-Host "== 3. 本體執行中升級（同 AppId，/CLOSEAPPLICATIONS）=="
+Write-Host "== 3. 本體執行中升級（同 AppId，/CLOSEAPPLICATIONS）：$baseVersion -> $version =="
 $canary = Join-Path $appDirHost "_internal\canary_from_old_version.txt"
 if ($appDirHost) { Set-Content -Path $canary -Value "old" }
 $rc2 = Sbx @("`"$Setup`"", "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS") 300
@@ -193,6 +202,12 @@ Check "_internal 在重鋪前被整包清掉（金絲雀消失）" (-not (Test-P
 Check "升級後檔案齊全" ((Test-Path "$appDirHost\MarkdownReader.exe") -and (Test-Path "$appDirHost\MarkdownOpen.exe") -and (Test-Path "$appDirHost\_internal\base_library.zip")) ""
 $d2 = RegDump "after_upgrade"
 Check "升級後關聯仍指向安裝目錄" ((Section $d2 "command") -match "$escapedDir\\MarkdownOpen\.exe") ""
+# AppId 對不上時 Inno 會做出「第二份安裝」：兩筆控制台項目、兩個反安裝器，
+# 而上面那條正向比對 DisplayVersion 照樣會綠。這條問的是「舊那份有沒有被取代」。
+Check "升級沒有變成第二份安裝（沒有 unins001.exe）" `
+    ($appDirHost -and -not (Test-Path (Join-Path $appDirHost "unins001.exe"))) $appDirHost
+# 跨版本升級才問得出來的一條：控制台顯示的版本要換成新的，不能留在舊版
+Check "升級後 DisplayVersion 是新版本" ((Section $d2 "uninstall") -match "DisplayVersion\s+REG_SZ\s+$([regex]::Escape($version))") ((Section $d2 "uninstall") -replace '\s+', ' ')
 
 Write-Host "== 4. 靜默反安裝（預設保留設定）=="
 $rc3 = Sbx @("`"$(Join-Path $installDirInside 'unins000.exe')`"", "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART") 300

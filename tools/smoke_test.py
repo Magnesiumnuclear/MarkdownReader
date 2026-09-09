@@ -2866,6 +2866,31 @@ def section_single_instance(args) -> None:
           re.search(r"#ifndef AppVersion\s*\n\s*#error", iss) is not None)
     check("安裝檔：[Files] 明列 MarkdownOpen.exe（來源缺檔要讓 ISCC 直接失敗）",
           re.search(r'Source:\s*"\{#SourceDir\}\\MarkdownOpen\.exe"', iss) is not None)
+    # 轉交器的版本資源以前寫死在 app.rc，升版沒人記得改——1.1.0 的安裝檔裡
+    # 裝著一個標示 1.0.0.0 的執行檔。現在由 CMake 從 app/__init__.py 產生
+    # version.h；這兩條擋的是「有人又把版本抄回 .rc 裡」。
+    rc_path = os.path.join(PROJECT_ROOT, "src_cpp", "md_open", "app.rc")
+    with open(rc_path, encoding="utf-8") as handle:
+        rc_text = handle.read()
+    cmake_path = os.path.join(PROJECT_ROOT, "src_cpp", "md_open", "CMakeLists.txt")
+    with open(cmake_path, encoding="utf-8") as handle:
+        cmake_text = handle.read()
+    check("轉交器：app.rc 不寫死版本號，用 CMake 產生的巨集",
+          "APP_VERSION_CSV" in rc_text and "APP_VERSION_STR" in rc_text
+          and re.search(r"FILEVERSION\s+\d+\s*,", rc_text) is None,
+          re.search(r"FILEVERSION.*", rc_text).group(0) if "FILEVERSION" in rc_text else "沒有 FILEVERSION")
+    # regdump 查的是寫死的 AppId；和 .iss 對不上時，「Uninstall 項已刪」那條會
+    # 因為永遠查不到鍵而假通過——反安裝根本沒驗到。
+    iss_appid = re.search(r'#define\s+AppId\s+"\{\{([0-9A-Fa-f-]+)\}?"', iss)
+    regdump_path = os.path.join(PROJECT_ROOT, "tools", "sandbox_regdump.cmd")
+    with open(regdump_path, encoding="utf-8", errors="replace") as handle:
+        regdump_text = handle.read()
+    check("安裝檔：沙盒 regdump 查的 AppId 與 .iss 相同（否則反安裝檢查會假通過）",
+          iss_appid is not None and iss_appid.group(1) in regdump_text,
+          iss_appid.group(1) if iss_appid else "在 .iss 找不到 AppId")
+    check("轉交器：CMakeLists 從 app/__init__.py 讀版本（版本來源只有一個）",
+          "app/__init__.py" in cmake_text.replace("\\", "/")
+          and "__version__" in cmake_text and "configure_file" in cmake_text)
     check("安裝檔：升級前整包清 {app}\\_internal（殘留舊版 Qt 外掛會當機）",
           re.search(r'\[InstallDelete\]\s*\n\s*Type:\s*filesandordirs;\s*'
                     r'Name:\s*"\{app\}\\_internal"', iss) is not None)
