@@ -87,7 +87,23 @@ from app import config  # noqa: E402
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASELINE_PATH = os.path.join(PROJECT_ROOT, "tools", "render_baseline.json")
-README_DOC = os.path.join(PROJECT_ROOT, "README.md")
+# 「真實混合文件」的輪廓：拿真的文件量，補足合成輪廓看不到的結構混雜。
+# 素材是 docs/ 八個分冊依檔名順序接起來（約 1 360 行）。README 拆分前這裡量的是
+# 1 500 行的 README；拆分後單一分冊最多三百多行，量起來只剩幾毫秒、貼著雜訊，
+# 接起來才保住原本的量級與代表性。指標鍵名 sethtml_readme 為了基準線的歷史
+# 連續性沿用舊名，不隨素材換掉。
+PROFILE_DIR = os.path.join(PROJECT_ROOT, "docs")
+
+
+def profile_source() -> str:
+    parts = []
+    for filename in sorted(os.listdir(PROFILE_DIR)):
+        if filename.endswith(".md"):
+            with open(os.path.join(PROFILE_DIR, filename), encoding="utf-8") as handle:
+                parts.append(handle.read())
+    if not parts:
+        raise SystemExit(f"找不到分冊：{PROFILE_DIR}")
+    return "\n\n".join(parts)
 
 THEME = "light"
 
@@ -290,8 +306,7 @@ def _probe_qt(name: str, docs: dict[str, str], runs: int) -> list[float]:
     _QAPP = QApplication.instance() or QApplication([])
 
     if name == "sethtml_readme":
-        with open(README_DOC, encoding="utf-8") as handle:
-            source = handle.read()
+        source = profile_source()
     else:
         source = docs[name[len("sethtml_") :]]
 

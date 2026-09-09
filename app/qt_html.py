@@ -84,8 +84,23 @@ class MermaidPreprocessor(Preprocessor):
 
     _OPEN_RE = re.compile(r"^(?P<indent>[ ]{0,3})(?P<fence>`{3,}|~{3,})[ \t]*mermaid\b")
     # 任何圍欄的開頭（含沒有語言標記的）。用來略過別的圍欄的內容：
-    # 展示用的程式碼區塊裡寫著 ```mermaid 是「文字」，不是圖表
-    _ANY_FENCE_RE = re.compile(r"^[ ]{0,3}(?P<fence>`{3,}|~{3,})")
+    # 展示用的程式碼區塊裡寫著 ```mermaid 是「文字」，不是圖表。
+    # rest 抓圍欄後面的資訊字串：反引號圍欄的資訊字串裡不能再有反引號
+    # （CommonMark 的規則，fenced_code 也照這個判），否則那只是行首的行內碼——
+    # 例如「```` ```mermaid ```` 區塊會…」這種說明句。曾經把它當成沒關上的
+    # 四反引號圍欄，之後整份文件的 mermaid 圖全部不畫，而且沒有任何提示。
+    _ANY_FENCE_RE = re.compile(r"^[ ]{0,3}(?P<fence>`{3,}|~{3,})(?P<rest>.*)$")
+
+    @classmethod
+    def _other_fence(cls, line: str) -> str | None:
+        """這行是不是別種圍欄的開頭；是就回傳圍欄字串。"""
+        match = cls._ANY_FENCE_RE.match(line)
+        if match is None:
+            return None
+        fence = match.group("fence")
+        if fence[0] == "`" and "`" in match.group("rest"):
+            return None
+        return fence
 
     def run(self, lines: list[str]) -> list[str]:
         out: list[str] = []
@@ -98,12 +113,12 @@ class MermaidPreprocessor(Preprocessor):
                 index += 1
                 # 別的圍欄（```python、~~~、甚至光禿禿的 ```）整塊原樣跳過：
                 # 裡面出現的 ```mermaid 是被展示的文字，不是圖表。實際踩過的例子
-                # 就是本專案的 README——說明管線的程式碼區塊裡寫著 ```mermaid，
+                # 就是本專案的 docs/02-Mermaid.md——說明管線的程式碼區塊裡寫著 ```mermaid，
                 # 沒有這一段會被當成真的圍欄攔走，整個區塊被打散。
                 # 收尾找不到就照原樣走到檔尾，與 fenced_code 對沒關上的圍欄一致。
-                other = self._ANY_FENCE_RE.match(lines[index - 1])
+                other = self._other_fence(lines[index - 1])
                 if other is not None:
-                    closing = self._find_closing(lines, index, other.group("fence"))
+                    closing = self._find_closing(lines, index, other)
                     stop = (closing + 1) if closing is not None else total
                     out.extend(lines[index:stop])
                     index = stop

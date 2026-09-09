@@ -186,7 +186,7 @@ if ($packed -ne 0) {
 
 # 5. 原生轉交器（有 g++ 才編；沒有就沿用舊產物或略過，主程式不受影響）
 #    它讓「已開著時再雙擊 .md」從約 170 ms 降到約 10 ms，
-#    檔案關聯建議指向它而不是本體（見 README「原生轉交器」一節）。
+#    檔案關聯建議指向它而不是本體（見 docs\05-單一實例與轉交器.md 的「原生轉交器」節）。
 # 旗標的單一事實來源在 src_cpp\md_open\CMakeLists.txt，
 # 工具鏈（g++ / windres / make 的路徑）釘在同目錄的 CMakePresets.json，
 # VS Code 的 CMake「建置」按鈕與這裡走的是同一套定義。

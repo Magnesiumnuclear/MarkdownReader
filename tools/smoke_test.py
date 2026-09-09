@@ -58,6 +58,7 @@ from app import config  # noqa: E402
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SAMPLE = os.path.join(PROJECT_ROOT, "sample.md")
 README = os.path.join(PROJECT_ROOT, "README.md")
+MERMAID_DOC = os.path.join(PROJECT_ROOT, "docs", "02-Mermaid.md")
 
 _PASS: list[str] = []
 _FAIL: list[tuple[str, str]] = []
@@ -4257,7 +4258,7 @@ def section_mermaid(args) -> None:
                      "```mermaid\n" + seq_src + "\n```\n\n"
                      "```mermaid\nclassDiagram\n  Animal <|-- Duck\n```\n\n"
                      "```mermaid\ngraph TD\n  A --> B\n  這行壞了 !!!\n```\n")
-    # 覆審抓到的：展示用圍欄裡寫著 ```mermaid 是文字不是圖表——README 自己的
+    # 覆審抓到的：展示用圍欄裡寫著 ```mermaid 是文字不是圖表——docs/02-Mermaid.md 自己的
     # 管線說明就是這樣寫的，被攔走整個區塊會被打散
     IMG_RE = re.compile(r'<img[^>]+src="mermaid:')
     NOTE_RE = re.compile(r'<table class="notice mermaid-note"')
@@ -4269,11 +4270,29 @@ def section_mermaid(args) -> None:
           len(IMG_RE.findall(fenced_html)) == 1 and not NOTE_RE.findall(fenced_html)
           and "graph TD" in fenced_html,
           f"img={len(IMG_RE.findall(fenced_html))} note={len(NOTE_RE.findall(fenced_html))}")
-    with open(README, encoding="utf-8") as handle:
-        readme_html = document.markdown_to_html(handle.read(), "light")
-    check("整合：README 轉換後沒有任何真的 mermaid 圖或標示（管線圖是展示文字）",
-          not IMG_RE.findall(readme_html) and not NOTE_RE.findall(readme_html),
-          f"img={len(IMG_RE.findall(readme_html))} note={len(NOTE_RE.findall(readme_html))}")
+    with open(MERMAID_DOC, encoding="utf-8") as handle:
+        mermaid_doc_html = document.markdown_to_html(handle.read(), "light")
+    check("整合：docs/02-Mermaid.md 轉換後沒有任何真的 mermaid 圖或標示（管線圖是展示文字）",
+          not IMG_RE.findall(mermaid_doc_html) and not NOTE_RE.findall(mermaid_doc_html),
+          f"img={len(IMG_RE.findall(mermaid_doc_html))} note={len(NOTE_RE.findall(mermaid_doc_html))}")
+    # 上一條曾經是空過的：docs/02 第一段以「```` ```mermaid ````」這個行內碼開頭，
+    # 前處理器把它當成沒關上的四反引號圍欄，之後整份文件的 mermaid 都不畫——
+    # 所以「沒有任何真的圖」永遠成立。突變（在檔尾接一張真的圖）抓到的。
+    # 這兩條釘住：行首行內碼不是圍欄；docs/02 接一張真的圖要真的畫出來。
+    with open(MERMAID_DOC, encoding="utf-8") as handle:
+        mermaid_doc_source = handle.read()
+    appended_html = document.markdown_to_html(
+        mermaid_doc_source + "\n```mermaid\ngraph TD\n  A --> B\n```\n", "light")
+    check("整合：docs/02-Mermaid.md 檔尾接一張真的圖會畫出來（上一條不是空過）",
+          len(IMG_RE.findall(appended_html)) == 1 and not NOTE_RE.findall(appended_html),
+          f"img={len(IMG_RE.findall(appended_html))} note={len(NOTE_RE.findall(appended_html))}")
+    span_html = document.markdown_to_html(
+        "```` ```mermaid ```` 是行內碼，不是圍欄。\n\n"
+        "```mermaid\ngraph TD\n  A --> B\n```\n", "light")
+    check("整合：行首的四反引號行內碼不是圍欄，後面的 mermaid 圍欄照畫",
+          len(IMG_RE.findall(span_html)) == 1 and not NOTE_RE.findall(span_html)
+          and "```mermaid" in span_html,
+          f"img={len(IMG_RE.findall(span_html))} note={len(NOTE_RE.findall(span_html))}")
 
     viewer = MarkdownViewer(doc_path)
     viewer.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
