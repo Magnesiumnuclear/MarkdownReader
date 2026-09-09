@@ -2868,7 +2868,9 @@ def section_tab_dnd(args) -> None:
     """
     import tempfile as _tempfile
 
-    from PyQt6.QtCore import QEvent, QEventLoop, QPoint, QPointF, QSettings, Qt, QTimer
+    from PyQt6.QtCore import (
+        QEvent, QEventLoop, QPoint, QPointF, QRect, QSettings, Qt, QTimer,
+    )
     from PyQt6.QtGui import QMouseEvent
     from PyQt6.QtWidgets import QApplication
 
@@ -3714,14 +3716,55 @@ def section_tab_dnd(args) -> None:
               ghost is not None and ghost.isVisible()
               and ghost.frameGeometry().contains(probe),
               str(ghost.frameGeometry()) if ghost is not None else "無幽靈")
-        check("命中測試穿過幽靈，答出的是來源視窗而不是 DragGhost",
+        top_now = _wm.top_level_widget_at(probe)
+        check("命中測試穿過幽靈，答出的是自家視窗而不是 DragGhost",
+              top_now is host or top_now is under, type(top_now).__name__)
+        # 以前這裡斷言「放在自己視窗上＝拆分」。現在來源本體蓋住 under 的
+        # 分頁列要看穿：命中的是 under（真實 z-order 由 win32.window_stack_at
+        # 走出來，這條就是它的實機驗證）。移動事件一路上 _drag_intent_at 已經
+        # 把被蓋住的 under 疊上來了，下一條驗的就是那個 raise 真的生效。
+        info = manager4.drop_target_info_at(probe, exclude=host)
+        check("游標落在幽靈內、來源本體蓋住 under 的分頁列：看穿命中 under",
+              info is not None and info[0] is under, repr(info))
+        pump(300)
+        check("被蓋住的目標被疊上來：此刻探測點的最上層是 under（原生 z-order）",
+              _wm.top_level_widget_at(probe) is under,
+              type(_wm.top_level_widget_at(probe)).__name__)
+        release_at(btn, QPoint(start.x(), bar.mapToGlobal(bar.rect().center()).y()))
+        pump(400)
+        check("拖曳結束（放開在自己列上）：來源疊回最上層",
               _wm.top_level_widget_at(probe) is host,
               type(_wm.top_level_widget_at(probe)).__name__)
-        check("游標落在幽靈內時，放在自己視窗上仍判定為拆分（不被幽靈騙）",
-              manager4.drop_target_at(probe, exclude=host) is None,
-              repr(manager4.drop_target_at(probe, exclude=host)))
-        release_at(btn, QPoint(start.x(), bar.mapToGlobal(bar.rect().center()).y()))
+
+        # 釘選置頂的來源蓋住目標：raise_ 疊不過去，改暫時置頂目標；結束還原。
+        # 直接用 win32 設置頂（不走標題列的釘選鈕，host 自己的旗標維持 False）。
+        _win32.set_topmost(int(host.winId()), True)
+        pump(200)
+        host.activate_tab(0)
+        pump(200)
+        btn = bar._buttons[0]
+        start = press_at(btn, QPoint(8, 8))
+        for step in (1, 2, 3):
+            move_to(btn, QPoint(
+                start.x() + (probe.x() - start.x()) * step // 3,
+                start.y() + (probe.y() - start.y()) * step // 3,
+            ))
+        move_to(btn, probe)
         pump(300)
+        check("釘選置頂的來源蓋住目標：目標被暫時置頂，探測點的最上層是 under",
+              _win32.is_topmost(int(under.winId()))
+              and _wm.top_level_widget_at(probe) is under,
+              f"topmost={_win32.is_topmost(int(under.winId()))} "
+              f"top={type(_wm.top_level_widget_at(probe)).__name__}")
+        release_at(btn, QPoint(start.x(), bar.mapToGlobal(bar.rect().center()).y()))
+        pump(400)
+        check("拖曳結束：目標的置頂還原（本來沒釘選）、來源仍置頂",
+              not _win32.is_topmost(int(under.winId()))
+              and _win32.is_topmost(int(host.winId())),
+              f"under={_win32.is_topmost(int(under.winId()))} "
+              f"host={_win32.is_topmost(int(host.winId()))}")
+        _win32.set_topmost(int(host.winId()), False)
+        pump(200)
     elif not _offscreen():
         print("    [略過] 桌面環境遮住探測點，守門三條未執行")
 
@@ -3849,6 +3892,195 @@ def section_tab_dnd(args) -> None:
     check("拖曳中關窗：全域覆蓋游標已還原", _QAppC.overrideCursor() is None)
     check("拖曳中關窗：幽靈已收掉（不殘留在畫面最上層）",
           ghost_ref is None or not _is_alive_and_visible(ghost_ref))
+
+    # --- 看穿自家視窗的本體：分頁列被蓋住也能合併 -----------------------------
+    # 使用者的抱怨：視窗 1 的本體蓋住視窗 2 的分頁列，分頁就永遠併不進去。
+    # 真實 z-order 只有實機問得到（上面 onscreen 那組），這裡換掉
+    # manager.stack_probe 餵假堆疊，逐條驗 drop_target_info_at 的規則本身：
+    # 來源本體看穿、來源放置區是重排地盤、別的程式的視窗擋、最上層就是別的
+    # 程式時退回幾何掃描、問不到堆疊也退回；再驗視窗層「被蓋住就疊上來、
+    # 拖曳結束把來源疊回去」。
+    from app import window_manager as _wm_rules
+
+    under.move(host_geo.left() + 30, host_geo.top() + 240)
+    pump(300)
+    ux, uy, uw, uh = under.tab_bar.global_drop_rect()
+    covered = QPoint(ux + 40, uy + uh // 2)
+    check("看穿前置：探測點在 under 的放置區、也在 host 的框架內",
+          host.frameGeometry().contains(covered)
+          and QRect(ux, uy, uw, uh).contains(covered),
+          f"covered={covered} host={host.frameGeometry()}")
+    saved_probe = manager4.stack_probe
+
+    def _fake_stack(stack):
+        return lambda _pos: stack
+
+    try:
+        manager4.stack_probe = _fake_stack([host, under])
+        info = manager4.drop_target_info_at(covered, exclude=host)
+        check("看穿：來源本體蓋住 under 的分頁列，命中 under 並列出蓋住它的來源",
+              info is not None and info[0] is under and info[2] == (host,), repr(info))
+        check("看穿：兩元組版本與三元組同一個答案",
+              info is not None
+              and manager4.drop_target_at(covered, exclude=host) == (info[0], info[1]),
+              repr(manager4.drop_target_at(covered, exclude=host)))
+        manager4.stack_probe = _fake_stack([under, host])
+        info = manager4.drop_target_info_at(covered, exclude=host)
+        check("看穿：under 就在最上層時命中且沒有人蓋住它",
+              info is not None and info[0] is under and info[2] == (), repr(info))
+        manager4.stack_probe = _fake_stack([host, _wm_rules.FOREIGN, under])
+        check("看穿：來源本體底下先碰到別的程式的視窗，不合併",
+              manager4.drop_target_info_at(covered, exclude=host) is None,
+              repr(manager4.drop_target_info_at(covered, exclude=host)))
+        geo = manager4._scan_by_geometry(covered, host)
+        check("看穿前置：幾何掃描本身找得到 under", geo is not None and geo[0] is under, repr(geo))
+        manager4.stack_probe = _fake_stack(None)
+        check("看穿：問不到堆疊 → 退回幾何掃描",
+              manager4.drop_target_at(covered, exclude=host) == geo,
+              repr(manager4.drop_target_at(covered, exclude=host)))
+        manager4.stack_probe = _fake_stack([])
+        check("看穿：堆疊是空的 → 也退回幾何掃描",
+              manager4.drop_target_at(covered, exclude=host) == geo,
+              repr(manager4.drop_target_at(covered, exclude=host)))
+        # 別的程式的視窗在最上層（游標壓在它身上）：點在 under 框架內代表那條
+        # 分頁列被它蓋住 → 不併；放置區超出框架上緣的那一小圈（TEAR_OFF_MARGIN
+        # 48 － 標題列 36 = 12px）落在桌面上，分頁列本身看得到 → 照舊合併
+        manager4.stack_probe = _fake_stack([_wm_rules.FOREIGN])
+        check("看穿：游標壓在別的程式的視窗上、點在 under 框架內 → 不併（分頁列被它蓋住）",
+              manager4.drop_target_info_at(covered, exclude=host) is None,
+              repr(manager4.drop_target_info_at(covered, exclude=host)))
+        overshoot = QPoint(ux + 40, under.frameGeometry().top() - 4)
+        check("看穿前置：溢出點在 under 的放置區內、框架外",
+              QRect(ux, uy, uw, uh).contains(overshoot)
+              and not under.frameGeometry().contains(overshoot),
+              f"overshoot={overshoot} zone={(ux, uy, uw, uh)} frame={under.frameGeometry()}")
+        hit = manager4.drop_target_info_at(overshoot, exclude=host)
+        check("看穿：溢出框架的容忍帶落在別的程式上，分頁列看得到 → 照舊合併",
+              hit is not None and hit[0] is under and hit[2] == (), repr(hit))
+        # 來源自己的放置區是列內重排的地盤：即使 under 的放置區也含這個點，
+        # 仍然是 None。把 under 挪到和 host 分頁列同高、水平交疊來製造這個點。
+        under.move(host.x() + 60, host.y())
+        pump(300)
+        hx, hy, hw, hh = host.tab_bar.global_drop_rect()
+        ux2, uy2, uw2, uh2 = under.tab_bar.global_drop_rect()
+        both = QPoint(max(hx, ux2) + 20, hy + hh // 2)
+        check("看穿前置：這個點同時落在 host 的分頁列與 under 的放置區",
+              QRect(hx, hy, hw, hh).contains(both) and QRect(ux2, uy2, uw2, uh2).contains(both),
+              f"both={both} host={(hx, hy, hw, hh)} under={(ux2, uy2, uw2, uh2)}")
+        manager4.stack_probe = _fake_stack([host, under])
+        check("看穿：點在來源自己的放置區 → None（重排的地盤，不看穿）",
+              manager4.drop_target_info_at(both, exclude=host) is None,
+              repr(manager4.drop_target_info_at(both, exclude=host)))
+        under.move(host_geo.left() + 30, host_geo.top() + 240)
+        pump(300)
+        # 第三個視窗（單分頁，放置區是標題列）的本體蓋住 under 的分頁列：一樣看穿
+        third = manager4.create_window(docs[1])
+        third.move(host_geo.right() + 40, host_geo.top() + 300)
+        pump(300)
+        manager4.stack_probe = _fake_stack([third, under])
+        info = manager4.drop_target_info_at(covered, exclude=host)
+        check("看穿：第三個視窗的本體蓋住 under 的分頁列，也看穿並列出它",
+              info is not None and info[0] is under and info[2] == (third,), repr(info))
+
+        # 解析器：原生 HWND 清單 → 視窗／FOREIGN 的對應（正式路徑的
+        # window_stack_at）。offscreen 沒有 HWND 可問，暫時換掉平台守門、座標
+        # 換算與原生查詢，餵一串假的 raw 清單：自家 HWND 對回視窗、不認得的
+        # 自家頂層略過、第一個別的程式收成 FOREIGN 就停。
+        saved_native = (_wm_rules._is_offscreen, _wm_rules._native_point,
+                        _wm_rules.win32.window_stack_at)
+        try:
+            _wm_rules._is_offscreen = lambda: False
+            _wm_rules._native_point = lambda _pos: (1, 1)
+            raw = [(int(host.winId()), True), (999999, True), (int(third.winId()), True),
+                   (424242, False), (int(under.winId()), True)]
+            _wm_rules.win32.window_stack_at = lambda _x, _y: list(raw)
+            stack = manager4.window_stack_at(covered)
+            check("解析器：自家 HWND 對回視窗、不認得的頂層略過、別的程式收成 FOREIGN 就停",
+                  stack == [host, third, _wm_rules.FOREIGN], repr(stack))
+            _wm_rules.win32.window_stack_at = lambda _x, _y: None
+            check("解析器：原生查詢問不出來 → None（走幾何掃描）",
+                  manager4.window_stack_at(covered) is None)
+        finally:
+            (_wm_rules._is_offscreen, _wm_rules._native_point,
+             _wm_rules.win32.window_stack_at) = saved_native
+
+        # 視窗層：被蓋住的目標要疊上來讓使用者看到；同一目標只疊一次；
+        # 疊不過釘選置頂的遮擋就暫時置頂、結束時還原；拖曳結束把來源疊回去。
+        # offscreen 沒有真 z-order，用實例屬性遮住 raise_ 記錄呼叫，並換掉
+        # pin_over 與 win32.set_topmost 記錄置頂動作。
+        raised: list[str] = []
+        pins: list = []
+        tops: list = []
+        under.raise_ = lambda: raised.append("under")
+        host.raise_ = lambda: raised.append("host")
+        saved_pin = manager4.pin_over
+        saved_set_topmost = _wm_rules.win32.set_topmost
+        manager4.pin_over = lambda target, occluders: (pins.append((target, occluders)), False)[1]
+        _wm_rules.win32.set_topmost = lambda handle, on: (tops.append((handle, on)), True)[1]
+        try:
+            manager4.stack_probe = _fake_stack([host, under])
+            host._drag_raised = None
+            intent = host._drag_intent_at(covered, True)
+            check("視窗層：被蓋住的目標預告為合併，而且被疊上來",
+                  intent == "merge" and raised == ["under"], f"{intent} {raised}")
+            check("視窗層：疊上來時帶著蓋住它的視窗去問要不要暫時置頂",
+                  pins == [(under, (host,))], repr(pins))
+            host._drag_intent_at(covered, True)
+            check("視窗層：游標在同一目標上滑動不重複疊",
+                  raised == ["under"] and len(pins) == 1, f"{raised} {len(pins)}")
+            check("視窗層：目標分頁列有指示線",
+                  under.tab_bar._insert_marker.isVisible())
+            host._clear_insert_markers()
+            check("視窗層：拖曳結束把來源疊回去、狀態清空",
+                  raised == ["under", "host"] and host._drag_raised is None,
+                  f"{raised} {host._drag_raised}")
+            # 暫時置頂：pin_over 說「有置頂」→ 記在案，結束時還原成目標自己的
+            # 釘選狀態（under 沒釘選 → 取消置頂）
+            manager4.pin_over = lambda target, occluders: True
+            raised.clear()
+            host._drag_intent_at(covered, True)
+            check("視窗層：暫時置頂的目標記在案", host._drag_pinned == [under],
+                  repr(host._drag_pinned))
+            host._clear_insert_markers()
+            check("視窗層：拖曳結束還原目標自己的釘選狀態（沒釘選 → 取消置頂）",
+                  tops == [(int(under.winId()), False)] and host._drag_pinned == [],
+                  f"{tops} {host._drag_pinned}")
+            # 目標在拖曳中被關掉：還原只做身分比較、不碰已刪除的包裝，不能崩
+            gone = manager4.create_window(docs[1])
+            gone.move(host_geo.left() + 30, host_geo.top() + 240)
+            pump(300)
+            gbar = gone.title_bar
+            gtl = gbar.mapToGlobal(gbar.rect().topLeft())
+            gone_pt = QPoint(gtl.x() + 40, gtl.y() + gbar.height() // 2)
+            manager4.stack_probe = _fake_stack([host, gone])
+            host._drag_raised = None
+            host._drag_intent_at(gone_pt, True)
+            check("視窗層前置：疊上來並暫時置頂的是 gone",
+                  host._drag_raised is gone and host._drag_pinned == [gone],
+                  f"{host._drag_raised} {host._drag_pinned}")
+            gone.close()
+            pump(400)
+            tops.clear()
+            host._clear_insert_markers()
+            check("視窗層：目標在拖曳中被關掉，結束時不崩、狀態清空",
+                  host._drag_pinned == [] and host._drag_raised is None and tops == [],
+                  f"{host._drag_pinned} {host._drag_raised} {tops}")
+            manager4.pin_over = lambda target, occluders: False
+            raised.clear()
+            manager4.stack_probe = _fake_stack([under, host])
+            host._drag_intent_at(covered, True)
+            check("視窗層：目標沒被蓋住就不疊", raised == [], str(raised))
+            host._clear_insert_markers()
+            check("視窗層：沒疊過別人，結束時也不動來源", raised == [], str(raised))
+        finally:
+            manager4.pin_over = saved_pin
+            _wm_rules.win32.set_topmost = saved_set_topmost
+            del under.raise_
+            del host.raise_
+        third.close()
+        pump(300)
+    finally:
+        manager4.stack_probe = saved_probe
 
     for w in manager4.windows():
         w.close()

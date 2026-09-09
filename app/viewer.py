@@ -614,9 +614,22 @@ class MarkdownViewer(QWidget):
         """
         if self._manager is None:
             return "none"
-        target = self._manager.drop_target_at(global_pos, exclude=self)
+        info = self._manager.drop_target_info_at(global_pos, exclude=self)
+        target = None if info is None else (info[0], info[1])
         self._update_insert_markers(target)
-        if target is not None:
+        if info is not None:
+            target_window, _, occluders = info
+            # 目標的分頁列被自家視窗（多半就是來源視窗）蓋住：先把它疊上來，
+            # 使用者放開前看得到那條分頁列與指示線，不是併進一個看不見的地方。
+            # 只在目標換人時做一次；游標在同一個目標上滑動不重複 SetWindowPos。
+            # 蓋住它的若是釘選置頂的視窗，raise_ 疊不過去，改暫時置頂（記在
+            # _drag_pinned）。拖曳結束後由 _clear_insert_markers 還原置頂、
+            # 把來源疊回去。
+            if occluders and target_window is not self._drag_raised:
+                self._drag_raised = target_window
+                target_window.raise_()
+                if self._manager.pin_over(target_window, occluders):
+                    self._drag_pinned.append(target_window)
             return "merge"
         if outside_band and len(self._tabs) > 1:
             return "detach"
@@ -638,11 +651,32 @@ class MarkdownViewer(QWidget):
                 window.tab_bar.hide_insert_marker()
 
     def _clear_insert_markers(self) -> None:
+        """拖曳結束（放開或取消，落點不論）的收尾：清指示線、把來源疊回去。
+
+        分頁列的 drag_ended 在放開決策**之前**觸發。拖曳中若曾把被蓋住的
+        目標疊上來，這裡先把來源疊回去：放開在目標上時，接著的
+        _on_tab_detached 會再把目標疊上並啟用，最後在上面的仍是目標；放開在
+        別處時，來源不該被自己發起的拖曳壓到後面。只用身分比較、不碰那個
+        視窗的屬性——它可能在拖曳期間被關掉了。
+        """
+        raised = self._drag_raised
+        self._drag_raised = None
+        pinned = self._drag_pinned
+        self._drag_pinned = []
+        for window in pinned:
+            # 還原成它自己的釘選狀態。視窗可能在拖曳期間被關掉了：WA_DeleteOnClose
+            # 之後 sip 包裝碰一下就是 RuntimeError，當作已經不用還原。
+            try:
+                win32.set_topmost(int(window.winId()), bool(window._always_on_top))
+            except RuntimeError:
+                pass
         if self._manager is None:
             self.tab_bar.hide_insert_marker()
             return
         for window in self._manager.windows():
             window.tab_bar.hide_insert_marker()
+        if raised is not None and raised is not self:
+            self.raise_()
 
     def _on_tab_detached(
         self, index: int, global_pos, allow_new_window: bool = True
@@ -916,6 +950,11 @@ class MarkdownViewer(QWidget):
         self.tab_bar.detachRequested.connect(self._on_tab_detached)
         self.tab_bar.drop_intent_probe = self._drag_intent_at
         self.tab_bar.drag_ended = self._clear_insert_markers
+        # 拖曳中被疊上來的目標視窗（它的分頁列原本被自家視窗蓋住），以及
+        # 為了疊過釘選置頂的遮擋而暫時置頂的目標（結束時逐一還原）；
+        # 見 _drag_intent_at 與 _clear_insert_markers
+        self._drag_raised = None
+        self._drag_pinned: list = []
         # 「＋」的主區域＝開新分頁（可直接貼上），右側展開選單＝開啟檔案。
         # 以前 newTabRequested 接的是 open_dialog，和它自己的提示文字
         #「開新分頁 (Ctrl+T)」對不上——按下去跳出的是開檔對話框。

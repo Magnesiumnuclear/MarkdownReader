@@ -101,18 +101,51 @@ if IS_WINDOWS:
     _user32.WindowFromPoint.restype = wintypes.HWND
     _user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
     _user32.GetAncestor.restype = wintypes.HWND
+
+    # window_stack_at 用的：沿 z-order 往下走、逐一判斷視窗是否真的蓋在那個點上
+    _user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+    _user32.GetWindow.restype = wintypes.HWND
+    for _name in ("IsWindowVisible", "IsIconic"):
+        getattr(_user32, _name).argtypes = [wintypes.HWND]
+        getattr(_user32, _name).restype = wintypes.BOOL
+    _user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    _user32.GetWindowRect.restype = wintypes.BOOL
+    _kernel32.GetCurrentProcessId.restype = wintypes.DWORD
+    # DwmGetWindowAttribute：cloaked（別的虛擬桌面、暫停的 UWP）與不含隱形邊框的
+    # 真實外框。dwmapi 在支援的 Windows 上一定有；載不到就退回 GetWindowRect。
+    try:
+        _dwmapi = ctypes.windll.dwmapi
+        _dwmapi.DwmGetWindowAttribute.argtypes = [
+            wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+        ]
+        _dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
+    except OSError:  # pragma: no cover - 沒有 dwmapi 的環境
+        _dwmapi = None
 else:  # pragma: no cover - 只在非 Windows 平台走到
     wintypes = None
     _user32 = None
     _shell32 = None
     _kernel32 = None
+    _dwmapi = None
 
 # GetWindowLongPtrW 用的常數
 _GWL_EXSTYLE = -20
 _WS_EX_TOPMOST = 0x00000008
+_WS_EX_TRANSPARENT = 0x00000020
 
 # GetAncestor 用的常數
 _GA_ROOT = 2
+
+# GetWindow 用的常數：z-order 往下的下一個視窗
+_GW_HWNDNEXT = 2
+
+# DwmGetWindowAttribute 用的常數
+_DWMWA_EXTENDED_FRAME_BOUNDS = 9
+_DWMWA_CLOAKED = 14
+
+# window_stack_at 最多往下走幾個視窗。桌面上的頂層視窗（含隱藏的輔助視窗）
+# 通常幾十到兩三百個；這只是防止異常環境下每次滑鼠移動都掃到天荒地老。
+_STACK_WALK_LIMIT = 512
 
 
 def set_app_user_model_id(app_id: str = config.APP_USER_MODEL_ID) -> bool:
@@ -190,6 +223,78 @@ def top_level_hwnd_at(x: int, y: int) -> int:
         return int(_user32.GetAncestor(handle, _GA_ROOT) or handle)
     except Exception:
         return 0
+
+
+def _covers_point(handle, point) -> bool:
+    """這個頂層視窗此刻是否真的蓋在原生座標 point 上。
+
+    問的是「看不看得到」，不是「收不收輸入」：WindowFromPoint 會跳過停用的
+    視窗，這裡不跳——停用的視窗照樣畫在畫面上、照樣遮住底下的分頁列。
+    其餘複刻 WindowFromPoint 的排除規則：隱藏、最小化、WS_EX_TRANSPARENT
+    （拖曳縮影就是這種，見 tab_bar.DragGhost）都不算。再加兩條它不需要而
+    這裡需要的：cloaked（在別的虛擬桌面、或被系統暫停的 UWP——
+    IsWindowVisible 仍是真）不算；外框用 DWM 的真實邊界，別的程式的視窗在
+    Windows 10/11 四周各有七八個像素的隱形縮放邊框，用 GetWindowRect 會把
+    那圈也算成「蓋住」。
+    """
+    if not _user32.IsWindowVisible(handle) or _user32.IsIconic(handle):
+        return False
+    if _user32.GetWindowLongPtrW(handle, _GWL_EXSTYLE) & _WS_EX_TRANSPARENT:
+        return False
+    rect = wintypes.RECT()
+    if _dwmapi is not None:
+        cloaked = wintypes.DWORD(0)
+        if _dwmapi.DwmGetWindowAttribute(
+            handle, _DWMWA_CLOAKED, ctypes.byref(cloaked), ctypes.sizeof(cloaked)
+        ) == 0 and cloaked.value:
+            return False
+        if _dwmapi.DwmGetWindowAttribute(
+            handle, _DWMWA_EXTENDED_FRAME_BOUNDS, ctypes.byref(rect), ctypes.sizeof(rect)
+        ) != 0 and not _user32.GetWindowRect(handle, ctypes.byref(rect)):
+            return False
+    elif not _user32.GetWindowRect(handle, ctypes.byref(rect)):  # pragma: no cover
+        return False
+    return rect.left <= point.x < rect.right and rect.top <= point.y < rect.bottom
+
+
+def window_stack_at(x: int, y: int) -> list[tuple[int, bool]] | None:
+    """原生座標 (x, y) 底下由上而下的頂層視窗：[(HWND, 是否本行程), ...]。
+
+    給「看穿自家視窗本體」的合併命中用：拖曳合併不該只看最上層那一個，
+    來源視窗（或第三個自家視窗）的本體蓋住了別人的分頁列時，底下那條分頁列
+    仍然是合法的合併目標。從 WindowFromPoint 答出的視窗起沿 z-order 往下走
+    （GetWindow GW_HWNDNEXT 在頂層視窗之間就是 z-order），每個都用
+    _covers_point 過濾。走到第一個**別的行程**的視窗就停，它也放進清單——
+    被別的程式蓋住的分頁列是真的看不到，呼叫端看到它就不再往下找。
+    問不出來回 None，呼叫端退回既有的幾何掃描。
+    """
+    if not IS_WINDOWS:
+        return None
+    try:
+        point = wintypes.POINT(int(x), int(y))
+        handle = _user32.WindowFromPoint(point)
+        if not handle:
+            return None
+        handle = _user32.GetAncestor(handle, _GA_ROOT) or handle
+        own_pid = _kernel32.GetCurrentProcessId()
+        stack: list[tuple[int, bool]] = []
+        first = True
+        for _ in range(_STACK_WALK_LIMIT):
+            if not handle:
+                break
+            # 第一個是 WindowFromPoint 親自答的，已經套過它的規則，不必再過濾
+            if first or _covers_point(handle, point):
+                pid = wintypes.DWORD(0)
+                _user32.GetWindowThreadProcessId(handle, ctypes.byref(pid))
+                ours = pid.value == own_pid
+                stack.append((int(handle), ours))
+                if not ours:
+                    break
+            first = False
+            handle = _user32.GetWindow(handle, _GW_HWNDNEXT)
+        return stack
+    except Exception:
+        return None
 
 
 def force_foreground(window_id: int) -> bool:
