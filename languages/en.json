@@ -177,5 +177,5 @@
   "welcome.sc.maximize": "F11",
   "welcome.scDesc.maximize": "Toggle maximized",
   "welcome.sc.escape": "Esc",
-  "welcome.scDesc.escape": "Close the window"
+  "welcome.scDesc.escape": "Closes the find bar or settings panel first; otherwise same as Ctrl + W"
 }

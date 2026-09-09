@@ -177,5 +177,5 @@
   "welcome.sc.maximize": "F11",
   "welcome.scDesc.maximize": "切換最大化",
   "welcome.sc.escape": "Esc",
-  "welcome.scDesc.escape": "關閉視窗"
+  "welcome.scDesc.escape": "先關搜尋列或設定面板；都沒開時同 Ctrl + W"
 }
