@@ -73,6 +73,13 @@ EXCLUDES = [
     "numpy",
     "pyqtgraph",
     "tkinter",
+    # OpenSSL 的三個使用者：_ssl 被 http.client／urllib／asyncio 這些用不到的標準庫
+    # 拉進來（它們都用 try/except 包 import ssl，少了不會壞）；_hashlib 是 hashlib
+    # 的 OpenSSL 後端，沒有它 hashlib.sha1 會退回內建實作，本程式只在 Mermaid 快取
+    # 鍵用到，結果相同。三個一起排除，libcrypto／libssl 就沒有人再需要。
+    "_ssl",
+    "ssl",
+    "_hashlib",
     "unittest",
     "pydoc_data",
     "PyQt6.QtWebEngineCore",
@@ -104,23 +111,50 @@ EXCLUDES = [
 #                         不需要它；若日後在極舊的顯卡或虛擬機出現空白視窗，
 #                         把這一行拿掉重新打包即可。
 #   Qt6Pdf.dll       4.6MB QtPdf 模組，本程式沒有用到。
-#   libcrypto/libssl 6MB   QtNetwork 的 TLS 後端。單一實例只用 QLocalSocket
-#                         （Windows 具名管道），不走 TCP/TLS，因此可以排除。
+#   libcrypto/libssl 6.8MB 【來源不是 Qt，是 Python 自己的 _ssl 與 _hashlib】
+#                         Python 的 DLLs\ 裡叫 libcrypto-3.dll，PyInstaller 收進來
+#                         時會改名成 libcrypto-3-x64.dll——以前這裡寫的是改名前的
+#                         名字，用完全比對，於是一個都沒濾掉，1.0.0 與 1.1.0 的安裝檔
+#                         都白背了它。現在改用前綴比對，並在模組層就把 _ssl／ssl／
+#                         _hashlib 排除（見 EXCLUDES）：本程式不連網、hashlib 沒有
+#                         _hashlib 時會退回內建的 _sha1 等實作，功能不受影響。
+#   plugins/tls      0.7MB QtNetwork 的 TLS 後端外掛（schannel／openssl），同理用不到。
 #                         注意 Qt6Network.dll 本身不能排除，那是 QLocalSocket 的家。
-EXCLUDE_BINARIES = (
-    "opengl32sw.dll",
-    "qt6pdf.dll",
-    "libcrypto-3.dll",
-    "libssl-3.dll",
+EXCLUDE_BINARY_PREFIXES = (
+    "opengl32sw",
+    "qt6pdf",
+    "libcrypto-",
+    "libssl-",
 )
+EXCLUDE_BINARY_DIRS = (
+    "pyqt6/qt6/plugins/tls/",
+)
+
+# Qt 的翻譯檔整包 6.6MB、96 個語言，程式只會載入 qtbase_zh_TW.qm（126KB）：
+# language.install_qt_translator 只認 zh_TW，英文走源字串不需要 .qm。
+KEEP_TRANSLATIONS = ("qtbase_zh_tw.qm",)
 
 
 def _strip_binaries(binaries):
-    """濾掉 EXCLUDE_BINARIES 指定的 DLL。"""
+    """濾掉用不到的 DLL 與外掛（依前綴與目錄比對，不依賴改名前後的完整檔名）。"""
     kept = []
     for entry in binaries:
-        name = os.path.basename(entry[0]).lower()
-        if name in EXCLUDE_BINARIES:
+        dest = entry[0].replace("\\", "/").lower()
+        name = os.path.basename(dest)
+        if name.startswith(EXCLUDE_BINARY_PREFIXES):
+            continue
+        if any(folder in dest for folder in EXCLUDE_BINARY_DIRS):
+            continue
+        kept.append(entry)
+    return kept
+
+
+def _strip_datas(datas):
+    """Qt 翻譯檔只留程式會載入的那一個。"""
+    kept = []
+    for entry in datas:
+        dest = entry[0].replace("\\", "/").lower()
+        if "/translations/" in dest and os.path.basename(dest) not in KEEP_TRANSLATIONS:
             continue
         kept.append(entry)
     return kept
@@ -147,6 +181,7 @@ a = Analysis(
 )
 
 a.binaries = _strip_binaries(a.binaries)
+a.datas = _strip_datas(a.datas)
 
 pyz = PYZ(a.pure)
 

@@ -619,7 +619,9 @@ class MarkdownViewer(QWidget):
         # 頂端；文件高度要等版面算完才正確，所以下一個事件回合再套用。
         ratio = getattr(tab, "transfer_scroll", None)
         if ratio:
-            QTimer.singleShot(0, lambda: tab.apply_scroll_ratio(ratio))
+            # 下一個回合才套用；到時視窗可能已經在關、或這個分頁又被搬走了，
+            # 那時 tab.browser 是已銷毀的包裝，碰了就是計時器回呼裡的例外
+            QTimer.singleShot(0, lambda: self._restore_adopted_scroll(tab, ratio))
             tab.transfer_scroll = None
 
     def _drag_intent_at(self, global_pos, outside_band: bool) -> str:
@@ -762,7 +764,9 @@ class MarkdownViewer(QWidget):
         self.find_bar.attach(tab.browser)
 
         if not tab.loaded:
-            tab.load()
+            # 延後分頁第一次切過去才讀檔：大檔一樣要有等待游標，理由同 open_path
+            with self._busy_feedback(tab.path):
+                tab.load()
             if tab.path:
                 self._set_search_context(tab.path)
         if tab.dirty:
@@ -1473,8 +1477,11 @@ class MarkdownViewer(QWidget):
         self._tab.path = path
         self._set_search_context(path)
 
+        # 讀檔（含多重編碼試解與統計）也要在忙碌回饋之內：大檔光這一段就凍結
+        # 幾百毫秒，而以前等待游標要到 _render 才出現，看起來像當掉。
         try:
-            self._tab.text, self._tab.meta = document.read_text_file(path)
+            with self._busy_feedback(path):
+                self._tab.text, self._tab.meta = document.read_text_file(path)
         except document.DocumentError as error:
             self._tab.text = ""
             self._tab.meta = None
@@ -1662,8 +1669,25 @@ class MarkdownViewer(QWidget):
         return bar.value() / bar.maximum() if bar.maximum() else 0.0
 
     def _apply_scroll_ratio(self, ratio: float) -> None:
+        # 這個方法是用 QTimer.singleShot(0, ...) 排到下一個事件回合的（渲染完
+        # 還原捲動位置、自動重載後還原）。視窗在那個回合之前被關掉時，closeEvent
+        # 已經把 _tabs 清空，self.browser 會直接 IndexError——而這是在 Qt 的計時器
+        # 回呼裡，例外漏出去就是行程中止。flush_pending_chunks 與 _save_session
+        # 都有同一道守衛，這裡以前漏了。
+        if self._closing or not self._tabs:
+            return
         bar = self.browser.verticalScrollBar()
         bar.setValue(int(round(ratio * bar.maximum())))
+
+    def _restore_adopted_scroll(self, tab, ratio: float) -> None:
+        """收養分頁後的下一個回合還原它的捲動位置（見 adopt_tab）。
+
+        只在「視窗還活著、分頁還在這裡」時才碰 tab.browser：這是計時器回呼，
+        任何例外都會中止行程。
+        """
+        if self._closing or not any(t is tab for t in self._tabs):
+            return
+        tab.apply_scroll_ratio(ratio)
 
     # -- 標題與狀態列 --------------------------------------------------------
     def _update_titles(self, name: str | None) -> None:
@@ -2147,6 +2171,9 @@ class MarkdownViewer(QWidget):
         self._reload_timer.stop()
         self._chunk_timer.stop()
         self._resize_timer.stop()
+        # 連發尾工的計時器也要停：它和上面三個一樣是視窗的子物件，一樣可能在
+        # deleteLater 的空檔觸發。漏了它就是「三個有停、一個沒停」的不一致。
+        self._batch_sync_timer.stop()
         self._watcher.blockSignals(True)
         self._tabs.clear()
 

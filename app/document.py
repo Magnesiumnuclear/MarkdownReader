@@ -171,7 +171,10 @@ def read_text_file(path: str) -> tuple[str, DocumentMeta]:
         encoding=encoding,
         size_bytes=len(raw),
         modified=modified,
-        char_count=sum(1 for char in text if not char.isspace()),
+        # 非空白字元數。以前是逐字元的 Python 迴圈，20 MB 的檔要 0.8 秒，而且這段
+        # 在忙碌回饋之外，使用者看到的是「凍住一秒才出現等待游標」。str.split()
+        # 走 C 迴圈，而且用的正是 str.isspace 同一套判定，結果完全等價、快九倍。
+        char_count=sum(map(len, text.split())),
         line_count=text.count("\n") + 1,
     )
     return text, meta
@@ -200,8 +203,15 @@ def meta_for_pasted(text: str) -> DocumentMeta:
 
 
 def _build_converter(theme: str) -> markdown.Markdown:
+    from markdown.extensions.toc import slugify_unicode
+
     extensions: list = ["extra", "sane_lists", "toc"]
-    configs: dict = {}
+    # 【標題 id 要留住中文】toc 預設的 slugify 把非 ASCII 全部丟掉，`## 表格` 的
+    # id 變成 `_1`、`## 安裝與執行` 變成 `_3`，而使用者手寫的 `[跳](#表格)`
+    # 產生的 href 仍是 `#表格`——兩邊對不上，點了完全沒反應，連 sample.md 自己
+    # 的示範連結都是死的。slugify_unicode 保留 Unicode 字元、重複標題照樣
+    # 加 `_1` 後綴，[TOC] 與註腳的 id 和 href 由同一個擴充產生，不受影響。
+    configs: dict = {"toc": {"slugify": slugify_unicode}}
     if PYGMENTS_AVAILABLE:
         extensions.append("codehilite")
         configs["codehilite"] = {

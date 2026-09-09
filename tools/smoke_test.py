@@ -58,6 +58,33 @@ from app import config  # noqa: E402
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SAMPLE = os.path.join(PROJECT_ROOT, "sample.md")
 README = os.path.join(PROJECT_ROOT, "README.md")
+
+
+def _write_big_doc(folder: str, name: str = "big.md", target_bytes: int = 1_200_000) -> str:
+    """產生一份夠大的 Markdown 素材（標題、段落、表格、程式碼混合）。
+
+    以前拿 tools/CHANGELOG.md 當大檔——那是別的專案留下的未追蹤檔案，乾淨 clone
+    沒有它：忙碌回饋那組檢查會整個被跳過、HTML 快取那組退回 145 行的 README，
+    「大檔」測試等於沒測。素材要超過 config.BUSY_FEEDBACK_BYTES 才會觸發忙碌回饋。
+    """
+    path = os.path.join(folder, name)
+    block = (
+        "## 小節\n\n這是一段內文，用來把文件撐到有意義的大小，混合中文與 English words。\n\n"
+        "| 欄一 | 欄二 | 欄三 |\n|---|---|---|\n| a | b | c |\n| 1 | 2 | 3 |\n\n"
+        "```python\ndef f(x):\n    return x + 1\n```\n\n- 清單一\n- 清單二\n\n"
+    )
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("# 大檔素材\n\n")
+        written = 0
+        index = 0
+        while written < target_bytes:
+            chunk = block.replace("小節", f"小節 {index}")
+            handle.write(chunk)
+            written += len(chunk.encode("utf-8"))
+            index += 1
+    return path
+
+
 MERMAID_DOC = os.path.join(PROJECT_ROOT, "docs", "02-Mermaid.md")
 
 _PASS: list[str] = []
@@ -404,45 +431,124 @@ def section_rendering(args) -> None:
 
     # 大檔的忙碌回饋：等待游標與「正在載入」必須在凍結『之前』就畫出來，
     # 否則使用者看到的仍是數百毫秒的無反應。用 repaint 當取樣點。
-    big_doc = os.path.join(PROJECT_ROOT, "tools", "CHANGELOG.md")
-    if os.path.isfile(big_doc):
-        observed = {"cursor": False, "text": ""}
-        original_repaint = viewer.status_label.repaint
+    big_doc = _write_big_doc(tmp)
+    observed = {"cursor": False, "text": ""}
+    original_repaint = viewer.status_label.repaint
 
-        def sampling_repaint(*args, **kwargs):
-            cursor = QApplication.overrideCursor()
-            if cursor is not None and cursor.shape() == Qt.CursorShape.WaitCursor:
-                observed["cursor"] = True
-            observed["text"] = viewer.status_label.text()
-            observed["busy"] = viewer._status_is_busy
-            return original_repaint(*args, **kwargs)
+    def sampling_repaint(*args, **kwargs):
+        cursor = QApplication.overrideCursor()
+        if cursor is not None and cursor.shape() == Qt.CursorShape.WaitCursor:
+            observed["cursor"] = True
+        observed["text"] = viewer.status_label.text()
+        observed["busy"] = viewer._status_is_busy
+        return original_repaint(*args, **kwargs)
 
-        viewer.status_label.repaint = sampling_repaint
-        viewer.open_path(big_doc, new_tab=True)
+    viewer.status_label.repaint = sampling_repaint
+    viewer.open_path(big_doc, new_tab=True)
+    pump(700)
+    viewer.status_label.repaint = original_repaint
+    check("大檔渲染前就設好等待游標", observed["cursor"])
+    # 測旗標而不是文案：文案會隨語言變，_status_is_busy 不會。
+    # 這條因此比原本更強——它問的是「忙碌狀態有沒有被正確標記」，
+    # 而那正是 _busy_feedback 的 finally 還原邏輯所依賴的東西。
+    check("大檔渲染前就標記為忙碌並顯示訊息",
+          observed["busy"] and observed["text"], str(observed))
+    check("渲染結束後游標已還原（try/finally）",
+          QApplication.overrideCursor() is None)
+
+    # 小檔不該閃忙碌提示（低於門檻時渲染在百毫秒內，閃一下只是雜訊）
+    calls = {"n": 0}
+    plain_repaint = viewer.status_label.repaint
+
+    def counting_repaint(*args, **kwargs):
+        calls["n"] += 1
+        return plain_repaint(*args, **kwargs)
+
+    viewer.status_label.repaint = counting_repaint
+    viewer.open_path(other_doc, new_tab=True)
+    pump(300)
+    viewer.status_label.repaint = plain_repaint
+    check("小檔不觸發忙碌回饋", calls["n"] == 0, str(calls["n"]))
+
+    # --- 讀檔階段也在忙碌回饋之內 ------------------------------------------
+    # 以前等待游標到 _render 才出現；大檔光「讀檔＋多重編碼試解＋統計」就凍結
+    # 幾百毫秒，看起來像當掉。用 read_text_file 當取樣點：它被呼叫的當下，
+    # 覆蓋游標必須已經是等待游標。
+    import time as _time
+
+    from app import document as _doc_probe
+    from app.document_tab import DocumentTab as _DT
+
+    seen = {"cursor_at_read": None}
+    real_read = _doc_probe.read_text_file
+
+    def sampling_read(path):
+        cursor = QApplication.overrideCursor()
+        seen["cursor_at_read"] = (
+            cursor is not None and cursor.shape() == Qt.CursorShape.WaitCursor)
+        return real_read(path)
+
+    _doc_probe.read_text_file = sampling_read
+    try:
+        viewer.open_path(_write_big_doc(tmp, "big2.md"), new_tab=True)
         pump(700)
-        viewer.status_label.repaint = original_repaint
-        check("大檔渲染前就設好等待游標", observed["cursor"])
-        # 測旗標而不是文案：文案會隨語言變，_status_is_busy 不會。
-        # 這條因此比原本更強——它問的是「忙碌狀態有沒有被正確標記」，
-        # 而那正是 _busy_feedback 的 finally 還原邏輯所依賴的東西。
-        check("大檔渲染前就標記為忙碌並顯示訊息",
-              observed["busy"] and observed["text"], str(observed))
-        check("渲染結束後游標已還原（try/finally）",
-              QApplication.overrideCursor() is None)
+        check("大檔：讀檔時等待游標已經在（不是等到渲染才出現）",
+              seen["cursor_at_read"] is True, str(seen))
+        viewer._add_tab(_DT(_write_big_doc(tmp, "big3.md")), activate=False)
+        viewer._sync_tab_bar()
+        seen["cursor_at_read"] = None
+        viewer.activate_tab(viewer.tab_count() - 1)
+        pump(700)
+        check("延後分頁第一次載入也有等待游標", seen["cursor_at_read"] is True, str(seen))
+    finally:
+        _doc_probe.read_text_file = real_read
+    check("讀檔後游標已還原", QApplication.overrideCursor() is None)
 
-        # 小檔不該閃忙碌提示（低於門檻時渲染在百毫秒內，閃一下只是雜訊）
-        calls = {"n": 0}
-        plain_repaint = viewer.status_label.repaint
+    # --- 字數統計：和逐字元 isspace 完全等價，而且快 -----------------------
+    # 舊寫法是逐字元的 Python 迴圈（20 MB 要 0.8 秒）；str.split() 用的正是
+    # 同一套 isspace 判定，走 C 迴圈快九倍。樣本刻意塞各種 Unicode 空白。
+    probe_text = ("a b" + chr(9) + "c" + chr(10) + chr(0x3000) + "g" + chr(0x1C)
+                  + "H" + chr(0xA0) + "i j" + chr(0x2028) + "k" + chr(13) + chr(10))
+    probe_path = os.path.join(tmp, "spaces.md")
+    with open(probe_path, "w", encoding="utf-8", newline="") as handle:
+        handle.write(probe_text)
+    _, probe_meta = _doc_probe.read_text_file(probe_path)
+    check("字數統計與逐字元 isspace 判定完全等價（全形空白、NBSP、U+001C、U+2028）",
+          probe_meta.char_count == sum(1 for c in probe_text if not c.isspace()),
+          f"{probe_meta.char_count}")
+    ascii_path = os.path.join(tmp, "ascii12mb.md")
+    with open(ascii_path, "w", encoding="utf-8") as handle:
+        handle.write(("lorem ipsum dolor sit amet consectetur " * 30 + "\n") * 10500)
+    t0 = _time.perf_counter()
+    _doc_probe.read_text_file(ascii_path)
+    elapsed = _time.perf_counter() - t0
+    check("12 MB 純文字讀檔含統計在 0.3 秒內（逐字元迴圈要 0.5 秒以上）",
+          elapsed < 0.3, f"{elapsed * 1000:.0f} ms")
 
-        def counting_repaint(*args, **kwargs):
-            calls["n"] += 1
-            return plain_repaint(*args, **kwargs)
-
-        viewer.status_label.repaint = counting_repaint
-        viewer.open_path(other_doc, new_tab=True)
-        pump(300)
-        viewer.status_label.repaint = plain_repaint
-        check("小檔不觸發忙碌回饋", calls["n"] == 0, str(calls["n"]))
+    # --- 中文標題的錨點 ------------------------------------------------------
+    # toc 預設的 slugify 把非 ASCII 全丟掉：`## 表格` 的 id 變成 _1，而手寫的
+    # `[跳](#表格)` href 仍是 #表格，兩邊對不上，點了沒反應——連 sample.md 自己的
+    # 示範連結都是死的。改用 slugify_unicode 之後 id 就是「表格」。
+    anchor_doc = os.path.join(tmp, "anchors.md")
+    with open(anchor_doc, "w", encoding="utf-8") as handle:
+        handle.write("# 目錄\n\n[跳到表格](#表格)\n\n" + "填充段落。\n\n" * 300
+                     + "## 表格\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n## 表格\n\n第二個同名標題。\n")
+    with open(anchor_doc, encoding="utf-8") as handle:
+        anchor_html = _doc_probe.markdown_to_html(handle.read(), "light")
+    check("中文標題的 id 保留中文（toc 用 slugify_unicode），重複標題加 _1",
+          'name="表格"' in anchor_html and 'name="表格_1"' in anchor_html
+          and 'href="#表格"' in anchor_html,
+          str(re.findall(r'name="([^"]+)"', anchor_html)))
+    viewer.open_path(anchor_doc, new_tab=True)
+    pump(500)
+    viewer.flush_pending_chunks()
+    pump(300)
+    anchor_bar = viewer.browser.verticalScrollBar()
+    anchor_bar.setValue(0)
+    viewer._on_anchor_clicked(QUrl("#表格"))
+    pump(400)
+    check("點中文錨點會捲到該標題（以前 id 是 _1，對不上，點了沒反應）",
+          anchor_bar.value() > 0, f"scroll={anchor_bar.value()} max={anchor_bar.maximum()}")
 
     # --- 破圖佔位：圖示 + alt 文字 + 作者寫的路徑 ----------------------------
     # Qt 內建的破圖是 :/qt-project.org/styles/commonstyle/images/file-16.png，
@@ -1036,8 +1142,7 @@ def section_render_cache(args) -> None:
 
     # --- HTML 快取 ---
     QSettings(config.ORG_NAME, config.APP_NAME).clear()
-    big = os.path.join(PROJECT_ROOT, "tools", "CHANGELOG.md")
-    target = big if os.path.isfile(big) else README
+    target = _write_big_doc(tempfile.mkdtemp(prefix="mdbig-"), "cache_big.md")
     viewer = MarkdownViewer(target)
     viewer.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
     viewer.resize(1000, 700)
@@ -1088,6 +1193,13 @@ def section_render_cache(args) -> None:
         document.markdown_to_html = original_convert
     check("字級縮放不重跑 Markdown 轉換（快取命中）",
           conversions["n"] == 0, f"轉換了 {conversions['n']} 次")
+
+    # 大檔素材有上百個頂層元素，會走分段渲染；縮放之後剩餘片段還在排隊，
+    # resize 裡的 processEvents 會把它們補上、revision 跟著加。先補完，
+    # 下面數的才是「縮放引起的重排」。（以前的素材幾乎全是清單，一個 <ul>
+    # 算一個元素，根本沒觸發分段，所以沒踩到。）
+    viewer.flush_pending_chunks()
+    pump(300)
 
     # --- 內文寬度未變時跳過整份重排 -----------------------------------------
     # _apply_content_width 每個 resize 事件都會被呼叫，而 setFrameFormat 會讓
@@ -2084,6 +2196,40 @@ def section_tabs(args) -> None:
     v4.close()
     pump(300)
 
+    # --- 關窗與計時器回呼的競態 ----------------------------------------------
+    # 這些回呼是 QTimer.singleShot 排到下一回合的，視窗在那之前被關掉時，
+    # _tabs 已清空、browser 可能已銷毀；例外漏出計時器回呼就是行程中止。
+    from PyQt6 import sip as _sip
+    from app.document_tab import DocumentTab as _DT2
+
+    vt = MarkdownViewer(batch[0])
+    vt.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+    vt.resize(700, 500)
+    vt.show()
+    pump(400)
+    ghost_tab = _DT2(batch[1])
+    _sip.delete(ghost_tab.browser)      # 模擬分頁已被搬走／它的閱讀區已銷毀
+    safe = True
+    try:
+        vt._restore_adopted_scroll(ghost_tab, 0.5)
+    except Exception as exc:      # noqa: BLE001
+        safe = False
+        detail = repr(exc)
+    check("收養後的捲動還原：分頁不在這個視窗就不碰它的閱讀區（已銷毀也不崩）",
+          safe, "" if safe else detail)
+    vt._batch_sync_timer.start(60)
+    vt.close()                          # 不 pump：停在關閉中的狀態
+    check("關窗時連發尾工的計時器也停了（和另外三個計時器一致）",
+          not vt._batch_sync_timer.isActive())
+    safe = True
+    try:
+        vt._apply_scroll_ratio(0.5)
+    except Exception as exc:      # noqa: BLE001
+        safe = False
+        detail = repr(exc)
+    check("關窗後排到下一回合的捲動還原不會碰空的分頁清單", safe, "" if safe else detail)
+    pump(400)
+
     # --- 多選連發：一批轉交只切一次分頁、只搶一次前景 ------------------------
     # 檔案總管多選 = N 條轉交訊息在約 150 ms 內陸續進來。route_external_open
     # 認這個連發，同一批只有第一條走完整路徑。時鐘是可注入的，不然這裡會變成
@@ -2891,6 +3037,23 @@ def section_single_instance(args) -> None:
     check("轉交器：CMakeLists 從 app/__init__.py 讀版本（版本來源只有一個）",
           "app/__init__.py" in cmake_text.replace("\\", "/")
           and "__version__" in cmake_text and "configure_file" in cmake_text)
+    # 打包排除清單：名字對不上就等於沒排除——1.0.0 與 1.1.0 寫的是改名前的
+    # libcrypto-3.dll，產物裡叫 libcrypto-3-x64.dll，於是 6.8MB 的 OpenSSL 白背了兩版。
+    spec_path = os.path.join(PROJECT_ROOT, "build.spec")
+    with open(spec_path, encoding="utf-8") as handle:
+        spec_text = handle.read()
+    prefix_block = re.search(r"EXCLUDE_BINARY_PREFIXES\s*=\s*\((.*?)\)", spec_text, re.S)
+    prefixes = re.findall(r'"([^"]+)"', prefix_block.group(1)) if prefix_block else []
+    import PyQt6 as _pyqt6_pkg
+
+    search_dirs = [os.path.join(os.path.dirname(_pyqt6_pkg.__file__), "Qt6", "bin"),
+                   os.path.join(os.path.dirname(sys.executable), "DLLs")]
+    real_names = {n.lower() for d in search_dirs if os.path.isdir(d) for n in os.listdir(d)}
+    unmatched = [p for p in prefixes if not any(n.startswith(p) for n in real_names)]
+    check("打包排除清單的每個前綴都對得上 Qt 或 Python 裡真實存在的檔名",
+          bool(prefixes) and not unmatched, f"對不上：{unmatched}")
+    check("OpenSSL 的三個使用者（_ssl、ssl、_hashlib）在模組排除清單裡",
+          all(f'"{m}"' in spec_text for m in ("_ssl", "ssl", "_hashlib")))
     check("安裝檔：升級前整包清 {app}\\_internal（殘留舊版 Qt 外掛會當機）",
           re.search(r'\[InstallDelete\]\s*\n\s*Type:\s*filesandordirs;\s*'
                     r'Name:\s*"\{app\}\\_internal"', iss) is not None)
@@ -4006,7 +4169,7 @@ def section_tab_dnd(args) -> None:
     # 視窗（含另一份併行測試）蓋住、或無前景權——不是機制回歸。
     # 紅的話守門三條直接略過，免得跟著紅誤導成命中測試壞了。
     # 這一組問的是原生 WindowFromPoint 的 z-order，offscreen 整組僅實機。
-    if onscreen_only("守門前置＋幽靈命中測試（查原生 z-order 的那四條）"):
+    if onscreen_only("守門前置＋幽靈命中測試（查原生 z-order 的那八條）"):
         env_ok = _wm.top_level_widget_at(probe) is host
         check("守門前置：host 是探測點的最上層（紅＝環境遮擋，非機制回歸）",
               env_ok, type(_wm.top_level_widget_at(probe)).__name__)
@@ -5279,6 +5442,22 @@ def section_installer(args) -> None:
     )
     iscc = next((p for p in candidates if os.path.isfile(p)), None)
     onedir = os.path.join(PROJECT_ROOT, "dist", "MarkdownReader-onedir")
+    internal = os.path.join(onedir, "_internal")
+    if os.path.isdir(internal):
+        leftovers = [n for n in os.listdir(internal)
+                     if n.lower().startswith(("libcrypto-", "libssl-", "_ssl.", "_hashlib."))]
+        check("打包產物裡沒有 OpenSSL（libcrypto／libssl／_ssl／_hashlib）",
+              not leftovers, str(leftovers))
+        check("打包產物裡沒有 TLS 外掛目錄",
+              not os.path.isdir(os.path.join(internal, "PyQt6", "Qt6", "plugins", "tls")))
+        translations = os.path.join(internal, "PyQt6", "Qt6", "translations")
+        check("打包產物的 Qt 翻譯檔只剩 qtbase_zh_TW.qm",
+              os.path.isdir(translations) and os.listdir(translations) == ["qtbase_zh_TW.qm"],
+              str(os.listdir(translations)) if os.path.isdir(translations) else "無目錄")
+    else:
+        label = "打包產物瘦身檢查（需要 dist\\MarkdownReader-onedir）"
+        _SKIP.append(label)
+        print(f"    [略過] {label}")
     if iscc is None or not os.path.isfile(os.path.join(onedir, "MarkdownOpen.exe")):
         label = "安裝檔動態檢查（需要 Inno Setup 6 與 dist\\MarkdownReader-onedir 含轉交器）"
         _SKIP.append(label)
