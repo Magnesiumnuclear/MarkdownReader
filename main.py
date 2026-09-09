@@ -17,6 +17,7 @@ QLocalSocket 只需要 QtCore + QtNetwork，而且不需要 QApplication 就能�
 用法：
     py -3.13 main.py                     顯示歡迎頁
     py -3.13 main.py "D:\\docs\\note.md"   開啟指定檔案
+    py -3.13 main.py a.md b.md c.md      一次開多個（只有第一個會立刻渲染）
 """
 
 from __future__ import annotations
@@ -82,26 +83,30 @@ def _install_exception_hook() -> None:
     sys.excepthook = handle
 
 
-def _target_path(argv: list[str]) -> str | None:
-    """從命令列參數取出要開啟的檔案路徑。"""
-    for argument in argv[1:]:
-        if argument.startswith("-"):
-            continue
-        # 相對路徑（手動執行時可能出現）一律正規化為絕對路徑
-        return os.path.abspath(argument)
-    return None
+def _target_paths(argv: list[str]) -> list[str]:
+    """從命令列參數取出要開啟的檔案路徑（可以有多個）。
+
+    以前只取第一個，於是 `MarkdownReader.exe a.md b.md` 會安靜地丟掉 b.md。
+    相對路徑（手動執行時可能出現）一律正規化為絕對路徑。
+    """
+    return [
+        os.path.abspath(argument)
+        for argument in argv[1:]
+        if not argument.startswith("-")
+    ]
 
 
 def main() -> int:
     _install_exception_hook()
 
-    target = _target_path(sys.argv)
+    targets = _target_paths(sys.argv)
+    target = targets[0] if targets else None
 
     # === 轉交路徑（不開視窗）================================================
     # 這之前不要放任何 QtGui / QtWidgets 的匯入，見模組開頭說明。
     from app import single_instance
 
-    if single_instance.send_to_existing(target):
+    if single_instance.send_all_to_existing(targets):
         return 0
 
     # === 開視窗路徑 ==========================================================
@@ -159,7 +164,18 @@ def main() -> int:
         # 管道一關，新行程連不上就會自己開視窗——正確的退化。close 可重入，
         # 與 app.exec() 之後那次不衝突。
         app.lastWindowClosed.connect(server.close)
-    manager.create_window(target)
+    window = manager.create_window(target)
+    # 命令列一次給了好幾個檔案：第一個已經由 create_window 載入並顯示，
+    # 其餘只建延後載入的分頁，不必為了「開起來」就先渲染十份文件。
+    if len(targets) > 1:
+        window.open_paths(targets[1:], activate_first=False)
+    if targets:
+        # 【冷啟動多選】沒有實例在跑時多選 N 個檔案，第一個是轉交器放在命令列上、
+        # 由這裡開的，沒有經過 route_external_open；其餘 N-1 個等管道開起來才
+        # 轉交進來。不在這裡種下連發狀態的話，第一條轉交會被當成「新的一批」而
+        # 切過去——十個檔案開起來停在第二個。時間要從「第一份文件渲染完」起算，
+        # 所以這行必須在 create_window 之後。
+        manager.note_batch_started(window)
 
     exit_code = app.exec()
     if server is not None:

@@ -18,6 +18,8 @@ sip 包裝，任何人拿去用就是 RuntimeError（這專案在捲軸快照上
 
 from __future__ import annotations
 
+import time
+
 from PyQt6.QtCore import QObject, QPoint, QRect
 
 from . import config, win32
@@ -121,6 +123,12 @@ def top_level_widget_at(global_pos: QPoint):
 class WindowManager(QObject):
     """行程內所有閱讀器視窗的登記處。"""
 
+    # 多選連發的判定窗口。檔案總管一次多選會在約 150 ms 內把 N 條轉交
+    # 送進來，取得比它寬鬆一點；每收到一條就重新計時，長串也不會被拆開。
+    # 誤判的代價很小：只是使用者「刻意先後開的第二個檔案」不會被切過去，
+    # 分頁照樣開出來，點一下就到。
+    BURST_SECONDS = 0.4
+
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._windows: list[MarkdownViewer] = []
@@ -129,6 +137,11 @@ class WindowManager(QObject):
         # 正式路徑是 window_stack_at（原生 z-order）；回歸測試在 offscreen 沒有
         # HWND 可問，靠換掉這個屬性餵假堆疊來逐條驗規則。
         self.stack_probe = self.window_stack_at
+        # 多選連發的狀態（見 route_external_open）。時鐘拉成屬性是為了測試：
+        # 靠真的 sleep 去驗連發會變成又慢又飄的計時測試。
+        self._clock = time.monotonic
+        self._burst_target: MarkdownViewer | None = None
+        self._burst_deadline = 0.0
 
     # -- 建立與登記 -----------------------------------------------------------
     def create_window(
@@ -190,6 +203,10 @@ class WindowManager(QObject):
         self._windows = [w for w in self._windows if w is not viewer]
         if self._last_active is viewer:
             self._last_active = self._windows[-1] if self._windows else None
+        if self._burst_target is viewer:
+            # 和 _last_active 同一個道理：清單裡絕不能留已銷毀的 sip 包裝
+            self._burst_target = None
+            self._burst_deadline = 0.0
 
     def broadcast_language(self, mode: str, origin=None) -> None:
         """把語言變更推到所有視窗。
@@ -219,15 +236,69 @@ class WindowManager(QObject):
 
     # -- 單一實例路由 ---------------------------------------------------------
     def route_external_open(self, path: str) -> None:
-        """雙擊 .md 轉交進來的路徑：交給最後作用中的視窗開新分頁。"""
-        target = self._last_active if self._last_active in self._windows else None
-        if target is None and self._windows:
-            target = self._windows[-1]
+        """雙擊 .md 轉交進來的路徑：交給最後作用中的視窗開新分頁。
+
+        【多選是一連串的轉交，不是一次】檔案總管多選按開啟時，Windows 一律
+        「每個檔案叫一次開啟指令」——實測過 MultiSelectModel（Single／
+        Document／Player）與 `%*` 五種組合，全都是叫 N 次、每次一個路徑，
+        改不了。於是十個檔案會變成十條轉交訊息，在約 150 ms 內陸續進來。
+
+        每條都當成獨立開檔的話，就是十次「開分頁＋切過去＋渲染＋搶前景」，
+        實測 3.4 秒、視窗標題變動 63 次。所以這裡認「連發」：一條路徑進來時
+        若距離上一條不到 BURST_SECONDS，就當成同一批，只加延後載入的分頁，
+        不切過去也不搶前景。每收到一條就重新計時，整批才不會被拆開。
+
+        第一條完全不受影響（不做任何延後或緩衝），單檔雙擊的延遲一如既往。
+        整批送到同一個視窗：中途使用者切換視窗也不該把一次多選拆散。
+        """
+        same_burst = (
+            self._burst_target is not None
+            and self._burst_target in self._windows
+            and not self._burst_target.is_closing
+            and self._clock() < self._burst_deadline
+            and bool(path)          # 空訊息只是「把視窗叫到前面」，不屬於任何一批
+        )
+        if same_burst:
+            target = self._burst_target
+            target.open_external_in_background(path)
+            # 視窗已經在前面就不用再搶（真的同一批時第一條就搶過了）。沒在前面
+            # 才搶：連發窗口萬一誤判，使用者按下開啟卻什麼都沒發生是最糟的結果。
+            if not target.isActiveWindow():
+                target.take_foreground()
+            # 【計時要在做完事之後】渲染是同步的，一份大文件可能就超過整個窗口。
+            # 在開始前蓋章的話，第一個檔案越大、後面越可能被判成不同批——正好在
+            # 最需要批次的時候失效。
+            self._burst_deadline = self._clock() + self.BURST_SECONDS
+            return
+
+        # 【跳過關閉中的視窗】closeEvent 到 destroyed 之間，視窗還在清單裡但
+        # 分頁已經清空；把檔案送進去就是丟掉。_forget 只在 destroyed 才跑，
+        # 靠它來不及。
+        alive = [w for w in self._windows if not w.is_closing]
+        target = self._last_active if self._last_active in alive else None
+        if target is None and alive:
+            target = alive[-1]
         if target is None:
-            # 所有視窗都關了但行程還沒退出（理論上只有極短暫的窗口）
-            self.create_window(path or None)
+            # 所有視窗都關了（或都正在關）但行程還沒退出。新開的這個也要登記成
+            # 連發目標，否則一批多選的頭兩個檔案會各開一次、各搶一次前景。
+            window = self.create_window(path or None)
+            if path:
+                self.note_batch_started(window)
             return
         target.handle_external_open(path)
+        if path:
+            self.note_batch_started(target)
+
+    def note_batch_started(self, window: MarkdownViewer) -> None:
+        """從現在起的 BURST_SECONDS 內，進來的路徑算同一批（見 route_external_open）。
+
+        冷啟動多選會走到這裡：第一個檔案是轉交器放在命令列上、由本行程自己開的，
+        沒有經過 route_external_open。不種下這個狀態的話，使用者選的第二個檔案
+        會被當成「新的一批」而切過去——十個檔案開起來停在第二個，還多付一次
+        渲染與一次搶前景。
+        """
+        self._burst_target = window
+        self._burst_deadline = self._clock() + self.BURST_SECONDS
 
     # -- 拖曳合併的命中測試 ---------------------------------------------------
     def window_stack_at(self, global_pos: QPoint) -> list | None:

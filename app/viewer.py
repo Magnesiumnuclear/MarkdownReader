@@ -265,6 +265,11 @@ class FramelessResizer(QObject):
 class MarkdownViewer(QWidget):
     """Markdown 閱讀器主視窗。"""
 
+    # 多選連發時，分頁列與檔案監看的尾工延後多久合併成一次（見 open_paths）。
+    # 短到看不出來，長到足以蓋住檔案總管把 N 條轉交送完的那段（實測十個檔案
+    # 約 150 ms 內送完，但每條之間只差十幾毫秒）。
+    BATCH_SYNC_MS = 60
+
     def __init__(
         self,
         path: str | None = None,
@@ -378,6 +383,13 @@ class MarkdownViewer(QWidget):
         self._reload_timer = QTimer(self)
         self._reload_timer.setSingleShot(True)
         self._reload_timer.timeout.connect(self._on_reload_timeout)
+        # 多選連發時把分頁列與檔案監看的尾工合併成一次（見 open_paths）。
+        # 掛在視窗底下，視窗一銷毀就跟著沒了，不會在關窗後才觸發。
+        self._batch_sync_timer = QTimer(self)
+        self._batch_sync_timer.setSingleShot(True)
+        self._batch_sync_timer.timeout.connect(self._flush_batch_sync)
+        # 正在關閉（closeEvent 已經進來）。管理器路由檔案時要跳過這種視窗。
+        self._closing = False
         self._resize_timer = QTimer(self)
         self._resize_timer.setSingleShot(True)
         self._resize_timer.timeout.connect(self._on_resize_settled)
@@ -485,6 +497,11 @@ class MarkdownViewer(QWidget):
             # 事件過濾器等 showEvent 再裝，還沒顯示時裝了也收不到滑鼠事件
             return
         self._resizer.refresh_targets()
+
+    @property
+    def is_closing(self) -> bool:
+        """closeEvent 已經進來了嗎？管理器用它決定還能不能把檔案路由進來。"""
+        return self._closing
 
     def tab_count(self) -> int:
         return len(self._tabs)
@@ -713,9 +730,15 @@ class MarkdownViewer(QWidget):
             self.close()
 
     def _index_of_path(self, path: str) -> int | None:
-        target = os.path.abspath(path)
+        """已經開著這個檔案的分頁；沒有就回 None。
+
+        比對用 normcase：Windows 上 Note.md 與 note.md 是同一個檔案，用大小寫
+        敏感的比對會讓同一個檔案開出第二個分頁（兩個分頁同時被監看，一次存檔
+        重載兩次）。open_paths 的批內去重用的也是這把尺，兩邊要一致。
+        """
+        target = os.path.normcase(os.path.abspath(path))
         for index, tab in enumerate(self._tabs):
-            if tab.path and os.path.abspath(tab.path) == target:
+            if tab.path and os.path.normcase(os.path.abspath(tab.path)) == target:
                 return index
         return None
 
@@ -846,12 +869,102 @@ class MarkdownViewer(QWidget):
             [(tab.display_name, tab.path) for tab in self._tabs], self._active
         )
 
+    # -- 一次開多個檔案 ------------------------------------------------------
+    def open_paths(self, paths, activate_first: bool = True,
+                   defer_sync: bool = False) -> int:
+        """一次開多個檔案，回傳實際新開的分頁數。
+
+        【只渲染一個】第一個檔案照常載入並切過去，其餘只建立「延後載入」的
+        空殼分頁——記住路徑、標題直接用檔名，等使用者切過去才讀檔與渲染。
+        沿用的是還原上次分頁那套機制（見 document_tab 開頭的說明）。
+        十個檔案原本要付十次「讀檔＋轉 Markdown＋排版」，現在只付一次。
+
+        已經開著的檔案不會重複開；一次呼叫只同步一次分頁列與檔案監看。
+        讀不到的檔案不會中斷整批：延後分頁要等切過去才讀檔，那時才會顯示
+        錯誤頁，和使用者自己點開一個壞檔的行為一致。
+
+        【defer_sync】檔案總管多選是一條一條送進來的，每條都各自呼叫一次。
+        那樣尾工會做 N 次：_sync_tab_bar 每次結構有變就把整列分頁按鈕砍掉重建
+        （十個檔案累計 45 顆），而砍的時候 setParent(None) 會讓舊按鈕在被
+        deleteLater 收掉之前短暫變成「頂層視窗」——畫面上因此閃出一堆無標題的
+        小視窗（實測十個檔案最多同時九個）。_watch_files 也是每次都把監看器
+        整個拆掉重裝。所以連發路徑把尾工交給一個很短的計時器合併成一次。
+        """
+        seen: set[str] = set()
+        wanted: list[str] = []
+        for raw in paths:
+            if not raw:
+                continue
+            path = os.path.abspath(raw)
+            key = os.path.normcase(path)
+            if key in seen:
+                continue          # 同一批裡重複給了同一個檔案
+            seen.add(key)
+            wanted.append(path)
+        if not wanted:
+            return 0
+
+        opened = 0
+        first = True
+        for path in wanted:
+            existing = self._index_of_path(path)
+            if existing is not None:
+                # 已經開著：整批的第一個切過去，其餘留在原處不打擾
+                if first and activate_first:
+                    self.activate_tab(existing)
+                first = False
+                continue
+            if first and activate_first:
+                self.open_path(path, new_tab=True)
+            else:
+                self._add_tab(DocumentTab(path), activate=False)
+            opened += 1
+            first = False
+
+        # open_path 自己會同步，但延後分頁那條路徑不會，整批補一次就好
+        if defer_sync:
+            self._batch_sync_timer.start(self.BATCH_SYNC_MS)
+        else:
+            self._sync_tab_bar()
+            self._watch_files()
+        return opened
+
+    def _flush_batch_sync(self) -> None:
+        """連發結束後補做一次尾工（見 open_paths 的 defer_sync 說明）。
+
+        計時器是本視窗的子物件，視窗一銷毀就跟著沒了，不會在關窗後才觸發。
+        """
+        self._sync_tab_bar()
+        self._watch_files()
+
     # -- 外部開檔（單一實例） ------------------------------------------------
     def handle_external_open(self, path: str) -> None:
         """另一個行程把檔案交過來時呼叫（雙擊 .md 而本程式已在執行）。"""
         if path:
             self.open_path(path, new_tab=True)
         # 使用者是在檔案總管雙擊的，視窗要自己跳到前景
+        self.take_foreground()
+
+    def open_external_in_background(self, path: str) -> None:
+        """同一批多選裡的第二個之後的檔案：只建延後分頁，不切過去、不搶前景。
+
+        檔案總管多選開啟時，Windows 是「每個檔案叫一次開啟指令」（實測過，
+        MultiSelectModel 與 %* 都改不了這件事），於是 N 個檔案會變成 N 條
+        轉交訊息陸續送進來。每一條都當成獨立開檔的話，使用者會看到視窗連續
+        切 N 次分頁、渲染 N 份文件、被搶 N 次前景——十個檔案實測 3.4 秒、
+        標題變動 63 次。同一批只有第一條需要那些動作。
+        """
+        if path:
+            self.open_paths([path], activate_first=False, defer_sync=True)
+
+    def take_foreground(self) -> None:
+        """把視窗叫到前景（使用者剛在檔案總管按了開啟）。
+
+        已經在前面就什麼都不做：多選的第二個檔案之後再搶一次，換來的只是
+        視窗閃動與 AttachThreadInput 的成本。
+        """
+        if self.isActiveWindow() and not self.isMinimized():
+            return
         if self.isMinimized():
             self.showNormal()
         self.raise_()
@@ -1906,27 +2019,30 @@ class MarkdownViewer(QWidget):
 
     # -- 拖放 ----------------------------------------------------------------
     def dragEnterEvent(self, event) -> None:  # noqa: N802
-        if self._first_supported_path(event) is not None:
+        if self._supported_paths(event):
             event.acceptProposedAction()
 
     def dropEvent(self, event) -> None:  # noqa: N802
-        path = self._first_supported_path(event)
-        if path is not None:
+        paths = self._supported_paths(event)
+        if paths:
             event.acceptProposedAction()
-            self.open_path(path, new_tab=True)
+            # 拖進來幾個就開幾個：以前只開第一個，其餘無聲無息地消失
+            self.open_paths(paths)
 
     @staticmethod
-    def _first_supported_path(event) -> str | None:
+    def _supported_paths(event) -> list[str]:
+        """拖放內容裡所有支援的本機檔案，維持拖放的順序。"""
         mime = event.mimeData()
         if not mime.hasUrls():
-            return None
+            return []
+        paths = []
         for url in mime.urls():
             if not url.isLocalFile():
                 continue
             path = url.toLocalFile()
             if os.path.splitext(path)[1].lower() in config.SUPPORTED_SUFFIXES:
-                return path
-        return None
+                paths.append(path)
+        return paths
 
     # -- 視窗狀態 ------------------------------------------------------------
     def _restore_window_state(self) -> None:
@@ -2001,6 +2117,11 @@ class MarkdownViewer(QWidget):
         super().moveEvent(event)
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        # 【要讓外面知道這個視窗正在關】從這裡到 destroyed 訊號之間有一段空窗：
+        # 視窗還留在管理器的清單裡，但下面已經把分頁全部放掉了。這段期間若有
+        # 檔案被路由進來，會開進一個正在銷毀的視窗——畫面上什麼都不會出現，
+        # 使用者雙擊的檔案就這樣消失。
+        self._closing = True
         # 拖曳中關窗（中鍵按在被拖的分頁上、Ctrl+W）不會經過放開事件，
         # 要在這裡收掉手勢，否則全域拖曳游標與置頂的幽靈視窗會殘留
         # （詳見 tab_bar.cancel_active_drag 的說明）

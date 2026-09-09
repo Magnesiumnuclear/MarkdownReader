@@ -62,6 +62,42 @@ def send_to_existing(path: str | None) -> bool:
     return socket.bytesToWrite() == 0
 
 
+def send_all_to_existing(paths: list[str]) -> bool:
+    """把多個路徑交給既有實例（命令列一次給了好幾個檔案）。
+
+    一條連線送一個路徑，不把多個路徑塞進同一條訊息：收方是靠換行判斷「到齊了」，
+    一次多條會讓「第一個換行就交件」與「後面還在路上」打架，換來的只是省下
+    幾條便宜的連線。收方那邊會把在短時間內連續進來的路徑當成同一批處理
+    （見 window_manager.route_external_open）。
+
+    第一條送不出去就代表沒有實例在跑，回傳 False 讓本行程自己開視窗；
+    第一條成功之後就一定回傳 True——那時已經有檔案送出去了，再回報失敗會
+    變成「一個檔案開在既有視窗、其餘又另開一個視窗」。
+
+    後續路徑要重試。收方是單執行緒的：它可能正忙著渲染第一個檔案而暫時不接
+    連線，這時 connectToServer 會逾時失敗——只送一次就等於把那個檔案丟掉，
+    而且沒有任何錯誤訊息。重試的總預算對齊原生轉交器的 kPipeBusyTotalMs。
+    """
+    if not paths:
+        return send_to_existing(None)
+    if not send_to_existing(paths[0]):
+        return False
+    for path in paths[1:]:
+        _send_with_retry(path)
+    return True
+
+
+def _send_with_retry(path: str, budget_ms: int = 3000) -> bool:
+    """送一個路徑，收方忙就重試到預算用完。"""
+    waited = 0
+    while True:
+        if send_to_existing(path):
+            return True
+        if waited >= budget_ms:
+            return False
+        waited += config.IPC_CONNECT_TIMEOUT_MS
+
+
 class InstanceServer(QObject):
     """監聽端。收到別的行程送來的路徑時發出 pathReceived。"""
 

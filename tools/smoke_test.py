@@ -1993,6 +1993,293 @@ def section_tabs(args) -> None:
     v3.set_restore_tabs(False)
     v3.close()
     pump(300)
+
+    # --- 一次開多個檔案（多選、拖放、命令列共用的原語）-----------------------
+    # 檔案總管多選是「每個檔案叫一次開啟指令」（實測 MultiSelectModel 與 %*
+    # 都改不了），所以十個檔案原本要付十次「讀檔＋轉 Markdown＋排版」。
+    # open_paths 只讓第一個真的載入，其餘建成延後分頁，切過去才讀。
+    batch_dir = tempfile.mkdtemp(prefix="mdmulti-")
+    batch = []
+    for index in range(5):
+        target = os.path.join(batch_dir, f"batch{index}.md")
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write(f"# 批次 {index}{NL}{NL}內容 {index}{NL}")
+        batch.append(target)
+
+    v4 = MarkdownViewer(batch[0])
+    v4.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+    v4.resize(900, 640)
+    v4.show()
+    pump(400)
+    opened = v4.open_paths(batch[1:])
+    pump(400)
+    check("一次開多個：分頁數等於檔案數", v4.tab_count() == 5,
+          f"{v4.tab_count()} 個分頁，回報開了 {opened} 個")
+    check("一次開多個：整批只有第一個載入，其餘是延後分頁",
+          [tab.loaded for tab in v4._tabs[1:]] == [True, False, False, False],
+          str([tab.loaded for tab in v4._tabs]))
+    check("一次開多個：延後分頁的標題直接用檔名（不是「新分頁」）",
+          [t.display_name for t in v4._tabs] ==
+          [os.path.basename(p) for p in batch],
+          str([t.display_name for t in v4._tabs]))
+    check("一次開多個：作用中的是整批的第一個（後面的不會把它搶走）",
+          v4._active == 1 and v4._tabs[1].path == os.path.abspath(batch[1]),
+          f"active={v4._active}")
+    # 切過去才載入，而且內容正確
+    v4.activate_tab(3)
+    pump(400)
+    check("切到延後分頁時才讀檔，內容正確",
+          v4._tabs[3].loaded and "內容 3" in v4.browser.toPlainText(),
+          v4.browser.toPlainText()[:40])
+
+    # 重複的路徑不會開出第二個分頁
+    before = v4.tab_count()
+    again = v4.open_paths([batch[1], batch[1], batch[2]])
+    pump(300)
+    check("一次開多個：已經開著的檔案不重複開",
+          v4.tab_count() == before and again == 0,
+          f"{before} -> {v4.tab_count()}，回報 {again}")
+    check("一次開多個：整批第一個若已開著就切過去",
+          v4._tabs[v4._active].path == os.path.abspath(batch[1]),
+          str(v4._tabs[v4._active].path))
+
+    # 壞檔案不會中斷整批：其餘照樣開出來，切過去才顯示錯誤頁
+    missing = os.path.join(batch_dir, "不存在.md")
+    v4.open_paths([missing], activate_first=False)
+    pump(300)
+    check("一次開多個：讀不到的檔案照樣建分頁，不中斷整批",
+          v4.tab_count() == before + 1)
+    v4.activate_tab(v4.tab_count() - 1)
+    pump(400)
+    check("切到讀不到的延後分頁會顯示錯誤頁，不崩潰",
+          v4._tabs[v4._active].error is not None)
+
+    # 拖放多個檔案：以前只開第一個，其餘無聲無息地消失
+    import shutil
+
+    from PyQt6.QtCore import QMimeData, QUrl
+    from PyQt6.QtGui import QDropEvent
+
+    drop_dir = tempfile.mkdtemp(prefix="mddrop-")
+    drops = []
+    for index in range(3):
+        target = os.path.join(drop_dir, f"drop{index}.md")
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write(f"# 拖放 {index}{NL}")
+        drops.append(target)
+    mime = QMimeData()
+    mime.setUrls([QUrl.fromLocalFile(p) for p in drops] +
+                 [QUrl.fromLocalFile(os.path.join(drop_dir, "忽略.png"))])
+    before = v4.tab_count()
+    event = QDropEvent(QPointF(10.0, 10.0), Qt.DropAction.CopyAction, mime,
+                       Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+    v4.dropEvent(event)
+    pump(500)
+    check("拖放多個檔案會全部開出來（不支援的副檔名略過）",
+          v4.tab_count() == before + 3,
+          f"{before} -> {v4.tab_count()}")
+    check("拖放多個檔案：只有第一個載入，其餘延後",
+          [t.loaded for t in v4._tabs[-3:]] == [True, False, False],
+          str([t.loaded for t in v4._tabs[-3:]]))
+    v4.close()
+    pump(300)
+
+    # --- 多選連發：一批轉交只切一次分頁、只搶一次前景 ------------------------
+    # 檔案總管多選 = N 條轉交訊息在約 150 ms 內陸續進來。route_external_open
+    # 認這個連發，同一批只有第一條走完整路徑。時鐘是可注入的，不然這裡會變成
+    # 又慢又飄的計時測試。
+    from app.window_manager import WindowManager as _WM
+
+    manager_b = _WM()
+    fake_now = {"t": 1000.0}
+    manager_b._clock = lambda: fake_now["t"]
+    host_b = manager_b.create_window(batch[0])
+    host_b.resize(900, 640)
+    pump(400)
+    foreground_calls = []
+    host_b.take_foreground = lambda: foreground_calls.append(1)
+
+    manager_b.route_external_open(batch[1])
+    pump(300)
+    check("連發第一條：走完整路徑（切過去、載入、搶前景）",
+          host_b.tab_count() == 2 and host_b._tabs[host_b._active].loaded
+          and host_b._tabs[host_b._active].path == os.path.abspath(batch[1])
+          and len(foreground_calls) == 1,
+          f"分頁={host_b.tab_count()} 前景={len(foreground_calls)}")
+
+    fake_now["t"] += 0.05
+    manager_b.route_external_open(batch[2])
+    fake_now["t"] += 0.05
+    manager_b.route_external_open(batch[3])
+    pump(400)
+    check("同一批的後續：分頁開出來但不切過去",
+          host_b.tab_count() == 4
+          and host_b._tabs[host_b._active].path == os.path.abspath(batch[1]),
+          f"分頁={host_b.tab_count()} active={host_b._tabs[host_b._active].path}")
+    check("同一批的後續：只建延後分頁，不多渲染",
+          [t.loaded for t in host_b._tabs] == [True, True, False, False],
+          str([t.loaded for t in host_b._tabs]))
+    check("同一批的後續：不再重複搶前景（十個檔案不會閃十次）",
+          len(foreground_calls) == 1, str(len(foreground_calls)))
+
+    # 連發時的尾工要合併：每條都重建分頁列的話，舊按鈕 setParent(None) 會在被
+    # 收掉之前短暫變成頂層視窗，畫面上閃出一堆無標題小視窗（實測十個檔案九個）
+    syncs = []
+    real_sync = host_b._sync_tab_bar
+    host_b._sync_tab_bar = lambda: (syncs.append(1), real_sync())[1]
+    fake_now["t"] += 0.05
+    manager_b.route_external_open(batch[4])
+    check("連發的尾工延後合併：當下不重建分頁列", syncs == [], str(len(syncs)))
+    pump(host_b.BATCH_SYNC_MS + 250)
+    check("連發靜下來之後補做一次尾工", len(syncs) == 1, str(len(syncs)))
+    host_b._sync_tab_bar = real_sync
+
+    # 視窗不在前面時，連發的後續仍要把它叫出來——不然使用者按了開啟卻什麼都
+    # 沒發生（檔案安靜地開在看不到的視窗裡），那比「沒切過去」糟得多
+    fake_now["t"] += 0.05
+    host_b.isActiveWindow = lambda: False
+    manager_b.route_external_open(batch[0])
+    pump(200)
+    check("連發中視窗若不在前面，仍會把它叫到前景",
+          len(foreground_calls) == 2, str(len(foreground_calls)))
+    del host_b.isActiveWindow
+
+    # 【blocker 回歸】連發的計時要在「做完事之後」蓋章。渲染是同步的，一份大
+    # 文件可能就吃掉整個窗口；在開始前蓋章的話，第一個檔案越大越容易被判成
+    # 不同批——正好在最需要批次的時候失效。
+    fake_now["t"] += manager_b.BURST_SECONDS + 0.1     # 先讓上一批過期
+    slow = host_b.handle_external_open
+
+    def slow_open(path):
+        fake_now["t"] += 1.0      # 假裝第一份文件渲染了一秒
+        slow(path)
+
+    host_b.handle_external_open = slow_open
+    manager_b.route_external_open(batch[1])
+    pump(300)
+    host_b.handle_external_open = slow
+    active_before = host_b._tabs[host_b._active].path
+    fake_now["t"] += 0.05
+    manager_b.route_external_open(batch[2])
+    pump(300)
+    check("第一個檔案渲染很久也不會把整批拆散（計時在做完之後才起算）",
+          host_b._tabs[host_b._active].path == active_before,
+          f"active={host_b._tabs[host_b._active].path}")
+
+    # 冷啟動多選：第一個檔案是命令列開的，沒經過 route_external_open
+    fake_now["t"] += manager_b.BURST_SECONDS + 0.1
+    manager_b.note_batch_started(host_b)
+    active_before = host_b._tabs[host_b._active].path
+    fake_now["t"] += 0.05
+    manager_b.route_external_open(batch[3])
+    pump(300)
+    check("冷啟動多選：命令列開的第一個檔案也會起一批（第二個不搶走畫面）",
+          host_b._tabs[host_b._active].path == active_before,
+          f"active={host_b._tabs[host_b._active].path}")
+
+    # 空訊息（無參數啟動）只是「把視窗叫到前面」，不該起一批也不該延長
+    fake_now["t"] += manager_b.BURST_SECONDS + 0.1
+    manager_b.route_external_open("")
+    fake_now["t"] += 0.05
+    manager_b.route_external_open(batch[4])
+    pump(300)
+    check("空訊息不會起一批（之後的檔案照樣切過去）",
+          host_b._tabs[host_b._active].path == os.path.abspath(batch[4]),
+          f"active={host_b._tabs[host_b._active].path}")
+
+    # 大小寫不同是同一個檔案，不該開出第二個分頁
+    before = host_b.tab_count()
+    host_b.open_paths([os.path.abspath(batch[4]).upper()])
+    pump(300)
+    check("大小寫不同的同一個檔案不會重複開",
+          host_b.tab_count() == before, f"{before} -> {host_b.tab_count()}")
+
+    # 超過連發窗口＝使用者刻意再開一個檔案，要切過去
+    fake_now["t"] += manager_b.BURST_SECONDS + 0.1
+    fg_before = len(foreground_calls)
+    manager_b.route_external_open(batch[0])
+    pump(400)
+    check("超過連發窗口就是新的一批：切過去並搶前景",
+          host_b._tabs[host_b._active].path == os.path.abspath(batch[0])
+          and len(foreground_calls) == fg_before + 1,
+          f"active={host_b._tabs[host_b._active].path} "
+          f"前景={fg_before}->{len(foreground_calls)}")
+
+    # 連發中的空訊息（無參數啟動）只是「把視窗叫到前面」，不能被整批吞掉
+    fake_now["t"] += 0.05
+    tabs_before = host_b.tab_count()
+    fg_before = len(foreground_calls)
+    host_b.isActiveWindow = lambda: False
+    manager_b.route_external_open("")
+    pump(200)
+    del host_b.isActiveWindow
+    check("連發中的空訊息仍會把視窗叫到前面，且不開分頁",
+          host_b.tab_count() == tabs_before
+          and len(foreground_calls) == fg_before + 1,
+          f"分頁={tabs_before}->{host_b.tab_count()} "
+          f"前景={fg_before}->{len(foreground_calls)}")
+
+    # 空訊息不屬於任何一批，也不該把連發窗口往後延——否則使用者在多選之後
+    # 刻意開的下一個檔案會被前面那條無關的訊息拖進同一批而不切過去
+    fake_now["t"] += manager_b.BURST_SECONDS + 0.1     # 先讓上一批過期
+    manager_b.route_external_open(batch[1])           # 起一批（真的路徑）
+    pump(300)
+    fake_now["t"] += manager_b.BURST_SECONDS - 0.05   # 還在窗口內
+    manager_b.route_external_open("")                 # 空訊息：不該延長
+    fake_now["t"] += 0.1                              # 累計已超過窗口
+    manager_b.route_external_open(batch[2])
+    pump(300)
+    check("連發中的空訊息不會把窗口往後延",
+          host_b._tabs[host_b._active].path == os.path.abspath(batch[2]),
+          f"active={host_b._tabs[host_b._active].path}")
+
+    # 連發途中目標視窗被關掉：檔案不能掉進正在銷毀的視窗裡。
+    # 【不要 pump】closeEvent 到 destroyed 之間才是危險窗口：視窗還在管理器的
+    # 清單裡，分頁卻已經清空。pump 過了 deleteLater 就跑完，剛好繞過這一段。
+    fake_now["t"] += 0.05
+    late = os.path.join(batch_dir, "late.md")
+    with open(late, "w", encoding="utf-8") as handle:
+        handle.write("# 關閉中的視窗不能吃掉這個檔案" + NL)
+    keep = manager_b.create_window(batch[2])
+    keep.resize(700, 500)
+    pump(300)
+    # 先讓上一批過期，這一條才會起新的一批、目標才會是 keep
+    fake_now["t"] += manager_b.BURST_SECONDS + 0.1
+    manager_b.route_external_open(batch[3])     # 讓 keep 成為連發目標
+    pump(300)
+    check("連發前置：連發目標確實是剛開的那個視窗",
+          manager_b._burst_target is keep)
+    fake_now["t"] += 0.05
+    keep.close()                                # 不 pump，停在關閉中的狀態
+    # 讓「最後作用中」也指著這個關閉中的視窗：不這樣的話路由本來就會挑到別人，
+    # 這條檢查會變成不管有沒有跳過關閉中的視窗都綠
+    manager_b._last_active = keep
+    crashed = ""
+    try:
+        manager_b.route_external_open(late)
+    except Exception as exc:      # noqa: BLE001
+        crashed = repr(exc)
+
+    # 【不要 pump 就判定】等 deleteLater 跑完，關閉中的視窗會從清單消失，
+    # 「檔案掉進去了」和「檔案沒開成」就分不出來了
+    def _holds(window, target):
+        key = os.path.normcase(os.path.abspath(target))
+        return any(tab.path and os.path.normcase(tab.path) == key
+                   for tab in window._tabs)
+
+    went_to_closing = _holds(keep, late)
+    landed = any(w is not keep and _holds(w, late)
+                 for w in manager_b.windows())
+    check("連發途中視窗被關掉：不崩潰", not crashed, crashed)
+    check("連發途中視窗被關掉：檔案不會掉進正在關閉的視窗", not went_to_closing)
+    check("連發途中視窗被關掉：檔案落在活著的視窗裡，不會消失", landed,
+          f"視窗數={len(manager_b.windows())}")
+    pump(500)
+    for window in list(manager_b.windows()):
+        window.close()
+    pump(400)
+    for folder in (batch_dir, drop_dir):
+        shutil.rmtree(folder, ignore_errors=True)
     QSettings(config.ORG_NAME, config.APP_NAME).clear()
 
 

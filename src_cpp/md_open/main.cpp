@@ -7,7 +7,7 @@
 // 就付一次，是日常最有感的操作。
 //
 // 這支程式只做三件事：
-//   1. 試著連上具名管道，連得上就把路徑送過去、結束。
+//   1. 試著連上具名管道，連得上就把路徑（可以有多個）送過去、結束。
 //   2. 連不上就啟動本體，把參數原封不動傳過去。
 //   3. 等管道出現後才退場，讓同時被雙擊的其他檔案排在後面轉交，
 //      而不是各自開一個視窗。
@@ -57,6 +57,10 @@ static const DWORD kPollIntervalMs = 25;
 // 否則會握著排隊鎖空等滿 15 秒。取 4 秒而不是更短，是因為單一 exe 版的
 // 啟動器行程可能在解壓期間就被判定閒置，太短會誤判。
 static const DWORD kIdleGraceMs = 4000;
+
+// 一次最多轉交幾個路徑。檔案總管多選是一檔一次叫用，這個上限只擋
+// 命令列給到離譜的情況；每個路徑各佔 MAX_PATH*2 個 wchar，放在堆疊上。
+static const int kMaxPaths = 32;
 
 // --- 小工具（不用 CRT，避免多拖一份執行期）--------------------------------
 
@@ -230,29 +234,38 @@ static HANDLE launch_app(const wchar_t *app_path)
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 {
-    // 取第一個非旗標參數當作要開的檔案，並正規化成絕對路徑
-    wchar_t path[MAX_PATH * 2];
-    path[0] = 0;
+    // 收集所有非旗標參數當作要開的檔案，並正規化成絕對路徑。
+    // 檔案總管多選是「每個檔案叫一次」，所以這裡通常只有一個；但命令列
+    // （或別的程式）一次給好幾個時，以前只送第一個、其餘無聲無息地消失。
+    wchar_t paths[kMaxPaths][MAX_PATH * 2];
+    int path_count = 0;
     {
         int count = 0;
         LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &count);
         if (argv) {
-            for (int i = 1; i < count; ++i) {
+            for (int i = 1; i < count && path_count < kMaxPaths; ++i) {
                 if (argv[i][0] == L'-') continue;
                 wchar_t full[MAX_PATH * 2];
                 DWORD n = GetFullPathNameW(argv[i],
                                            (DWORD)(sizeof(full) / sizeof(full[0])),
                                            full, NULL);
-                wappend(path, sizeof(path) / sizeof(path[0]),
+                paths[path_count][0] = 0;
+                wappend(paths[path_count], sizeof(paths[0]) / sizeof(wchar_t),
                         (n > 0 && n < sizeof(full) / sizeof(full[0])) ? full : argv[i]);
-                break;
+                ++path_count;
             }
             LocalFree(argv);
         }
     }
+    const wchar_t *path = path_count > 0 ? paths[0] : L"";
 
-    // 快路徑：已經有實例在跑就直接送過去。
-    if (try_send(path)) return 0;
+    // 快路徑：已經有實例在跑就直接送過去。一條連線送一個路徑（收方靠換行
+    // 判斷到齊，不把多個塞進同一條訊息）；第一條送得出去就代表實例活著，
+    // 後面幾條盡力送完即可。收方會把連續進來的路徑當成同一批處理。
+    if (try_send(path)) {
+        for (int i = 1; i < path_count; ++i) try_send(paths[i]);
+        return 0;
+    }
 
     // 慢路徑：要啟動本體。用互斥鎖排隊，否則一次選取多個 .md 按 Enter 時，
     // 每個行程都會發現「沒有實例」而各自開一個視窗。
@@ -264,7 +277,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     }
 
     // 排隊等到的期間，前面那個可能已經把本體帶起來了，再試一次。
+    // 這裡同樣要把剩下的路徑送完——只送第一個的話，冷啟動多選時排在後面的
+    // 檔案會無聲無息地消失。
     if (held && try_send(path)) {
+        for (int i = 1; i < path_count; ++i) try_send(paths[i]);
         ReleaseMutex(gate);
         CloseHandle(gate);
         return 0;
