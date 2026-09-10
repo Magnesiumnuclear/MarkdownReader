@@ -1061,6 +1061,119 @@ def section_rendering(args) -> None:
     bar.deactivate()
     pump(200)
 
+    # -- YAML front matter 屬性表 -------------------------------------------
+    # 以前：文件開頭 ---…--- 的 metadata 會被畫成水平線＋setext 大標題。
+    # 現在：合格的 YAML front matter 被剝離、組成文件頂端一個淡色的小型鍵／值
+    #       屬性表；不合格（未關閉、中間有非 YAML 行、前面有空行、空 front
+    #       matter）一律退回原樣交給 Markdown，文件絕不會開不了。
+    fm_basic = _doc_probe.markdown_to_html(
+        "---\ntitle: 我的文章\nauthor: Sam\n---\n# 內文\n", "light")
+    check("front matter 基本鍵值顯示成小型屬性表",
+          '<table class="frontmatter"' in fm_basic
+          and '<td class="fmkey">title</td>' in fm_basic
+          and "我的文章" in fm_basic and "author" in fm_basic,
+          fm_basic[:200])
+
+    fm_block = _doc_probe.markdown_to_html(
+        "---\ntags:\n  - python\n  - qt\n---\nx\n", "light")
+    fm_inline = _doc_probe.markdown_to_html(
+        "---\nlangs: [zh, en]\n---\nx\n", "light")
+    check("front matter 區塊清單與行內清單都以「、」併呈",
+          "python、qt" in fm_block and "zh、en" in fm_inline,
+          f"block={('python、qt' in fm_block)} inline={('zh、en' in fm_inline)}")
+
+    fm_quote = _doc_probe.markdown_to_html(
+        '---\ntitle: "帶引號"\n---\nx\n', "light")
+    check("front matter 值的成對引號被剝除",
+          "帶引號" in fm_quote and "&quot;帶引號&quot;" not in fm_quote,
+          fm_quote[:200])
+
+    # '...' 後刻意留一行空白：讓「錨點」那條的 body 位移突變（close+2）只吃掉這
+    # 行空白而非「內文」，兩條突變因此互相隔離、各自只讓自己那條紅。
+    fm_dots = _doc_probe.markdown_to_html("---\ntitle: x\n...\n\n內文\n", "light")
+    check("front matter 以 ... 結尾也認得",
+          'class="frontmatter"' in fm_dots and "內文" in fm_dots,
+          fm_dots[:200])
+
+    # 第一行 --- 後接一個合法鍵行 title: 標題，再接不像 YAML 的散文行「關於本文」，
+    # 讓 _parse 能產出非空 pairs——成表與否只由 _looks_like_yaml_line 這一關決定。
+    fm_hr = _doc_probe.markdown_to_html(
+        "---\ntitle: 標題\n關於本文\n---\n正文\n", "light")
+    check("--- 當水平線的普通文件不被誤判成 front matter",
+          'class="frontmatter"' not in fm_hr and "關於本文" in fm_hr,
+          fm_hr[:200])
+
+    fm_blank = _doc_probe.markdown_to_html("\n---\ntitle: x\n---\n", "light")
+    check("front matter 前面有空行就不算（第一行必須正好是 ---）",
+          'class="frontmatter"' not in fm_blank, fm_blank[:200])
+
+    fm_esc = _doc_probe.markdown_to_html("---\ntitle: <b>粗</b>\n---\nx\n", "light")
+    check("front matter 值裡的 HTML/Markdown 被 escape 不解析",
+          "&lt;b&gt;粗&lt;/b&gt;" in fm_esc and "<b>粗</b>" not in fm_esc,
+          fm_esc[:200])
+
+    fm_prog_doc = "---\ntitle: 首屏\n---\n\n" + ("## 段\n\n內容一段。\n\n" * 250)
+    fm_prog_page = _doc_probe.render_document(
+        fm_prog_doc, _doc_probe.meta_for_pasted(fm_prog_doc), "light")
+    fm_head, fm_chunks = _doc_probe.split_for_progressive_render(fm_prog_page)
+    fm_after_key = (fm_head[fm_head.index("frontmatter"):]
+                    if "frontmatter" in fm_head else "")
+    check("分段渲染時 front matter 表在首屏且是完整一個表格",
+          bool(fm_chunks) and 'class="frontmatter"' in fm_head
+          and fm_head.count('class="frontmatter"') == 1
+          and "</table>" in fm_after_key,
+          f"chunks={len(fm_chunks)} "
+          f"count={fm_head.count('class=' + chr(34) + 'frontmatter' + chr(34))}")
+
+    fm_tab = _DT()
+    fm_tab.set_pasted("---\nsource: 剪貼簿\n---\n內容\n")
+    fm_paste = fm_tab.build_html("light")
+    check("貼上的 Markdown 走同一個轉換，front matter 也成表",
+          'class="frontmatter"' in fm_paste and "剪貼簿" in fm_paste,
+          fm_paste[:200])
+
+    fm_css_light = styles.build_doc_css("light", 11.0, 160, "zh_TW")
+    fm_css_dark = styles.build_doc_css("dark", 11.0, 160, "zh_TW")
+    check("深淺色主題各有 front matter 屬性表樣式",
+          all(sel in fm_css_light for sel in
+              ("table.frontmatter", "td.fmkey", "td.fmval"))
+          and all(sel in fm_css_dark for sel in
+                  ("table.frontmatter", "td.fmkey", "td.fmval")),
+          "light/dark 三個選擇器")
+
+    # 渲染路徑會剝離 front matter，但字數統計在 read_text_file 對全文算、不剝離。
+    # 對照 full（含 front matter）與 body_only（剝離後）證明兩者不同，再釘死
+    # char_count 照 full 算——這才驗到「渲染剝離、統計不剝離」這條不變式。
+    fm_wc_path = os.path.join(tmp, "fm_wordcount.md")
+    fm_wc_src = "---\ntitle: 統計\ntags: [a, b]\n---\n\n正文一段。\n"
+    with open(fm_wc_path, "w", encoding="utf-8") as handle:
+        handle.write(fm_wc_src)
+    fm_wc_text, fm_wc_meta = _doc_probe.read_text_file(fm_wc_path)
+    fm_wc_full = sum(map(len, fm_wc_text.split()))
+    fm_wc_body = sum(map(len, _doc_probe.split_front_matter(fm_wc_text)[1].split()))
+    check("front matter 不影響原始字數（渲染剝離、統計照全文算）",
+          'class="frontmatter"' in _doc_probe.markdown_to_html(fm_wc_text, "light")
+          and fm_wc_full > fm_wc_body
+          and fm_wc_meta.char_count == fm_wc_full,
+          f"full={fm_wc_full} body_only={fm_wc_body} char_count={fm_wc_meta.char_count}")
+
+    fm_anchor = _doc_probe.markdown_to_html("---\ntitle: x\n---\n## 表格\n", "light")
+    check("front matter 後的標題錨點與內文不受剝離影響",
+          'class="frontmatter"' in fm_anchor and 'name="表格"' in fm_anchor,
+          fm_anchor[:200])
+
+    fm_mermaid = _doc_probe.markdown_to_html(
+        "---\ntitle: 圖\n---\n\n```mermaid\ngraph TD\nA-->B\n```\n", "light")
+    check("front matter 剝離在 Mermaid 前處理之前（兩者並存）",
+          'class="frontmatter"' in fm_mermaid and 'src="mermaid:' in fm_mermaid,
+          fm_mermaid[:200])
+
+    fm_unclosed = _doc_probe.markdown_to_html(
+        "---\ntitle: 未關閉\nauthor: 保留\n", "light")
+    check("沒有結尾分隔符的 front matter 退回原樣、不吞內文",
+          'class="frontmatter"' not in fm_unclosed and "title: 未關閉" in fm_unclosed,
+          fm_unclosed[:200])
+
     viewer.close()
     pump(300)
     QSettings(config.ORG_NAME, config.APP_NAME).clear()

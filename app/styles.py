@@ -753,6 +753,28 @@ table.data td {
     color: $text;
 }
 
+/* YAML front matter 屬性表。這張表不經 qt_html 的樹改寫（在 markdown_to_html
+   轉換前就組好、字串前接在最前面），所以不會被加上 data class，樣式必須在這裡
+   自足。刻意偏淡、字級略小（0.85em），鍵欄用等寬字與 header 底色以示區隔；
+   深淺色因全走色票（$border / $table_header_bg / $window_bg / $text /
+   $text_muted）自動連動，不必各寫一份。 */
+table.frontmatter { border-collapse: collapse; margin-top: 0.20em; margin-bottom: 1.10em; }
+td.fmkey {
+    border: 1px solid $border;
+    padding: 4px 12px;
+    background-color: $table_header_bg;
+    color: $text;
+    font-family: $font_code;
+    font-size: 0.85em;
+}
+td.fmval {
+    border: 1px solid $border;
+    padding: 4px 12px;
+    background-color: $window_bg;
+    color: $text_muted;
+    font-size: 0.85em;
+}
+
 /* 註腳 */
 div.footnote { font-size: 0.90em; color: $text_muted; }
 div.footnote li { color: $text_muted; }

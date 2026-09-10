@@ -256,15 +256,211 @@ def theme_sensitive(html: str) -> bool:
     return "codecell" in html
 
 
+# --- YAML front matter ------------------------------------------------------
+# 文件開頭 `---`…`---`（或以 `...` 收尾）圍起來的 metadata（Obsidian／Hugo／
+# Jekyll 常見）。不處理的話 Markdown 會把開頭那條 `---` 當成水平線、再把下一行
+# 當成 setext 大標題，metadata 整段被吃掉。這裡在轉換前把它剝離、另外組成一個
+# 淡色的小型鍵／值屬性表接在最前面。
+#
+# 【只做 YAML（---），不做 TOML（+++）】TOML 的語法（含 `[table]` 區段、多種
+# 純量型別）遠比這裡的最小解析複雜，需求也只點名 YAML，因此 `+++` 一律不理、
+# 照原樣交給 Markdown。
+#
+# 【頂層 key 行的樣子】冒號後必須接空白或就是行尾，才算 YAML 的 `key: value`。
+# 這樣「裸網址（http://…）」「無冒號的散文或標題」「key:value 沒有空白的純量」
+# 都不會被誤認成 front matter，避免把「開頭一條水平線、後面又一條」的普通文件
+# 吞掉。CRLF 檔每行會帶尾端 \r：分隔符判斷一律先 rstrip，key 行的 `.*` 會把 \r
+# 一起吃掉、`$` 落在真正的行尾，比對正常。
+_FM_KEY_RE = re.compile(r"^[^\s#:][^:]*:(?:\s.*)?$")
+
+
+def _looks_like_yaml_line(raw: str) -> bool:
+    """這一行「像不像」YAML front matter 裡會出現的行。
+
+    只做形狀判斷、不做語意解析：空行、整行 `#` 註解、`- 項目` 清單行、縮排的
+    續行（巢狀值）都算「像」；其餘要命中 _FM_KEY_RE 的頂層 `key: value` 才算。
+    只要中間有任一行不像，整段就不當 front matter，退回原樣交給 Markdown。
+    """
+    s = raw.strip()
+    if s == "" or s.startswith("#"):
+        return True
+    if s == "-" or s.startswith("- "):
+        return True
+    if raw[:1] in (" ", "\t"):
+        return True
+    return bool(_FM_KEY_RE.match(raw))
+
+
+def _strip_quotes(s: str) -> str:
+    """剝掉成對的首尾引號；單邊或不成對則原樣保留。"""
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        return s[1:-1]
+    return s
+
+
+def _render_value(v: str) -> str:
+    """把頂層 `key: value` 的 value 轉成儲存格內容（已 HTML escape）。
+
+    行內清單 `[a, b]` 以「、」併呈；其餘當純量。值裡的 Markdown／HTML 一律
+    escape、不解析（front matter 的值是 metadata，不是內文）。含逗號的引號項
+    （如 `[a, "b, c"]`）會被天真的 split(',') 拆錯，屬最小解析的已知簡化。
+    """
+    v = v.strip()
+    if len(v) >= 2 and v[0] == "[" and v[-1] == "]":
+        items = [_strip_quotes(x) for x in v[1:-1].split(",")]
+        return "、".join(html.escape(x) for x in items if x != "")
+    return html.escape(_strip_quotes(v))
+
+
+def _render_block(block: list[str]) -> str:
+    """把 `key:` 底下蒐集到的多行區塊轉成儲存格內容（已 HTML escape）。
+
+    整段都是 `- 項目` 清單就以「、」併呈；否則當多行／巢狀值，以 <br> 保留
+    換行（縮排對齊不保證，Qt rich text 會塌縮多餘空白，屬已知簡化）。
+    """
+    lines = list(block)
+    while lines and lines[0].strip() == "":
+        lines.pop(0)
+    while lines and lines[-1].strip() == "":
+        lines.pop()
+    items = [ln for ln in lines if ln.strip() != ""]
+    if not items:
+        return ""
+    stripped = [ln.strip() for ln in items]
+    if all(s == "-" or s.startswith("- ") for s in stripped):
+        return "、".join(html.escape(_strip_quotes(s[1:].strip())) for s in stripped)
+    return "<br>".join(html.escape(ln.strip()) for ln in items)
+
+
+def _parse_front_matter(inner: list[str]) -> list[tuple[str, str]]:
+    """把 front matter 內文逐行掃成 [(key, value_html), ...]。
+
+    空行與整行註解跳過；沒有前導 key 的孤立縮排行或清單行也跳過。命中
+    _FM_KEY_RE 的頂層行以第一個冒號切成 key／value：value 非空直接成一列；
+    value 為空（`key:`）則往下蒐集區塊，直到遇到下一個頂層 key 為止。
+    """
+    pairs: list[tuple[str, str]] = []
+    i = 0
+    n = len(inner)
+    while i < n:
+        raw = inner[i]
+        s = raw.strip()
+        if s == "" or s.startswith("#"):
+            i += 1
+            continue
+        if raw[:1] in (" ", "\t") or s == "-" or s.startswith("- "):
+            i += 1
+            continue
+        if not _FM_KEY_RE.match(raw):
+            i += 1
+            continue
+        colon = raw.index(":")
+        key = raw[:colon].strip()
+        value = raw[colon + 1:].strip()
+        if value:
+            pairs.append((key, _render_value(value)))
+            i += 1
+            continue
+        # value 為空：往下蒐集區塊，遇到下一個頂層 key（非縮排、非清單、且像
+        # key 行）為界；清單項可落在第 0 欄或縮排，都算這個 key 的內容。
+        block: list[str] = []
+        i += 1
+        while i < n:
+            nxt = inner[i]
+            ns = nxt.strip()
+            top_level = (
+                nxt[:1] not in (" ", "\t")
+                and not (ns == "-" or ns.startswith("- "))
+                and bool(_FM_KEY_RE.match(nxt))
+            )
+            if top_level:
+                break
+            block.append(nxt)
+            i += 1
+        pairs.append((key, _render_block(block)))
+    return pairs
+
+
+def _frontmatter_table(pairs: list[tuple[str, str]]) -> str:
+    """把解析好的鍵／值組成一個兩欄的 <table class="frontmatter">。
+
+    value_html 在 _render_value／_render_block 已經 escape 過（其中「、」與
+    <br> 是刻意保留的字面）；key 在這裡 escape。這張表不進 ElementTree、也不進
+    htmlStash，因此不會被 _mark_data_tables 加上 data class，樣式在文件 CSS 自足。
+    """
+    rows = [
+        '<tr><td class="fmkey">' + html.escape(key)
+        + '</td><td class="fmval">' + value_html + "</td></tr>"
+        for key, value_html in pairs
+    ]
+    return (
+        '<table class="frontmatter" border="0" cellspacing="0" cellpadding="0">'
+        + "".join(rows)
+        + "</table>"
+    )
+
+
+def split_front_matter(text: str) -> tuple[str, str]:
+    """剝離開頭的 YAML front matter，回傳 (屬性表 HTML 或 "", 剝離後內文)。
+
+    只認「檔案第一行正好是 ---」（前面不能有空行、行首不能有縮排；BOM 已由
+    read_text_file 的 codec 剝掉，text 直接以 --- 開頭），結尾是單獨一行 ---
+    或 ...，且中間每個非空行都「像 YAML」。任何一步不符或解析出錯，一律回傳
+    ("", 原文) 原樣交給 Markdown——front matter 解析失敗絕不能讓文件開不了。
+
+    只做 YAML（---）；TOML（+++）不處理。
+    """
+    lines = text.split("\n")
+    # step 1：第一行必須正好是 ---（rstrip 容忍 CRLF 的尾端 \r）。這一條同時擋掉
+    # 「前面有空行」（此時 lines[0] 是 ""）與「行首有縮排」。
+    if not lines or lines[0].rstrip() != "---":
+        return "", text
+    # step 2：找結尾分隔符 --- 或 ...；找不到代表未關閉，退回原樣、不吞內文。
+    close = None
+    for i in range(1, len(lines)):
+        if lines[i].rstrip() in ("---", "..."):
+            close = i
+            break
+    if close is None:
+        return "", text
+    # step 3：中間每個非空行都要像 YAML，否則整段不當 front matter（避免把
+    # 「開頭一條水平線、後面又一條」的普通文件或 setext 標題吞掉）。這一關必須
+    # 在 step 5「pairs 空退回」之前，否則不像 YAML 的行會先被 step 5 遮蔽。
+    inner = lines[1:close]
+    for raw in inner:
+        if raw.strip() != "" and not _looks_like_yaml_line(raw):
+            return "", text
+    # step 4：解析失敗一律退回原樣。
+    try:
+        pairs = _parse_front_matter(inner)
+    except Exception:  # noqa: BLE001 - front matter 解析絕不能讓文件開不了
+        return "", text
+    # step 5：解析不出任何鍵值（空 front matter、頂層純序列無鍵）就當作不是
+    # front matter，行為與現況一致。
+    if not pairs:
+        return "", text
+    body = "\n".join(lines[close + 1:])
+    return _frontmatter_table(pairs), body
+
+
 def markdown_to_html(text: str, theme: str) -> str:
-    """把 Markdown 原始碼轉成 Qt 相容的 HTML 片段。"""
+    """把 Markdown 原始碼轉成 Qt 相容的 HTML 片段。
+
+    先剝離開頭的 YAML front matter（見 split_front_matter）：剝離發生在
+    converter.convert 之前，因此天然在 Mermaid 前處理（優先序 27）與所有樹改寫
+    之前；屬性表字串直接前接在轉換結果最前面，轉換器永遠看不到它，也保證它是
+    body 的第一個頂層元素、完整一個 <table> 不會被分段渲染切壞。沒有 front
+    matter 時 fm_html 為 ""、body 就是原文，輸出與未剝離時逐位元組相同。
+    """
+    fm_html, body = split_front_matter(text)
     converter = _CONVERTERS.get(theme)
     if converter is None:
         converter = _build_converter(theme)
         _CONVERTERS[theme] = converter
     else:
         converter.reset()
-    return converter.convert(text)
+    return fm_html + converter.convert(body)
 
 
 def _page(body: str) -> str:
