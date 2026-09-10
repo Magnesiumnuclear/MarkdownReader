@@ -204,8 +204,32 @@ KEY_ACTIVE_TAB = "session/activeTab"
 DEFAULT_RESTORE_TABS = False
 
 # --- 單一實例 ---------------------------------------------------------------
-# 具名管道的名稱要含使用者名稱，避免多使用者登入時互相搶。
-IPC_SERVER_NAME = "MarkdownReader.SingleInstance"
+def _login_session_id() -> int:
+    """目前行程所在的登入工作階段編號（Windows）；查不到就回 0。"""
+    try:
+        import ctypes
+
+        session = ctypes.c_ulong(0)
+        kernel32 = ctypes.windll.kernel32
+        if kernel32.ProcessIdToSessionId(kernel32.GetCurrentProcessId(),
+                                         ctypes.byref(session)):
+            return int(session.value)
+    except (AttributeError, OSError):
+        pass
+    return 0
+
+
+# 具名管道是整台機器共用的（它沒有互斥鎖那種 Local\ 前綴可用），兩個使用者同時
+# 登入時，後登入的人雙擊 .md 會把路徑送進前一個人的視窗——在他看不到的桌面上
+# 開了分頁，自己這邊什麼都沒發生。所以名稱帶上登入工作階段編號。
+# 用工作階段編號而不是使用者名稱：同一個人從主控台與遠端桌面同時登入也是兩個
+# 桌面，各自一個實例才對；而且編號是純數字，不必煩惱使用者名稱裡的中文與空白
+# 在 Python 與 C++ 兩邊編碼是否一致。轉交器（src_cpp/md_open/main.cpp）用同樣的
+# 方式組名稱：IPC_SERVER_BASE 對應它的 kPipeBase，改了要兩邊一起改，測試會比對。
+# 這個註解以前寫「要含使用者名稱」但名稱其實什麼都沒含，排查多使用者互搶時會被
+# 引到錯的方向——現在說的就是做的。
+IPC_SERVER_BASE = "MarkdownReader.SingleInstance"
+IPC_SERVER_NAME = f"{IPC_SERVER_BASE}.{_login_session_id()}"
 IPC_CONNECT_TIMEOUT_MS = 150     # 連不到就當作沒有既有實例，不要卡住啟動
 IPC_WRITE_TIMEOUT_MS = 1000
 # 送出後等對方關閉連線的確認。只是保險，等不到也不影響正確性

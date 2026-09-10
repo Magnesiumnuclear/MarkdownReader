@@ -2972,21 +2972,42 @@ def section_single_instance(args) -> None:
     from app import single_instance
 
     # --- 管道名稱一致性 ---
-    # C++ 轉交器（src_cpp/md_open/main.cpp）用寫死的管道名稱和本體講話。
-    # 兩邊改到不同步的話不會有任何錯誤訊息：轉交器每次都「找不到管道」，
-    # 安靜退化成每個檔案開一個視窗。這裡直接比對原始碼，改壞立刻紅燈。
+    # 管道名稱＝基底名稱＋登入工作階段編號，Python（config.IPC_SERVER_NAME）與
+    # C++ 轉交器（src_cpp/md_open/main.cpp 的 pipe_path）各算一次。改到不同步的話
+    # 不會有任何錯誤訊息：轉交器每次都「找不到管道」，安靜退化成每個檔案開一個
+    # 視窗。三條都比對原始碼／在行程內算，改壞立刻紅燈。
+    #
+    # 【為什麼不拿真的轉交器連進來當端對端測試】試過，但殺不動「C++ 端把編號算錯」
+    # 這種突變：轉交器連錯名字→找不到→改用命令列參數啟動本體，而那個本體是編號
+    # 正確的產物，一起來就連上測試自己開的監聽端、把路徑交回來——路徑照樣抵達，
+    # 突變被「被啟動的本體救回來」給遮住。那個測試因此只能證明 Python 名稱與產物
+    # 相符（＝下面第三條已經涵蓋的事），卻要付出重編轉交器、殘留本體行程與時序
+    # 不穩的代價，不划算。真正的轉交往返由既有的單一實例測試（用測試專屬管道名）
+    # 與 onscreen 的「忙碌解除後轉交的檔案有開出來」涵蓋。
+    import ctypes
+
     launcher_src = os.path.join(PROJECT_ROOT, "src_cpp", "md_open", "main.cpp")
     if os.path.isfile(launcher_src):
         with open(launcher_src, encoding="utf-8") as handle:
             cpp = handle.read()
-        pipe_line = next(
+        base_line = next(
             (line for line in cpp.splitlines()
-             if "kPipePath" in line and 'L"' in line),
+             if "kPipeBase" in line and 'L"' in line),
             "",
         )
-        check("C++ 轉交器的管道名稱與 config.IPC_SERVER_NAME 一致",
-              config.IPC_SERVER_NAME in pipe_line,
-              pipe_line.strip() or "(找不到 kPipePath)")
+        check("C++ 轉交器的管道基底名稱與 config.IPC_SERVER_BASE 一致",
+              f'pipe\\\\{config.IPC_SERVER_BASE}"' in base_line,
+              base_line.strip() or "(找不到 kPipeBase)")
+        check("C++ 轉交器在執行時把登入工作階段編號接在基底名稱後面（和 Python 端同一個算法）",
+              "ProcessIdToSessionId(GetCurrentProcessId(), &session)" in cpp
+              and re.search(r'wsprintfW\(path,\s*L"%s\.%lu",\s*kPipeBase,\s*session\)', cpp)
+              is not None)
+
+    session = ctypes.c_ulong(0)
+    ctypes.windll.kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(session))
+    check("管道名稱帶登入工作階段編號（兩個使用者同時登入不再互搶；以前註解說有、其實沒有）",
+          config.IPC_SERVER_NAME == f"{config.IPC_SERVER_BASE}.{session.value}",
+          config.IPC_SERVER_NAME)
 
     # --- build.ps1 不能被 stderr 中斷 ---
     # 為什麼這條在「單一實例」這一節：轉交器只有 build.ps1 的第 5 步會產出並

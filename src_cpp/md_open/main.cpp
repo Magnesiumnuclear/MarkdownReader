@@ -28,8 +28,11 @@
 
 // --- 可調參數 --------------------------------------------------------------
 
-// 和 app/config.py 的 IPC_SERVER_NAME 一致，改了要兩邊一起改。
-static const wchar_t *kPipePath = L"\\\\.\\pipe\\MarkdownReader.SingleInstance";
+// 和 app/config.py 的 IPC_SERVER_BASE 一致，改了要兩邊一起改（測試會比對）。
+// 實際的管道名稱在執行時補上登入工作階段編號（見 pipe_path）：具名管道是整台
+// 機器共用的，沒有 kGateName 那種 Local\ 前綴可用，不加編號的話兩個使用者同時
+// 登入，後登入的人雙擊 .md 會把路徑送進前一個人看不到的視窗裡。
+static const wchar_t *kPipeBase = L"\\\\.\\pipe\\MarkdownReader.SingleInstance";
 
 // 本體的檔名。轉交器會在自己旁邊找它。
 static const wchar_t *kAppName = L"MarkdownReader.exe";
@@ -78,6 +81,20 @@ static void wappend(wchar_t *dest, size_t cap, const wchar_t *src)
     dest[n] = 0;
 }
 
+// 完整的管道路徑：kPipeBase + "." + 登入工作階段編號。和 app/config.py 的
+// IPC_SERVER_NAME 用同一個算法（兩邊都是 ProcessIdToSessionId 的結果），
+// 第一次呼叫時算好，之後直接回傳。wsprintfW 在 user32 裡，不是 CRT。
+static const wchar_t *pipe_path()
+{
+    static wchar_t path[128] = {0};
+    if (path[0] == 0) {
+        DWORD session = 0;
+        ProcessIdToSessionId(GetCurrentProcessId(), &session);
+        wsprintfW(path, L"%s.%lu", kPipeBase, session);
+    }
+    return path;
+}
+
 // --- 轉交 ------------------------------------------------------------------
 
 // 把路徑送給既有實例。成功回傳 true，代表本行程可以直接結束。
@@ -87,7 +104,7 @@ static bool try_send(const wchar_t *path)
     HANDLE pipe = INVALID_HANDLE_VALUE;
     DWORD busy_waited = 0;
     for (;;) {
-        pipe = CreateFileW(kPipePath, GENERIC_READ | GENERIC_WRITE,
+        pipe = CreateFileW(pipe_path(), GENERIC_READ | GENERIC_WRITE,
                            0, NULL, OPEN_EXISTING, 0, NULL);
         if (pipe != INVALID_HANDLE_VALUE) break;
         // 管道不存在 -> 沒有實例在跑，立刻放棄（這是最常見的冷啟動路徑，
@@ -97,7 +114,7 @@ static bool try_send(const wchar_t *path)
         // WaitNamedPipe 在實例空出來時會提早返回，之後仍可能被別的客戶端
         // 搶先接走，所以要繞回去重試 CreateFile，不能只試一次。
         if (busy_waited >= kPipeBusyTotalMs) return false;
-        WaitNamedPipeW(kPipePath, kPipeBusyWaitMs);
+        WaitNamedPipeW(pipe_path(), kPipeBusyWaitMs);
         busy_waited += kPipeBusyWaitMs;
     }
 
@@ -140,7 +157,7 @@ static bool wait_for_pipe(DWORD timeout_ms, HANDLE app_process)
     DWORD idle_for = 0;
     bool gui_idle = false;
     while (waited < timeout_ms) {
-        if (WaitNamedPipeW(kPipePath, 1)) return true;
+        if (WaitNamedPipeW(pipe_path(), 1)) return true;
         if (GetLastError() != ERROR_FILE_NOT_FOUND) {
             // 管道存在只是忙碌，也算已經起來了
             return true;
