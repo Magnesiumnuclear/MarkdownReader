@@ -17,11 +17,10 @@
   "titleBar.close": "Close (Ctrl+W)",
 
   "tab.close": "Close tab",
-  "tab.new": "New tab (Ctrl+T) — main area opens a tab, the arrow opens a file",
+  "tab.new": "New tab (Ctrl+T)",
   "tab.newTab": "New tab",
   "tab.noFile": "No file open",
   "tab.pasted": "Pasted content",
-  "tab.openFile": "Open file… (Ctrl+O)",
   "tab.drag.merge": "Merge",
   "tab.drag.detach": "New window",
   "tab.drag.none": "No action",

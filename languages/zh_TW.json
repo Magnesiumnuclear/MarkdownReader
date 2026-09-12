@@ -17,11 +17,10 @@
   "titleBar.close": "關閉 (Ctrl+W)",
 
   "tab.close": "關閉分頁",
-  "tab.new": "開新分頁 (Ctrl+T) — 主區域開新分頁，右側箭頭可開啟檔案",
+  "tab.new": "開新分頁 (Ctrl+T)",
   "tab.newTab": "新分頁",
   "tab.noFile": "尚未開啟檔案",
   "tab.pasted": "貼上的內容",
-  "tab.openFile": "開啟檔案… (Ctrl+O)",
   "tab.drag.merge": "合併",
   "tab.drag.detach": "拆分為新視窗",
   "tab.drag.none": "無動作",

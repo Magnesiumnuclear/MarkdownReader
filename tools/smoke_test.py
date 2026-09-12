@@ -2072,47 +2072,48 @@ def section_tabs(args) -> None:
         viewer.close()
     pump(300)
 
-    # --- 「＋」是一顆按鈕兩個功能：主區開新分頁、右側箭頭展開選單 ---------
-    # 改版前這顆按鈕接的是 open_dialog，和它自己的提示「開新分頁 (Ctrl+T)」
-    # 對不上——按下去跳出的是開檔對話框。
-    from app.title_bar import SplitIconButton as _Split
-
+    # --- 「＋」只做一件事：開新分頁 ---------------------------------------
+    # 這顆按鈕有過兩次行為錯誤。第一次是整顆接 open_dialog，和它自己的提示
+    #「開新分頁 (Ctrl+T)」對不上；第二次是右側加了一條 14px 的展開箭頭，選單
+    # 裡唯一的「開啟檔案…」和標題列資料夾鈕接的是同一個 open_dialog——同一個
+    # 功能兩個入口，代價是「＋」最右緣那一條點下去不會開分頁。現在箭頭拿掉，
+    # 整顆都是開新分頁；開檔的入口是標題列的資料夾鈕與 Ctrl+O。
     v3 = MarkdownViewer()
     v3.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
     v3.resize(1000, 700)
     v3.show()
     pump(400)
     plus = v3.tab_bar.new_button
-    check("「＋」是分割按鈕，右側有展開選單",
-          isinstance(plus, _Split) and len(plus.menu_widget().actions()) == 1,
-          f"{type(plus).__name__} 選單 {len(plus.menu_widget().actions())} 項")
-    check("展開選單那一項是「開啟檔案」",
-          plus.menu_widget().actions()[0].text() == t("tab.openFile"),
-          plus.menu_widget().actions()[0].text())
-    check("展開區在按鈕最右側、寬度容得下箭頭",
-          plus._expander_rect().x() == plus.width() - _Split.EXPANDER_WIDTH
-          and plus.width() > _Split.EXPANDER_WIDTH,
-          f"展開區 x={plus._expander_rect().x()} 按鈕寬={plus.width()}")
+    check("「＋」是一般按鈕，沒有展開選單（箭頭那條窄帶不存在）",
+          not hasattr(plus, "menu_widget"),
+          type(plus).__name__)
+    check("「＋」的寬度不再替箭頭留位置（30 而不是 30+14）",
+          plus.width() == 30, str(plus.width()))
+    check("分頁列不再有 openFileRequested 訊號（開檔入口只剩標題列與 Ctrl+O）",
+          not hasattr(v3.tab_bar, "openFileRequested"))
 
     # 【檔案對話框一律換成替身】QFileDialog.getOpenFileName 是 modal，真的彈
     # 出來就沒有人會去關它，整個測試永遠卡住。這裡踩過一次：某個突變把「＋」
-    # 主區域接回 open_dialog，測試一點下去就掛死二十分鐘。
+    # 接回 open_dialog，測試一點下去就掛死二十分鐘。
     # 換成替身之後，「有沒有開對話框」反而變成可以直接斷言的訊號——
-    # 主區域誤開對話框（正是改版前的行為）當場就會被抓到。
+    # 按「＋」誤開對話框（正是最早的行為）當場就會被抓到。
     from PyQt6.QtWidgets import QFileDialog as _QFileDialog
+    from PyQt6.QtWidgets import QMenu as _QMenu
 
     dialog_calls: list = []
     _real_get_open = _QFileDialog.getOpenFileName
     _QFileDialog.getOpenFileName = staticmethod(
         lambda *a, **k: (dialog_calls.append(1), ("", ""))[1]
     )
-    # 選單的 exec 同樣會跑巢狀迴圈等人選，換成替身只記錄「開在哪」
-    popped: list = []
-    plus.menu_widget().exec = lambda *a, **k: popped.append(a[0] if a else None)
+    # QMenu.exec 同樣是等人操作的巢狀迴圈。正確的程式已經沒有選單可彈，但這個
+    # 替身要留著：箭頭若被裝回去，少了它測試會卡死到逾時（實測 25 分鐘後才被
+    # 砍掉）而不是變紅——沒有訊號比錯誤訊號更糟。有了替身，「有沒有彈出選單」
+    # 就變成可以直接斷言的東西。
+    menu_pops: list = []
+    _real_menu_exec = _QMenu.exec
+    _QMenu.exec = lambda self, *a, **k: menu_pops.append(1)
     new_hits: list = []
-    open_hits: list = []
     v3.tab_bar.newTabRequested.connect(lambda: new_hits.append(1))
-    v3.tab_bar.openFileRequested.connect(lambda: open_hits.append(1))
 
     def click_plus(x_in_button):
         point = QPoint(x_in_button, plus.height() // 2)
@@ -2128,25 +2129,25 @@ def section_tabs(args) -> None:
 
     tabs_before_click = v3.tab_count()
     click_plus(10)
-    check("點主區域＝開新分頁（不是開檔對話框）",
-          len(new_hits) == 1 and not popped and not dialog_calls
+    check("點「＋」＝開新分頁（不是開檔對話框）",
+          len(new_hits) == 1 and not dialog_calls
           and v3.tab_count() == tabs_before_click + 1,
-          f"new={len(new_hits)} 選單={len(popped)} 對話框={len(dialog_calls)} "
+          f"new={len(new_hits)} 對話框={len(dialog_calls)} "
           f"分頁 {tabs_before_click}->{v3.tab_count()}")
-    click_plus(plus.width() - 5)
-    check("點右側箭頭＝展開選單，不會順手開新分頁",
-          len(popped) == 1 and len(new_hits) == 1,
-          f"選單={len(popped)} new={len(new_hits)}")
-    check("選單開在按鈕正下方",
-          bool(popped) and popped[0].y()
-          == plus.mapToGlobal(QPoint(0, plus.height())).y(),
-          str(popped[:1]))
-    plus.menu_widget().actions()[0].trigger()
+    # 最右緣就是以前箭頭佔走的那一條。以前點這裡只會展開選單，不會開分頁。
+    click_plus(plus.width() - 2)
+    check("點「＋」最右緣（以前的箭頭區）也是開新分頁，不會彈出選單",
+          len(new_hits) == 2 and not menu_pops and not dialog_calls
+          and v3.tab_count() == tabs_before_click + 2,
+          f"new={len(new_hits)} 選單={len(menu_pops)} 對話框={len(dialog_calls)} "
+          f"分頁 {tabs_before_click}->{v3.tab_count()}")
+    # 開檔的功能沒有消失，只是入口收斂到標題列那一顆
+    v3.title_bar.open_button.click()
     pump(120)
-    check("選單項送出 openFileRequested 並開啟檔案對話框",
-          len(open_hits) == 1 and len(dialog_calls) == 1,
-          f"signal={open_hits} 對話框={len(dialog_calls)}")
+    check("標題列的資料夾鈕仍然開得了檔案對話框（開檔功能沒跟著箭頭消失）",
+          len(dialog_calls) == 1, f"對話框={len(dialog_calls)}")
     _QFileDialog.getOpenFileName = _real_get_open
+    _QMenu.exec = _real_menu_exec
 
     # --- 空白分頁可以直接貼上 Markdown 原始碼 -----------------------------
     while v3.tab_count() > 1:

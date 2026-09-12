@@ -48,7 +48,7 @@ from PyQt6.QtWidgets import (
 
 from . import config, icons, styles
 from .language import t
-from .title_bar import IconButton, SplitIconButton
+from .title_bar import IconButton
 
 # 離開分頁列矩形四周多少邏輯像素才算「撕下來」。太小會誤觸，
 # 太大則拖不出去；瀏覽器實測大約就是這個量級。
@@ -442,8 +442,6 @@ class TabBar(QFrame):
     activated = pyqtSignal(int)
     closeRequested = pyqtSignal(int)
     newTabRequested = pyqtSignal()
-    # 「＋」右側展開選單裡的「開啟檔案…」
-    openFileRequested = pyqtSignal()
     # 拖曳重排：每次交換發一次（from, to），視窗層要同步 _tabs 的順序
     tabMoved = pyqtSignal(int, int)
     # 拖出列外放開：index 是「目前」的位置（重排後的），global_pos 是放開點。
@@ -495,18 +493,15 @@ class TabBar(QFrame):
         self._insert_marker = InsertMarker(self._strip)
         self._insert_marker.hide()
 
-        # 一顆按鈕兩個功能：主區域開新分頁（可直接貼上 Markdown 原始碼），
-        # 右側箭頭展開選單選「開啟檔案…」。寬度要含得下箭頭那一條。
-        self.new_button = SplitIconButton(
-            "plus", "tab.new", self,
-            size=(30 + SplitIconButton.EXPANDER_WIDTH, config.TAB_HEIGHT),
+        # 只做一件事：開新分頁（可直接貼上 Markdown 原始碼）。
+        # 以前右側還有一條展開箭頭，選單裡唯一的「開啟檔案…」和標題列的
+        # 資料夾鈕接的是同一個 open_dialog——同一個功能擺兩個入口，卻讓
+        # 「＋」多出一塊會吃掉點擊的窄帶。箭頭拿掉，整顆按鈕都是開新分頁。
+        self.new_button = IconButton(
+            "plus", "tab.new", self, size=(30, config.TAB_HEIGHT),
         )
         self.new_button.setObjectName("tabNew")
         self.new_button.clicked.connect(self.newTabRequested)
-        self._open_action = self.new_button.menu_widget().addAction(
-            t("tab.openFile")
-        )
-        self._open_action.triggered.connect(self.openFileRequested)
         outer.addWidget(self.new_button)
 
         self.hide()
@@ -571,8 +566,6 @@ class TabBar(QFrame):
 
     def apply_language(self) -> None:
         self.new_button.apply_language()
-        # 選單項的文字是一次性設進 QAction 的，語言換了要自己重設
-        self._open_action.setText(t("tab.openFile"))
         for button in self._buttons:
             button.apply_language()
         # 比照上面的 apply_theme：拖曳途中換語言，幽靈的徽章也要跟上

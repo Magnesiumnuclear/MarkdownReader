@@ -1072,11 +1072,10 @@ class MarkdownViewer(QWidget):
         # 見 _drag_intent_at 與 _clear_insert_markers
         self._drag_raised = None
         self._drag_pinned: list = []
-        # 「＋」的主區域＝開新分頁（可直接貼上），右側展開選單＝開啟檔案。
-        # 以前 newTabRequested 接的是 open_dialog，和它自己的提示文字
-        #「開新分頁 (Ctrl+T)」對不上——按下去跳出的是開檔對話框。
+        # 「＋」只做開新分頁（可直接貼上）。以前 newTabRequested 接的是
+        # open_dialog，和它自己的提示文字「開新分頁 (Ctrl+T)」對不上——
+        # 按下去跳出的是開檔對話框。開檔的入口是標題列的資料夾鈕與 Ctrl+O。
         self.tab_bar.newTabRequested.connect(self.new_tab)
-        self.tab_bar.openFileRequested.connect(self.open_dialog)
 
         self.settings_panel.languageModeChanged.connect(self.set_language_mode)
         self.settings_panel.themeModeChanged.connect(self.set_theme_mode)

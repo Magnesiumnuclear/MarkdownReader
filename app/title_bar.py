@@ -9,9 +9,9 @@ QSS 無法替 SVG 圖示重新著色，必須在 enter/leave 事件切換 QIcon�
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QPoint, QRect, QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QFontMetrics, QMouseEvent, QPainter
-from PyQt6.QtWidgets import QHBoxLayout, QLabel, QMenu, QToolButton, QWidget
+from PyQt6.QtCore import QSize, Qt, pyqtSignal
+from PyQt6.QtGui import QFontMetrics, QMouseEvent
+from PyQt6.QtWidgets import QHBoxLayout, QLabel, QToolButton, QWidget
 
 from . import config, icons, styles
 from .language import t
@@ -118,58 +118,6 @@ class IconButton(QToolButton):
         self._hovered = False
         self.refresh_icon()
         super().leaveEvent(event)
-
-
-class SplitIconButton(IconButton):
-    """一顆按鈕、兩個區域：主區域是預設動作，右側窄條展開選單。
-
-    為什麼不用 QToolButton 的 MenuButtonPopup：那個模式的箭頭由 Qt 樣式自己
-    畫，而本專案的規範是「圖示一律來自 assets/icons/*.svg 並隨主題變色」
-    （見模組開頭）。自己畫就能沿用 icons.pixmap 的著色與快取，深淺主題與
-    hover 都和其他按鈕一致。
-
-    命中判定用 x 座標切一刀：落在右側 EXPANDER_WIDTH 內就展開選單，其餘照常
-    送出 clicked。選單開在按鈕正下方而不是游標處——它在視覺上是這顆按鈕的延伸。
-    選單是空的時候完全退化成一般 IconButton（不畫箭頭、不攔點擊）。
-    """
-
-    EXPANDER_WIDTH = 14
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self._menu = QMenu(self)
-
-    def menu_widget(self) -> QMenu:
-        return self._menu
-
-    def _expander_rect(self) -> QRect:
-        return QRect(
-            self.width() - self.EXPANDER_WIDTH, 0,
-            self.EXPANDER_WIDTH, self.height(),
-        )
-
-    def paintEvent(self, event) -> None:  # noqa: N802 (Qt 事件命名)
-        super().paintEvent(event)
-        if self._menu.isEmpty():
-            return
-        color = self._color_active if self._hovered else self._color_normal
-        size = config.SPLIT_ARROW_SIZE
-        arrow = icons.pixmap("arrow_down", color, size)
-        area = self._expander_rect()
-        painter = QPainter(self)
-        painter.drawPixmap(
-            area.x() + (area.width() - size) // 2,
-            (self.height() - size) // 2,
-            arrow,
-        )
-        painter.end()
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        if (not self._menu.isEmpty()
-                and self._expander_rect().contains(event.pos())):
-            self._menu.exec(self.mapToGlobal(QPoint(0, self.height())))
-            return
-        super().mousePressEvent(event)
 
 
 class CustomTitleBar(QWidget):

@@ -194,7 +194,6 @@ TAB_LABEL_WIDTH = 130            # 檔名可用寬度，超過就中間省略
 # 底下鋪一條與分頁同色的襯底（右段實色、左段漸層淡出），字才不會和叉叉糊在一起。
 TAB_CLOSE_SIZE = 18              # 關閉鈕邊長
 TAB_CLOSE_ICON = 10              # 叉叉圖示邊長
-SPLIT_ARROW_SIZE = 8             # 分割按鈕右側展開箭頭的邊長
 TAB_CLOSE_MARGIN = 5             # 關閉鈕距分頁右緣
 TAB_CLOSE_FADE = 16              # 襯底左側漸層淡出的寬度
 
