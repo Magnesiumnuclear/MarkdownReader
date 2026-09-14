@@ -2217,8 +2217,251 @@ def section_tabs(args) -> None:
           all(p for p in saved_paths) and len(saved_paths) < v3.tab_count(),
           f"存了 {saved_paths}，分頁數 {v3.tab_count()}")
     v3.set_restore_tabs(False)
-    v3.close()
-    pump(300)
+
+    # --- 貼上的分頁關閉時詢問存檔 -------------------------------------------
+    # 以前貼上的分頁一關就沒了（沒有路徑、不進工作階段），使用者貼了一大段
+    # 東西按到 Ctrl+W 就全部消失。現在關分頁與關視窗都會問「儲存／不儲存／
+    # 取消」，選儲存就跳原生存檔對話框。
+    #
+    # 【三個模態對話框一律換替身】QMessageBox.question / warning 與
+    # QFileDialog.getSaveFileName 都是等人按的巢狀迴圈，offscreen 下沒有人會去
+    # 按，真的彈出來就是整份測試卡到逾時而不是變紅（這個專案踩過兩次）。
+    # 替身在這裡就要裝好：v3 此刻還握著一個貼上分頁，底下的 v3.close() 會進
+    # closeEvent 詢問。整段用 try/finally 包住，任何一條炸掉都要還原替身。
+    from PyQt6.QtWidgets import QMessageBox as _QMessageBox
+    _SB = _QMessageBox.StandardButton
+    _SAVE_DISCARD_CANCEL = _SB.Save | _SB.Discard | _SB.Cancel
+    _real_question = _QMessageBox.question
+    _real_warning = _QMessageBox.warning
+    _real_get_save = _QFileDialog.getSaveFileName
+    ask_calls: list = []          # 每次詢問記 (訊息, 按鈕組合)
+    warn_calls: list = []
+    save_calls: list = []
+    # answers 是「依序回覆」的佇列（關窗會連問好幾次），用完退回 answer
+    reply: dict = {"answer": _SB.Discard, "answers": [], "path": ""}
+
+    def _fake_question(parent, title, text, buttons=_SB.Ok, default=_SB.NoButton):
+        ask_calls.append((text, buttons))
+        if reply["answers"]:
+            return reply["answers"].pop(0)
+        return reply["answer"]
+
+    def _fake_warning(parent, title, text, *a, **k):
+        warn_calls.append(text)
+        return _SB.Ok
+
+    def _fake_get_save(parent=None, caption="", directory="", filter="", *a, **k):
+        save_calls.append(directory)
+        return (reply["path"], filter)
+
+    _QMessageBox.question = staticmethod(_fake_question)
+    _QMessageBox.warning = staticmethod(_fake_warning)
+    _QFileDialog.getSaveFileName = staticmethod(_fake_get_save)
+    paste_dir = tempfile.mkdtemp(prefix="mdpaste-")
+    try:
+        # 直接建構、不掛 WA_DeleteOnClose：關窗被取消之後要能查 isVisible 與
+        # _closing，掛了的話選「不儲存」關掉後物件就是已銷毀的包裝
+        vq = MarkdownViewer()
+        vq.resize(900, 640)
+        vq.show()
+        pump(400)
+        vq.open_path(SAMPLE)
+        pump(300)
+        # 兩個檔案分頁墊底：關分頁的那幾條要一直走 close_tab_at（多分頁）而不是
+        # 掉進「最後一個分頁→關視窗」，某條紅了也不會把後面的全部拖下水
+        vq.open_path(README, new_tab=True)
+        pump(300)
+
+        def paste_new(text):
+            vq.new_tab()
+            pump(120)
+            QApplication.clipboard().setText(text)
+            vq.paste_markdown()
+            pump(200)
+            return vq._tab
+
+        def ensure_kept(tab, text):
+            # 前一條若把分頁誤關了（那條已經紅），補一個回來讓這條測自己的事
+            if any(t_ is tab for t_ in vq._tabs):
+                vq.activate_tab(vq._tabs.index(tab))
+                pump(100)
+                return tab
+            return paste_new(text)
+
+        # 1. 不儲存：有問、分頁照關、沒開存檔對話框
+        paste_new("# 貼上一" + NL)
+        before_q = vq.tab_count()
+        asked_before = len(ask_calls)
+        reply["answer"] = _SB.Discard
+        vq.close_tab()
+        pump(200)
+        check("關貼上分頁會先問（儲存／不儲存／取消，以前一關就沒了）；選不儲存就關",
+              len(ask_calls) == asked_before + 1
+              and ask_calls[-1][1] == _SAVE_DISCARD_CANCEL
+              and vq.tab_count() == before_q - 1 and not save_calls,
+              f"問了 {len(ask_calls) - asked_before} 次 按鈕={ask_calls[-1][1] if ask_calls else None} "
+              f"分頁 {before_q}->{vq.tab_count()} 存檔對話框={len(save_calls)}")
+
+        # 2. 取消：分頁留著、內容不變
+        kept = paste_new("# 貼上二" + NL)
+        before_q = vq.tab_count()
+        reply["answer"] = _SB.Cancel
+        vq.close_tab()
+        pump(200)
+        check("關貼上分頁選取消：分頁留著（以前沒得取消）",
+              vq.tab_count() == before_q and any(t_ is kept for t_ in vq._tabs)
+              and kept.pasted,
+              f"分頁 {before_q}->{vq.tab_count()} pasted={kept.pasted}")
+
+        # 4. 儲存但在存檔對話框按取消：等同取消，分頁留著
+        kept = ensure_kept(kept, "# 貼上二" + NL)
+        before_q = vq.tab_count()
+        reply["answer"] = _SB.Save
+        reply["path"] = ""
+        saves_before = len(save_calls)
+        vq.close_tab()
+        pump(200)
+        check("選儲存卻在存檔對話框按取消：等同取消關閉、分頁仍是貼上狀態",
+              len(save_calls) == saves_before + 1 and vq.tab_count() == before_q
+              and kept.pasted and kept.path is None,
+              f"存檔對話框={len(save_calls) - saves_before} 分頁 {before_q}->{vq.tab_count()} "
+              f"pasted={kept.pasted} path={kept.path}")
+
+        # 10. 寫檔失敗（目錄不存在）：顯示錯誤、分頁留著、不崩潰
+        kept = ensure_kept(kept, "# 貼上二" + NL)
+        before_q = vq.tab_count()
+        reply["answer"] = _SB.Save
+        reply["path"] = os.path.join(paste_dir, "沒有這個目錄", "x.md")
+        warns_before = len(warn_calls)
+        vq.close_tab()
+        pump(200)
+        check("寫檔失敗（目錄不存在）：顯示錯誤訊息、分頁留著不關、仍是貼上狀態",
+              len(warn_calls) == warns_before + 1 and vq.tab_count() == before_q
+              and kept.pasted and kept.path is None,
+              f"錯誤框={len(warn_calls) - warns_before} 分頁 {before_q}->{vq.tab_count()} "
+              f"pasted={kept.pasted} path={kept.path}")
+
+        # 3. 儲存成功：檔案寫出、內容一致（\r\n 正規化成 \n）、分頁關掉
+        kept = ensure_kept(kept, "# 貼上二" + NL)
+        before_q = vq.tab_count()
+        saved_one = os.path.join(paste_dir, "one.md")
+        reply["answer"] = _SB.Save
+        reply["path"] = saved_one
+        kept_text = kept.text
+        vq.close_tab()
+        pump(200)
+        read_back = ""
+        if os.path.isfile(saved_one):
+            with open(saved_one, "r", encoding="utf-8") as handle:
+                read_back = handle.read()
+        check("選儲存並給路徑：檔案以 UTF-8 寫出、內容與貼上的一致、分頁關掉",
+              read_back == kept_text.replace("\r\n", "\n")
+              and vq.tab_count() == before_q - 1,
+              f"讀回={read_back[:40]!r} 分頁 {before_q}->{vq.tab_count()}")
+
+        # 5. 全是空白的貼上分頁：沒東西會遺失，不問
+        vq.new_tab()
+        pump(120)
+        vq._tab.set_pasted("   " + NL + chr(9) + NL)
+        before_q = vq.tab_count()
+        asked_before = len(ask_calls)
+        vq.close_tab()
+        pump(200)
+        check("內容只有空白的貼上分頁：不問直接關（空的新分頁也一樣）",
+              len(ask_calls) == asked_before and vq.tab_count() == before_q - 1,
+              f"問了 {len(ask_calls) - asked_before} 次 分頁 {before_q}->{vq.tab_count()}")
+
+        # 9. 拖到別的視窗（take_tab / adopt_tab）不是關閉，不問
+        moved = paste_new("# 搬去別的視窗" + NL)
+        asked_before = len(ask_calls)
+        taken = vq.take_tab(vq._tabs.index(moved))
+        pump(150)
+        vq.adopt_tab(taken)
+        pump(200)
+        check("把貼上分頁拖到別的視窗（take_tab/adopt_tab）不是關閉，不會問存檔",
+              len(ask_calls) == asked_before and taken is moved and moved.pasted
+              and any(t_ is moved for t_ in vq._tabs),
+              f"問了 {len(ask_calls) - asked_before} 次 taken={taken is moved}")
+        reply["answer"] = _SB.Discard
+        vq.close_tab_at(vq._tabs.index(moved))
+        pump(200)
+
+        # 6. 關視窗：有貼上分頁、選取消 → 視窗留著、_closing 不能被設成 True
+        first = paste_new("# 關窗一" + NL)
+        before_q = vq.tab_count()
+        reply["answer"] = _SB.Cancel
+        asked_before = len(ask_calls)
+        vq.close()
+        pump(300)
+        check("關視窗時有貼上分頁、選取消：視窗留著且 _closing 仍為 False（外部開檔不會被路由走）",
+              vq.isVisible() and not vq._closing and len(ask_calls) == asked_before + 1
+              and first.pasted and vq.tab_count() == before_q,
+              f"visible={vq.isVisible()} _closing={vq._closing} "
+              f"問了 {len(ask_calls) - asked_before} 次 分頁={vq.tab_count()}")
+
+        # 7. 關視窗、兩個貼上分頁：第一個儲存、第二個取消 → 視窗留著、
+        #    第一個已變成一般檔案分頁（路徑、meta、監看都到位），第二個仍是貼上
+        second = paste_new("# 關窗二" + NL)
+        saved_two = os.path.join(paste_dir, "two.md")
+        reply["answers"] = [_SB.Save, _SB.Cancel]
+        reply["path"] = saved_two
+        asked_before = len(ask_calls)
+        vq.close()
+        pump(300)
+        watched = list(vq._watcher.files())
+        check("關視窗逐一詢問每個貼上分頁（不是只問第一個）；中途取消就整個中止、視窗留著",
+              vq.isVisible() and not vq._closing
+              and len(ask_calls) == asked_before + 2 and second.pasted,
+              f"visible={vq.isVisible()} 問了 {len(ask_calls) - asked_before} 次 "
+              f"second.pasted={second.pasted}")
+        check("存檔成功的分頁變成一般檔案分頁：path 設好、pasted=False、meta 是磁碟上的檔案",
+              first.path == os.path.abspath(saved_two) and not first.pasted
+              and first.meta is not None and first.meta.path == first.path
+              and first.file_stamp is not None,
+              f"path={first.path} pasted={first.pasted} "
+              f"meta.path={getattr(first.meta, 'path', None)} stamp={first.file_stamp}")
+        check("存檔成功的分頁加入檔案監看（外部改了會重載，和開檔的分頁一樣）",
+              os.path.abspath(saved_two) in [os.path.abspath(p) for p in watched],
+              f"監看={watched}")
+        check("存檔後這個分頁再關就不會再問（已經是檔案分頁）",
+              not (first.pasted and first.text.strip()),
+              f"pasted={first.pasted}")
+
+        # 8. 關視窗、最後一個貼上分頁選儲存 → 視窗關閉、路徑進工作階段
+        vq.set_restore_tabs(True)
+        saved_three = os.path.join(paste_dir, "three.md")
+        reply["answers"] = [_SB.Save]
+        reply["path"] = saved_three
+        vq.close()
+        pump(300)
+        session_paths = [os.path.abspath(p) for p in QSettings(
+            config.ORG_NAME, config.APP_NAME).value(config.KEY_OPEN_TABS, [], type=list)]
+        check("關視窗時把貼上分頁存成檔案：視窗關閉、新檔案的路徑進工作階段（下次會還原）",
+              not vq.isVisible() and os.path.isfile(saved_three)
+              and os.path.abspath(saved_three) in session_paths
+              and os.path.abspath(saved_two) in session_paths,
+              f"visible={vq.isVisible()} 工作階段={session_paths}")
+        # 還原設定，別讓後面建的視窗把這幾個檔案還原回來
+        _qs = QSettings(config.ORG_NAME, config.APP_NAME)
+        _qs.setValue(config.KEY_RESTORE_TABS, False)
+        _qs.remove(config.KEY_OPEN_TABS)
+        _qs.remove(config.KEY_ACTIVE_TAB)
+        _qs.sync()
+        vq.deleteLater()
+        pump(200)
+
+        # v3 還握著一個貼上分頁：選「不儲存」關掉
+        reply["answer"] = _SB.Discard
+        reply["answers"] = []
+        v3.close()
+        pump(300)
+        check("v3 帶著貼上分頁關閉、選不儲存：視窗真的關了",
+              _sip.isdeleted(v3) or not v3.isVisible())
+    finally:
+        _QMessageBox.question = _real_question
+        _QMessageBox.warning = _real_warning
+        _QFileDialog.getSaveFileName = _real_get_save
+    pump(200)
 
     # --- 一次開多個檔案（多選、拖放、命令列共用的原語）-----------------------
     # 檔案總管多選是「每個檔案叫一次開啟指令」（實測 MultiSelectModel 與 %*

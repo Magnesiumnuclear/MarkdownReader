@@ -25,6 +25,7 @@ from PyQt6.QtCore import (
     QPoint,
     QRect,
     QSettings,
+    QStandardPaths,
     QTimer,
     QUrl,
     Qt,
@@ -808,6 +809,101 @@ class MarkdownViewer(QWidget):
         self._update_status()
         self._sync_tab_bar()
 
+    def _ask_save_pasted(self, tab: DocumentTab) -> bool:
+        """貼上的分頁要關掉之前，先問要不要存成檔案。
+
+        回傳 True ＝可以繼續關（已存好／選「不儲存」／根本不需要問）；
+        回傳 False ＝使用者取消，呼叫端必須中止整個關閉動作。
+
+        只有「貼上且內容非空白」的分頁才問：空的新分頁、讀檔案的分頁、已經
+        存成檔案的分頁都沒有東西會遺失。分頁關閉（close_tab_at）與視窗關閉
+        （closeEvent）共用這一個判斷，兩邊不各寫一份。拖到別的視窗
+        （take_tab / adopt_tab）不是關閉，不會經過這裡。
+
+        呼叫端要先 tab_bar.cancel_active_drag()：拖曳中用中鍵關被拖的分頁會
+        走到這裡，對話框彈出來時拖曳游標與置頂的幽靈視窗不能還掛著。
+
+        存檔成功後分頁就變成一般的檔案分頁：設好路徑再 load() 從磁碟讀回，
+        meta 與 file_stamp 才是真的（手動拼欄位會讓狀態列的路徑欄留空）。
+        之後它會被寫進工作階段、也會被檔案監看，和用開啟對話框開的檔案一樣。
+        """
+        if not (tab.pasted and tab.text.strip()):
+            return True
+        # 先切到這個分頁，使用者才看得到被問的是哪一個——多個貼上分頁的名稱
+        # 都是「貼上的內容」，只靠對話框文字分不出來。設定面板是整片覆蓋層，
+        # 開著的話切了也看不到，先收起來。
+        if self.settings_panel.isVisible():
+            self.toggle_settings()
+        try:
+            self.activate_tab(self._tabs.index(tab))
+        except ValueError:
+            pass
+        answer = QMessageBox.question(
+            self,
+            t("dialog.savePasted.title"),
+            t("dialog.savePasted.body", name=tab.display_name),
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save,
+        )
+        if answer == QMessageBox.StandardButton.Cancel:
+            return False
+        if answer == QMessageBox.StandardButton.Discard:
+            return True
+        # 選「儲存」：起始資料夾比照 open_dialog 用最近一個有路徑的分頁，
+        # 沒有就用文件資料夾——只給相對檔名的話原生對話框會落在行程的工作
+        # 目錄，從檔案總管關聯啟動時那是個不可預期的地方。
+        start_dir = next(
+            (os.path.dirname(other.path) for other in reversed(self._tabs) if other.path),
+            QStandardPaths.writableLocation(
+                QStandardPaths.StandardLocation.DocumentsLocation),
+        )
+        path, _selected = QFileDialog.getSaveFileName(
+            self,
+            t("dialog.savePasted.saveTitle"),
+            os.path.join(start_dir, t("dialog.savePasted.defaultName")),
+            t("dialog.openFilter"),
+        )
+        if not path:
+            # 存檔對話框按取消 ＝ 整個關閉動作取消，分頁留著
+            return False
+        # 文字模式在 Windows 會把 \n 寫成 \r\n；貼上的文字若本來就含 \r\n
+        # 會變成 \r\r\n。先正規化再以 newline="\n" 寫，檔案裡永遠是 \n。
+        text = tab.text.replace("\r\n", "\n")
+        try:
+            with open(path, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(text)
+        except OSError as error:
+            QMessageBox.warning(
+                self,
+                t("dialog.savePasted.errorTitle"),
+                t("dialog.savePasted.errorBody", error=str(error)),
+            )
+            return False
+        abs_path = os.path.abspath(path)
+        # 存到一個別的分頁已經開著的路徑（原生對話框問過「取代？」）：那個
+        # 分頁的內容已經是舊的，標成待重讀，下次切過去會拿到新內容。
+        # 這裡不能動 _tabs——close_tab_at 是先算好索引才 pop，在這裡移除分頁
+        # 會讓它 pop 錯人。
+        existing = self._index_of_path(abs_path)
+        if existing is not None and self._tabs[existing] is not tab:
+            other = self._tabs[existing]
+            other.loaded = False
+            other.file_stamp = None
+        tab.path = abs_path
+        tab.load()
+        if self._tabs[self._active] is tab:
+            self._set_search_context(tab.path)
+        self._sync_tab_bar()
+        self._update_titles(self._tab.display_name)
+        self._update_status()
+        self._watch_files()
+        # 工作階段不在這裡存：close_tab_at 路徑的分頁馬上就要被 pop，先寫進去
+        # 反而會在行程被砍時還原一個使用者已經關掉的分頁；closeEvent 路徑則
+        # 由它自己的 _save_session 收進去。
+        return True
+
     def close_tab(self) -> None:
         """關閉作用中的分頁；只剩一個時關閉視窗。"""
         self.close_tab_at(self._active)
@@ -817,6 +913,12 @@ class MarkdownViewer(QWidget):
             return
         if len(self._tabs) <= 1:
             self.close()
+            return
+
+        # 拖曳手勢要在對話框彈出來之前收掉（拖曳中用中鍵關被拖的分頁）；
+        # 詢問一定要在下面的 _tabs.pop 之前
+        self.tab_bar.cancel_active_drag()
+        if not self._ask_save_pasted(self._tabs[index]):
             return
 
         # 比照 activate_tab：搜尋列裡的比對位置是針對「目前那份文件」算出來的
@@ -2144,11 +2246,22 @@ class MarkdownViewer(QWidget):
         # 視窗還留在管理器的清單裡，但下面已經把分頁全部放掉了。這段期間若有
         # 檔案被路由進來，會開進一個正在銷毀的視窗——畫面上什麼都不會出現，
         # 使用者雙擊的檔案就這樣消失。
-        self._closing = True
+        #
         # 拖曳中關窗（中鍵按在被拖的分頁上、Ctrl+W）不會經過放開事件，
         # 要在這裡收掉手勢，否則全域拖曳游標與置頂的幽靈視窗會殘留
-        # （詳見 tab_bar.cancel_active_drag 的說明）
+        # （詳見 tab_bar.cancel_active_drag 的說明）。放在詢問之前：對話框
+        # 期間不能還掛著拖曳游標，而且就算後來取消關閉，手勢也已經無效。
         self.tab_bar.cancel_active_drag()
+        # 【詢問未存的貼上分頁，一定要在 _closing = True 之前】
+        # 使用者按取消的話視窗要照常可用；若 _closing 已經是 True，之後外部
+        # 開檔會被路由去別的視窗、分頁列的尾工也會被跳過。先把清單快照下來：
+        # 存檔成功後 pasted 會變 False，邊迭代邊改判斷會漏問。
+        pasted_tabs = [tab for tab in self._tabs if tab.pasted and tab.text.strip()]
+        for pasted in pasted_tabs:
+            if not self._ask_save_pasted(pasted):
+                event.ignore()
+                return
+        self._closing = True
         # 【這裡刻意不回寫各項設定】
         # 每個設定在被改動的當下就由它自己的 setter 寫進 QSettings 了，關窗再
         # 寫一次純屬多餘——而且有害：多視窗時，先開的那個視窗握著的是它「開啟

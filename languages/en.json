@@ -126,6 +126,12 @@
   "dialog.crash.title": "{app} — Unexpected error",
   "dialog.crash.text": "The application hit an unexpected error, but it was caught.",
   "dialog.crash.detail": "An error log was written to:\n{path}",
+  "dialog.savePasted.title": "Unsaved tab",
+  "dialog.savePasted.body": "The content of tab \"{name}\" has not been saved. Save to file?",
+  "dialog.savePasted.saveTitle": "Save pasted Markdown",
+  "dialog.savePasted.defaultName": "pasted-content.md",
+  "dialog.savePasted.errorTitle": "Write failed",
+  "dialog.savePasted.errorBody": "Cannot save file:\n{error}",
 
   "doc.largeFile": "<b>Large document ({size})</b><br>There is a lot of content; layout and scrolling may be slow.",
   "doc.noPygments": "<span class='mono'>Pygments</span> is not installed in this environment, so code blocks are shown as plain text.",

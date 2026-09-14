@@ -126,6 +126,12 @@
   "dialog.crash.title": "{app} — 發生未預期的錯誤",
   "dialog.crash.text": "程式發生未預期的錯誤，但已被攔截。",
   "dialog.crash.detail": "錯誤紀錄已寫入：\n{path}",
+  "dialog.savePasted.title": "分頁未儲存",
+  "dialog.savePasted.body": "分頁「{name}」的內容尚未儲存，要存成檔案嗎？",
+  "dialog.savePasted.saveTitle": "儲存貼上的 Markdown",
+  "dialog.savePasted.defaultName": "貼上的內容.md",
+  "dialog.savePasted.errorTitle": "寫入失敗",
+  "dialog.savePasted.errorBody": "無法儲存檔案：\n{error}",
 
   "doc.largeFile": "<b>大型文件（{size}）</b><br>內容較多，排版與捲動可能較慢。",
   "doc.noPygments": "目前環境沒有安裝 <span class='mono'>Pygments</span>，程式碼區塊會以純文字顯示。",
