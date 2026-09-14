@@ -32,6 +32,12 @@ class DocumentTab:
 
         self.history: list[str] = []          # 返回用的路徑堆疊
         self.file_stamp: tuple[float, int] | None = None
+        # 檔案曾經成功讀到、現在卻不在了（刪除、改名走開、磁碟拔掉）：內容保留，
+        # 狀態列改提示；檔案回來就重讀並清掉。
+        self.missing: bool = False
+        # 這個版本（stamp）讀失敗過、已經重試過一次：除非 stamp 再變才會再讀，
+        # 否則讀不到的檔案會每 300ms 重試一次，每次還在 GUI 執行緒睡 100ms。
+        self.retry_stamp: tuple[float, int] | None = None
         self.pending_anchor: str = ""
 
         # 內容是貼上來的（沒有檔案路徑）。分頁標題與工作階段都要看這個旗標：
@@ -90,6 +96,8 @@ class DocumentTab:
         self.loaded = True
         self.dirty = True
         self.pasted = False
+        self.missing = False
+        self.retry_stamp = None
         if not self.path:
             self.text, self.meta, self.error, self.file_stamp = "", None, None, None
             return

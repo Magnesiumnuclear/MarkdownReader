@@ -118,6 +118,20 @@ if ($Installer) {
     $zip = "dist\MarkdownReader-$version-portable.zip"
     if (Test-Path $zip) { Remove-Item -Force $zip }
     Compress-Archive -Path "dist\MarkdownReader-onedir\*" -DestinationPath $zip
+    # 可攜版的標記檔：exe 旁邊有它，程式就把設定與紀錄存在旁邊的 data 資料夾
+    # （見 app/resources.py 的 portable_root）。寫到暫存檔再加進 zip 的根，
+    # 絕不放進 dist\MarkdownReader-onedir——安裝檔的 [Files] 從那個目錄取檔，
+    # 放進去就會被裝進安裝版，安裝版跟著變成可攜模式。
+    $marker = Join-Path $env:TEMP "portable.txt"
+    @(
+        "這個檔案存在時，Markdown 閱讀器會把設定與錯誤紀錄存放在它旁邊的 data 資料夾（可攜模式）。",
+        "刪掉這個檔案，就回到一般模式：設定寫在登錄檔、錯誤紀錄寫在 %LOCALAPPDATA%\MarkdownReader。",
+        "",
+        "While this file exists, Markdown Reader stores its settings and error log in the ""data"" folder next to it (portable mode).",
+        "Delete this file to return to normal mode: settings go to the registry and the error log to %LOCALAPPDATA%\MarkdownReader."
+    ) | Set-Content -LiteralPath $marker -Encoding UTF8
+    Compress-Archive -Path $marker -DestinationPath $zip -Update
+    Remove-Item -LiteralPath $marker -Force
 
     $setupMb = "{0:N1}" -f ((Get-Item $setup).Length / 1MB)
     $zipMb = "{0:N1}" -f ((Get-Item $zip).Length / 1MB)

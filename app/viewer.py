@@ -13,8 +13,11 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
+from collections import namedtuple
+from functools import partial
 
 from PyQt6 import sip
 from PyQt6.QtCore import (
@@ -24,7 +27,6 @@ from PyQt6.QtCore import (
     QObject,
     QPoint,
     QRect,
-    QSettings,
     QStandardPaths,
     QTimer,
     QUrl,
@@ -61,6 +63,7 @@ from . import (
     icons,
     language,
     qt_html,
+    resources,
     styles,
     theme as theme_utils,
     win32,
@@ -68,6 +71,10 @@ from . import (
 from .language import t
 from .browser import MarkdownBrowser
 from .document_tab import DocumentTab
+
+# Ctrl+Shift+T 用的「最近關閉的分頁」一筆：檔案分頁記路徑，貼上的分頁記原文，
+# 加上關閉當下的捲動比例與索引，重開時插回原位並捲回原處。
+_ClosedTab = namedtuple("_ClosedTab", "path text pasted scroll index")
 from .find_bar import FindBar
 from .settings_panel import SettingsPanel
 from .tab_bar import TabBar
@@ -292,7 +299,8 @@ class MarkdownViewer(QWidget):
         self.setMinimumSize(*config.MIN_WINDOW_SIZE)
         self.setAcceptDrops(True)
 
-        self._settings = QSettings(config.ORG_NAME, config.APP_NAME)
+        # 唯一的 QSettings 建構點在 resources.make_settings：可攜模式回 ini、否則回登錄式
+        self._settings = resources.make_settings()
 
         # 【一定要在 _build_ui 之前】標題列與設定面板是建構當下就把文字塞進
         # 元件的，目錄還沒載入的話整個介面會是一堆翻譯鍵。也因為如此，建構子
@@ -372,6 +380,9 @@ class MarkdownViewer(QWidget):
         )
         # 分頁清單。至少永遠有一個，_tab 屬性指向作用中的那個。
         self._tabs: list[DocumentTab] = []
+        # 最近關閉的分頁（LIFO，最多 config.MAX_CLOSED_TABS 筆），Ctrl+Shift+T 取回。
+        # 只記「使用者關閉且存檔詢問通過」的；拖到別的視窗不是關閉，視窗關閉也不記。
+        self._closed_tabs: list[_ClosedTab] = []
         self._active = 0
         self._applying_topmost = False
 
@@ -384,6 +395,12 @@ class MarkdownViewer(QWidget):
         self._reload_timer = QTimer(self)
         self._reload_timer.setSingleShot(True)
         self._reload_timer.timeout.connect(self._on_reload_timeout)
+        # 監看的第三層：慢速輪詢（見 _watch_files 的說明）。它只直接比對 stamp，
+        # 不會去起 _reload_timer，兩個計時器不會互相觸發成迴圈。
+        self._poll_timer = QTimer(self)
+        self._poll_timer.timeout.connect(self._on_poll_timeout)
+        # 上一輪 _watch_files 有 addPath 回 False（掛失敗）：下一輪輪詢整批重掛一次。
+        self._watch_degraded = False
         # 多選連發時把分頁列與檔案監看的尾工合併成一次（見 open_paths）。
         # 掛在視窗底下，視窗一銷毀就跟著沒了，不會在關窗後才觸發。
         self._batch_sync_timer = QTimer(self)
@@ -460,6 +477,10 @@ class MarkdownViewer(QWidget):
             self._add_tab(DocumentTab(), activate=True)
             self._show_welcome()
         self._sync_tab_bar()
+        # 分頁集合第一次成形的地方，卻是唯一沒呼 _watch_files 的路徑：純還原啟動
+        # （命令列沒帶檔案）的分頁以前整批沒監看、輪詢也沒起。其他分支多呼一次是
+        # 冪等的（先 unwatch 再重掛、輪詢已在跑就不重啟）。
+        self._watch_files()
 
     def _add_tab(self, tab: DocumentTab, activate: bool) -> None:
         """把分頁加進堆疊。"""
@@ -927,6 +948,9 @@ class MarkdownViewer(QWidget):
         if self.find_bar.isVisible():
             self.find_bar.deactivate()
 
+        # 記錄點一定在 _ask_save_pasted 之後：使用者按取消，分頁留著、堆疊不能多一筆，
+        # 否則接著 Ctrl+Shift+T 會冒出一個重複的分頁。
+        self._remember_closed_tab(index)
         tab = self._tabs.pop(index)
         self.stack.removeWidget(tab.browser)
         tab.browser.setParent(None)
@@ -954,6 +978,54 @@ class MarkdownViewer(QWidget):
         self._sync_tab_bar()
         self._watch_files()
         self._refresh_resizer_targets()
+
+    def _remember_closed_tab(self, index: int) -> None:
+        """把即將被關掉的分頁推進「最近關閉」堆疊（唯一入口是 close_tab_at）。
+
+        空白的歡迎分頁沒有東西可還原，不記——順帶讓拆分視窗時清掉佔位分頁的那次
+        close_tab_at 不會污染新視窗的堆疊。貼上的分頁記原文：選「不儲存」關掉之後，
+        這裡是找回它的最後一道安全網。存成檔案再關的分頁 pasted 已是 False，記的是路徑。
+        """
+        tab = self._tabs[index]
+        if not tab.path and not tab.pasted:
+            return
+        self._closed_tabs.append(_ClosedTab(
+            path=tab.path, text=tab.text if tab.pasted else "",
+            pasted=tab.pasted, scroll=tab.scroll_ratio(), index=index,
+        ))
+        if len(self._closed_tabs) > config.MAX_CLOSED_TABS:
+            del self._closed_tabs[0]
+
+    def reopen_closed_tab(self) -> None:
+        """Ctrl+Shift+T：重開最近關掉的分頁，插回原索引（夾在現有分頁數以內）並切過去。
+
+        走 adopt_tab：它包辦掛 browser、插進 stack 與 _tabs、切換、監看，以及用
+        transfer_scroll 在下一回合還原捲動比例。路徑已不存在的檔案照常開，切過去時
+        load() 會把錯誤記進 tab.error、顯示既有的「找不到檔案」頁，不靜默跳過。
+        """
+        if not self._closed_tabs:
+            self._set_status(t("status.noClosedTab"))
+            return
+        entry = self._closed_tabs.pop()
+        if entry.pasted:
+            tab = DocumentTab()
+            tab.set_pasted(entry.text)
+        else:
+            tab = DocumentTab(entry.path)
+        tab.transfer_scroll = entry.scroll
+        self.adopt_tab(tab, min(entry.index, len(self._tabs)))
+
+    def activate_tab_by_number(self, number: int) -> None:
+        """Ctrl+1…Ctrl+8 切到第 1…8 個分頁，Ctrl+9 切到最後一個（瀏覽器慣例）；超出範圍不動作。"""
+        if not self._tabs:
+            return
+        if number >= 9:
+            target = len(self._tabs) - 1
+        else:
+            target = number - 1
+            if target >= len(self._tabs):
+                return
+        self.activate_tab(target)
 
     def next_tab(self) -> None:
         if len(self._tabs) > 1:
@@ -1218,9 +1290,14 @@ class MarkdownViewer(QWidget):
             ("Ctrl+PgDown", self.next_tab),
             ("Ctrl+PgUp", self.previous_tab),
             ("Esc", self._on_escape),
+            ("Ctrl+Shift+T", self.reopen_closed_tab),
         )
         for sequence, slot in bindings:
             QShortcut(QKeySequence(sequence), self, activated=slot)
+        # Ctrl+1…9 跳分頁。partial 把數字綁死，lambda 會晚綁定全部指到 9。
+        for number in range(1, 10):
+            QShortcut(QKeySequence(f"Ctrl+{number}"), self,
+                      activated=partial(self.activate_tab_by_number, number))
 
     # -- 主題 ----------------------------------------------------------------
     def apply_theme(self, theme: str, render: bool = True) -> None:
@@ -1401,10 +1478,8 @@ class MarkdownViewer(QWidget):
     def set_auto_reload(self, enabled: bool) -> None:
         self._auto_reload = bool(enabled)
         self._settings.setValue(config.KEY_AUTO_RELOAD, self._auto_reload)
-        if self._auto_reload:
-            self._watch_files()
-        else:
-            self._unwatch_all()
+        # 開關都走 _watch_files：關閉時它會清監看、停輪詢、清掉退化旗標。
+        self._watch_files()
         self._sync_settings_panel()
 
     def set_status_bar_visible(self, visible: bool) -> None:
@@ -1885,6 +1960,12 @@ class MarkdownViewer(QWidget):
         if self._tab.meta is None:
             return
         meta = self._tab.meta
+        if self._tab.missing:
+            # 檔案不在了：內容留著讓人看，狀態列講清楚看到的是最後讀到的版本，
+            # 不能再顯示原本的修改時間裝作是最新的。路徑仍顯示，方便知道是哪個檔。
+            self.status_path_label.setText(meta.path)
+            self._set_status(t("status.fileMissing"))
+            return
         # 千分位交給 format：中英文都用逗號，5,272 行遠比 5272 行好讀。
         # 修改時間刻意維持 ISO：無歧義、可排序、寬度固定，不隨語言變。
         parts = [
@@ -1944,43 +2025,113 @@ class MarkdownViewer(QWidget):
             self._watcher.removePath(watched)
 
     def _watch_files(self) -> None:
-        """監看所有分頁的檔案與其所在目錄。
+        """監看所有分頁的檔案與其所在目錄，並確保後備輪詢在跑。
 
-        背景分頁也要監看，否則切過去時看到的是舊內容。
+        監看有三層，缺一層就會安靜失效：
+        1. 檔案事件（fileChanged）——正常存檔。
+        2. 目錄事件（directoryChanged）——許多編輯器採「寫暫存檔再改名覆蓋」的
+           原子存檔，原檔會短暫消失導致 watcher 掉路徑，目錄事件是補償來源。
+        3. 慢速輪詢（_poll_timer）——addPath 掛失敗（以前根本沒看回傳值）、整個
+           資料夾消失（磁碟拔掉）時，前兩層一個事件都不會來，只剩它。
 
-        許多編輯器採「寫暫存檔再改名覆蓋」的原子存檔，原檔會短暫消失導致
-        watcher 掉路徑，因此目錄事件是必要的補償來源。
+        背景分頁也要監看，否則切過去時看到的是舊內容。自動重載關掉時清空監看、
+        停輪詢。同一個路徑開在兩個分頁（跨視窗合併會出現）只掛一次：Qt 對已在
+        清單裡的路徑 addPath 會回 False，那不是掛失敗，不能算進退化。
         """
         self._unwatch_all()
         if not self._auto_reload:
+            self._poll_timer.stop()
+            self._watch_degraded = False
             return
+        failed = False
+        seen_files: set[str] = set()
         for tab in self._tabs:
             if not tab.path:
                 continue
-            if os.path.isfile(tab.path):
-                self._watcher.addPath(tab.path)
+            key = os.path.normcase(tab.path)
+            if os.path.isfile(tab.path) and key not in seen_files:
+                seen_files.add(key)
+                if not self._watcher.addPath(tab.path):
+                    failed = True
             folder = os.path.dirname(tab.path)
             if folder and os.path.isdir(folder) and folder not in self._watcher.directories():
-                self._watcher.addPath(folder)
+                if not self._watcher.addPath(folder):
+                    failed = True
+        self._note_watch_health(failed)
+        if not self._poll_timer.isActive():
+            self._poll_timer.start(config.WATCH_POLL_MS)
+
+    def _note_watch_health(self, failed: bool) -> None:
+        """掛失敗只在旗標翻轉時記一次，不然每 3 秒重掛一次就每 3 秒刷一行。"""
+        if failed:
+            if not self._watch_degraded:
+                self._watch_degraded = True
+                logging.getLogger(__name__).warning(
+                    "檔案監看掛載失敗（addPath 回傳 False），改用輪詢作為後備")
+        else:
+            self._watch_degraded = False
+
+    def _rearm_watch(self, tab: DocumentTab) -> None:
+        """把「還在、但目前沒被監看」的檔案與資料夾補掛回去。
+
+        這就是掛失敗的重試點，也接住原子存檔或資料夾暫時消失掉的路徑。
+        不整批 unwatch 再重掛，成本低，輪詢每輪都可以做。
+        """
+        if not self._auto_reload or not tab.path:
+            return
+        if os.path.isfile(tab.path) and tab.path not in self._watcher.files():
+            self._watcher.addPath(tab.path)
+        folder = os.path.dirname(tab.path)
+        if folder and os.path.isdir(folder) and folder not in self._watcher.directories():
+            self._watcher.addPath(folder)
 
     def _on_watch_event(self, _changed: str) -> None:
         self._reload_timer.start(config.WATCH_DEBOUNCE_MS)
 
     def _on_reload_timeout(self) -> None:
-        """檢查每個分頁的檔案有沒有真的變動。
+        self._reload_changed_tabs()
 
+    def _on_poll_timeout(self) -> None:
+        """輪詢：上一輪掛失敗就整批重掛一次，然後做同一套比對。"""
+        if self._closing or not self._tabs or not self._auto_reload:
+            return
+        if self._watch_degraded:
+            self._watch_files()
+        self._reload_changed_tabs()
+
+    def _mark_tab_missing(self, tab: DocumentTab) -> None:
+        """只有曾成功讀到內容的分頁才算「消失」；延後載入、讀失敗的分頁 file_stamp 是 None。"""
+        if tab.file_stamp is None or tab.missing:
+            return
+        tab.missing = True
+        if tab is self._tab:
+            self._update_status()
+
+    def _reload_changed_tabs(self) -> None:
+        """三個觸發來源（檔案事件、目錄事件、輪詢）共用的比對與重讀。
+
+        每個分頁三態：在且沒變→略過；不在→標成消失（內容保留、狀態列提示）；
+        回來（曾消失）→無條件重讀並清提示，就算改回來的內容與時戳完全相同。
         作用中的分頁立刻重繪；背景分頁只標記成待重讀，切過去時才處理，
         免得背景改了十個檔案就要當場轉換十次 Markdown。
         """
+        if self._closing or not self._tabs:
+            return
         for tab in self._tabs:
             if not tab.path:
                 continue
-            # 原子存檔會讓 watcher 失去這個路徑，重新掛回去
-            if os.path.isfile(tab.path) and tab.path not in self._watcher.files():
-                self._watcher.addPath(tab.path)
-
+            self._rearm_watch(tab)
+            # isfile 當「可讀一般檔案」的閘：資料夾或不可讀路徑擋在重讀之外
+            if not os.path.isfile(tab.path):
+                self._mark_tab_missing(tab)
+                continue
             stamp = tab.stamp()
-            if stamp is None or stamp == tab.file_stamp:
+            if stamp is None:
+                self._mark_tab_missing(tab)
+                continue
+            if tab.missing:
+                tab.missing = False
+            elif stamp == tab.file_stamp:
                 continue  # 目錄裡其他檔案變動，與這個分頁無關
 
             if tab is not self._tab:
@@ -1992,11 +2143,16 @@ class MarkdownViewer(QWidget):
             try:
                 tab.text, tab.meta = document.read_text_file(tab.path)
             except document.DocumentError:
-                # 檔案暫時無法讀取（仍在寫入中），稍後再試一次
-                self._reload_timer.start(config.WATCH_DEBOUNCE_MS * 2)
+                # 檔案暫時無法讀取（仍在寫入中）：這個版本只重試一次。以前是每次
+                # 都再排 300ms，讀不到的檔案（沒權限）會無限重試，每輪還在 GUI
+                # 執行緒睡 100ms；輪詢保證 3 秒內點燃這個迴圈，所以必須有界。
+                if tab.retry_stamp != stamp:
+                    tab.retry_stamp = stamp
+                    self._reload_timer.start(config.WATCH_DEBOUNCE_MS * 2)
                 return
             tab.error = None
             tab.file_stamp = stamp
+            tab.retry_stamp = None
             self._render(preserve_scroll=False)
             self._update_status()
             QTimer.singleShot(0, lambda r=ratio: self._apply_scroll_ratio(r))
@@ -2021,6 +2177,15 @@ class MarkdownViewer(QWidget):
         # 純 #錨點：在本文件內捲動
         if not url.path() and url.fragment():
             self._scroll_to_anchor(url.fragment())
+            return
+
+        # www. 開頭但省略 scheme（作者手寫或 autolink 產出前使用者自訂）：
+        # 補 http:// 再交外部開啟，不誤判成本機相對路徑。
+        # 用 toString() 而非 path()，含連接埠的 URL（如 www.x.com:8080/p）才
+        # 不會遺漏連接埠（Qt 對此類 URL 的 scheme() 會是主機名，並非空字串）。
+        if scheme not in ("http", "https", "ftp", "ftps", "mailto") and \
+                url.toString().lower().startswith("www."):
+            self._open_external(QUrl("http://" + url.toString()))
             return
 
         if url.isRelative() and self._tab.path:
@@ -2286,6 +2451,8 @@ class MarkdownViewer(QWidget):
         # 連發尾工的計時器也要停：它和上面三個一樣是視窗的子物件，一樣可能在
         # deleteLater 的空檔觸發。漏了它就是「三個有停、一個沒停」的不一致。
         self._batch_sync_timer.stop()
+        # 第五個：後備輪詢。和上面四個一樣是視窗的子物件，一樣可能在 deleteLater 的空檔觸發。
+        self._poll_timer.stop()
         self._watcher.blockSignals(True)
         self._tabs.clear()
 

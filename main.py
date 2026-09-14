@@ -133,9 +133,10 @@ def main() -> int:
     # 否則工作列會出現「note.md — Markdown Reader - Markdown 閱讀器」。
     from app import language
 
-    from PyQt6.QtCore import QSettings
+    from app import resources
 
-    language.init_from_settings(QSettings(config.ORG_NAME, config.APP_NAME))
+    # 設定存哪裡（登錄檔或可攜版的 ini）由 resources.make_settings 一處決定
+    language.init_from_settings(resources.make_settings())
     app.setApplicationDisplayName(language.t("app.displayName"))
     app.setOrganizationName(config.ORG_NAME)
     app.setWindowIcon(icons.app_icon())

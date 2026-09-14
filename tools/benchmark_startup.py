@@ -145,11 +145,14 @@ def kill_all(image_name: str) -> None:
 
 # --- QSettings 前置與還原 ---------------------------------------------------
 def _settings_handle():
-    from PyQt6.QtCore import QCoreApplication, QSettings
+    from PyQt6.QtCore import QCoreApplication
+
+    from app import resources
 
     if QCoreApplication.instance() is None:
         QCoreApplication([])  # QSettings 需要一個 application 物件
-    return QSettings(config.ORG_NAME, config.APP_NAME)
+    # 走同一個工廠：一般模式回登錄式，和以前一樣；可攜模式回 ini
+    return resources.make_settings()
 
 
 def snapshot_settings() -> dict:

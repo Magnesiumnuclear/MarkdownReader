@@ -245,11 +245,12 @@ _CHILD_HEADER = textwrap.dedent(
 )
 
 
-def run_child(name: str, body: str, timeout: int = 120):
+def run_child(name: str, body: str, timeout: int = 120, env: dict | None = None):
     """在獨立行程執行一段程式，回傳 (結束碼, stdout, stderr)。
 
     子行程一律用 -u（不緩衝）：致命中止會讓緩衝區裡的輸出整段消失，
     那樣連「跑到哪一行才死」都看不出來。
+    env 是額外疊在目前環境上的變數（可攜版測試用它指定可攜根目錄）。
     """
     source = _CHILD_HEADER.format(root=PROJECT_ROOT.replace("\\", "/")) + textwrap.dedent(body)
     path = os.path.join(tempfile.gettempdir(), f"mdreader_smoke_{name}.py")
@@ -262,6 +263,7 @@ def run_child(name: str, body: str, timeout: int = 120):
         encoding="utf-8",
         errors="replace",
         timeout=timeout,
+        env={**os.environ, **env} if env else None,
     )
     return proc.returncode, proc.stdout, proc.stderr
 
@@ -1173,6 +1175,153 @@ def section_rendering(args) -> None:
     check("沒有結尾分隔符的 front matter 退回原樣、不吞內文",
           'class="frontmatter"' not in fm_unclosed and "title: 未關閉" in fm_unclosed,
           fm_unclosed[:200])
+
+    # ── 裸網址自動連結（autolink） ──────────────────────────────────────────
+    # 以前：裸網址不成連結；www. 被誤判為本機路徑找不到。
+    # 現在：BareUrlInlineProcessor（優先序 85）把 http(s)://、www.、郵件轉成 <a>。
+    _al = _doc_probe.markdown_to_html  # 與上面同一個別名
+
+    al_https = _al("看 https://example.com/a 這裡", "light")
+    check("裸 http(s) 網址成連結且 href 正確",
+          '<a href="https://example.com/a">https://example.com/a</a>' in al_https,
+          al_https[:300])
+
+    al_www = _al("www.example.com", "light")
+    check("www. 網域補 http:// 成連結，顯示文字不帶 scheme",
+          '<a href="http://www.example.com">www.example.com</a>' in al_www,
+          al_www[:200])
+
+    al_email = _al("寄 foo@bar.com 給我", "light")
+    check("電子郵件轉成 mailto 連結",
+          '<a href="mailto:foo@bar.com">foo@bar.com</a>' in al_email,
+          al_email[:200])
+
+    al_trail = _al("見 https://example.com. 與 https://x.io! 收", "light")
+    check("結尾標點不吃：句點剝掉",
+          'href="https://example.com"' in al_trail
+          and 'href="https://example.com."' not in al_trail,
+          al_trail[:300])
+    check("結尾標點不吃：驚嘆號剝掉",
+          'href="https://x.io"' in al_trail
+          and 'href="https://x.io!"' not in al_trail,
+          al_trail[:300])
+
+    al_paren = _al("(https://a/b)", "light")
+    al_paren2 = _al("https://a/b_(c)", "light")
+    check("右括號配對：(url) 不含 )",
+          'href="https://a/b"' in al_paren and 'href="https://a/b)"' not in al_paren,
+          al_paren[:200])
+    check("右括號配對：url_(c) 保留配對括號",
+          'href="https://a/b_(c)"' in al_paren2,
+          al_paren2[:200])
+
+    al_code = _al("碼 `http://x.com` 尾", "light")
+    check("行內碼裡的網址不變連結（backtick 優先序 190 > bare_url 85）",
+          '<code>http://x.com</code>' in al_code and '<a href' not in al_code,
+          al_code[:200])
+
+    # 程式碼圍欄裡的網址不變（與去掉 bare_url 的轉換器逐位元組相同）
+    _al_code_doc = "```python\nhttp://in-code.com\n```\n"
+    _al_ref = _doc_probe._build_converter("light")
+    _al_ref.inlinePatterns.deregister("bare_url")
+    _al_ref.reset()
+    _al_with = _al(_al_code_doc, "light")
+    _al_without = _al_ref.convert(_al_code_doc)
+    check("程式碼圍欄裡的網址不變（與無 autolink 轉換器逐位元組相同）",
+          _al_with == _al_without and 'href="http://in-code.com"' not in _al_with,
+          f"with={_al_with[:200]}")
+
+    al_link = _al("[見 http://x.com](http://y.com)", "light")
+    check("既有 Markdown 連結不被二次包（全文恰一個 <a）",
+          al_link.lower().count("<a ") == 1 and 'href="http://y.com"' in al_link,
+          al_link[:200])
+
+    al_angle = _al("<https://example.com>", "light")
+    check("<https://..> 角括號連結不變（autolink 120 > bare_url 85）",
+          al_angle.lower().count("<a ") == 1
+          and 'href="https://example.com"' in al_angle,
+          al_angle[:200])
+
+    _NOTE_RE = '<table class="notice mermaid-note"'
+    al_mermaid = _al(
+        "```mermaid\ngantt\ntitle https://mermaid.example\n```", "light")
+    check("Mermaid 不支援型退回程式碼區塊：網址不被連結",
+          'href="https://mermaid.example"' not in al_mermaid
+          and "https://mermaid.example" in al_mermaid
+          and _NOTE_RE in al_mermaid,
+          al_mermaid[:300])
+
+    al_br = _al("見 http://x.com<br> 後", "light")
+    check("URL 相鄰行內 HTML 不吃進佔位符：<br> 在連結外",
+          'href="http://x.com"' in al_br and "klzzwxh" not in al_br,
+          al_br[:300])
+
+    al_span = _al('raw <span data-url="http://x.com">t</span> 後', "light")
+    check("HTML 屬性裡的網址不變（html 90 > bare_url 85）",
+          '<a href="http://x.com"' not in al_span,
+          al_span[:200])
+
+    al_star = _al("見 https://x/a*b*c 完", "light")
+    check("URL 路徑內星號不被當強調（bare_url 85 > em_strong 60）",
+          '<a href="https://x/a*b*c">https://x/a*b*c</a>' in al_star
+          and "<em>" not in al_star,
+          al_star[:200])
+
+    al_raw_a = _al('raw <a href="http://short">https://long.example/x</a> end', "light")
+    check("原始 HTML <a> 內的網址不被二次包（全文恰一個 <a）",
+          al_raw_a.lower().count("<a ") == 1,
+          al_raw_a[:300])
+
+    al_cemail = _al("信箱聯絡foo@bar.com，謝謝", "light")
+    check("中文緊接郵件：local part 不吃中文",
+          'href="mailto:foo@bar.com"' in al_cemail
+          and "mailto:聯絡" not in al_cemail,
+          al_cemail[:200])
+
+    # www. 點擊走 http 外部開啟、不誤判本機檔案
+    _al_opened: list[str] = []
+    _al_orig = QDesktopServices.openUrl
+    QDesktopServices.openUrl = staticmethod(
+        lambda url: _al_opened.append(url.toString()) or True)
+    viewer._on_anchor_clicked(QUrl("www.example.com"))
+    QDesktopServices.openUrl = _al_orig
+    check("www. 無 scheme 的錨點點擊補 http:// 交外部（不誤判本機路徑）",
+          _al_opened == ["http://www.example.com"],
+          str(_al_opened))
+
+    # 大檔成本不超過 10%
+    import time as _al_time
+    _al_big_path = _write_big_doc(tmp, "al_perf.md")
+    with open(_al_big_path, encoding="utf-8") as fh:
+        _al_big_src = fh.read()
+    _al_conv_with = _doc_probe._build_converter("light")
+    _al_conv_without = _doc_probe._build_converter("light")
+    _al_conv_without.inlinePatterns.deregister("bare_url")
+    _al_times_w, _al_times_wo = [], []
+    for _ in range(3):
+        _al_conv_with.reset()
+        t0 = _al_time.perf_counter()
+        _al_conv_with.convert(_al_big_src)
+        _al_times_w.append(_al_time.perf_counter() - t0)
+        _al_conv_without.reset()
+        t0 = _al_time.perf_counter()
+        _al_conv_without.convert(_al_big_src)
+        _al_times_wo.append(_al_time.perf_counter() - t0)
+    _al_tw = min(_al_times_w)
+    _al_two = min(_al_times_wo)
+    _al_ratio = _al_tw / _al_two if _al_two > 0 else 999.0
+    check(f"大檔轉換多出的成本 < 10%（1.2MB，比值 {_al_ratio:.3f}，門檻 1.10）",
+          _al_ratio < 1.10,
+          f"with={_al_tw:.3f}s without={_al_two:.3f}s ratio={_al_ratio:.3f}")
+
+    # 病態長字元塊不退化成 O(n²)（lookbehind 防守）
+    _al_long = "a" * 200_000
+    _al_t0 = _al_time.perf_counter()
+    _al(_al_long, "light")
+    _al_elapsed = _al_time.perf_counter() - _al_t0
+    check("病態長字元塊不退化成 O(n²)（200k 個 a，1 秒內）",
+          _al_elapsed < 1.0,
+          f"elapsed={_al_elapsed:.3f}s")
 
     viewer.close()
     pump(300)
@@ -5797,6 +5946,567 @@ def section_mermaid(args) -> None:
 # ===========================================================================
 # 區塊：安裝檔
 # ===========================================================================
+def section_tab_shortcuts(args) -> None:
+    """Ctrl+Shift+T 重開剛關掉的分頁、Ctrl+1…9 跳分頁——瀏覽器使用者的肌肉記憶。
+
+    「最近關閉」堆疊每個視窗一份、最多 config.MAX_CLOSED_TABS 筆；只記「使用者關閉
+    且存檔詢問通過」的分頁（記錄點在 _ask_save_pasted 之後、pop 之前）；拖到別的
+    視窗不是關閉，不記。貼上的分頁記原文：選「不儲存」關掉後，Ctrl+Shift+T 是找回
+    它的最後一道安全網。獨立成一個小區塊：關貼上分頁會經過模態詢問，替身在這裡
+    自己裝、自己還原，突變跑一次只要幾秒。
+    """
+    import shutil
+
+    from PyQt6.QtCore import QEventLoop, QSettings, QTimer
+    from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
+
+    from app import document
+    from app.language import t
+    from app.viewer import MarkdownViewer
+
+    app = QApplication.instance() or QApplication([])
+
+    def pump(ms=150):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+        for _ in range(3):
+            app.processEvents()
+
+    NL = "\n"
+    _SB = QMessageBox.StandardButton
+    _real_question = QMessageBox.question
+    _real_get_save = QFileDialog.getSaveFileName
+    ask_calls: list = []
+    reply: dict = {"answer": _SB.Discard, "path": ""}
+    QMessageBox.question = staticmethod(
+        lambda parent, title, text, buttons=_SB.Ok, default=_SB.NoButton:
+        (ask_calls.append(text), reply["answer"])[1])
+    QFileDialog.getSaveFileName = staticmethod(
+        lambda parent=None, caption="", directory="", filter="", *a, **k: (reply["path"], filter))
+    work = tempfile.mkdtemp(prefix="mdshort-")
+    docs = []
+    for n in range(12):
+        path = os.path.join(work, f"d{n:02d}.md")
+        with open(path, "w", encoding="utf-8") as handle:
+            # 每行後面要空一行才是各自一段；連在一起 Markdown 會併成一段，文件捲不動，
+            # 「還原捲動」就會變成 0 對 0 的空比較。
+            handle.write(f"# 文件 {n}" + NL + NL + (f"第 {n} 份的內文行。" + NL + NL) * 80)
+        docs.append(path)
+    try:
+        v = MarkdownViewer(docs[0])
+        v.resize(1000, 700)
+        v.show()
+        pump(300)
+        for path in docs[1:4]:
+            v.open_path(path, new_tab=True)
+            pump(80)
+        # d00 d01 d02 d03，作用中是最後一個
+        v.activate_tab_by_number(1)
+        pump(80)
+        first = v._active
+        v.activate_tab_by_number(9)
+        pump(80)
+        last = v._active
+        v.activate_tab_by_number(3)
+        pump(80)
+        before = v._active
+        v.activate_tab_by_number(7)
+        pump(80)
+        check("Ctrl+1 切到第一個、Ctrl+9 切到最後一個、Ctrl+7 超出範圍不動作",
+              first == 0 and last == v.tab_count() - 1 and v._active == before == 2,
+              f"1→{first} 9→{last} 7→{v._active}（之前 {before}）")
+
+        # 關中間那個再重開：位置與捲動都要對
+        v.activate_tab(1)
+        pump(80)
+        bar = v.browser.verticalScrollBar()
+        bar.setValue(bar.maximum() // 2)
+        pump(80)
+        ratio = v._tabs[1].scroll_ratio()
+        v.close_tab_at(1)
+        pump(80)
+        gone = v.tab_count()
+        v.reopen_closed_tab()
+        pump(400)
+        v.flush_pending_chunks()
+        pump(200)
+        check("關掉中間的分頁再 Ctrl+Shift+T：插回原位、切過去、捲動位置還原",
+              gone == 3 and v.tab_count() == 4 and v._active == 1
+              and v._tabs[1].path == docs[1]
+              and ratio > 0.3 and abs(v._tabs[1].scroll_ratio() - ratio) < 0.05,
+              f"tabs {gone}→{v.tab_count()} active={v._active} "
+              f"path={os.path.basename(v._tabs[1].path or '')} ratio {ratio:.2f}→{v._tabs[1].scroll_ratio():.2f}")
+
+        # 連關兩個，依序重開是後進先出
+        v.close_tab_at(3)
+        pump(80)
+        v.close_tab_at(2)
+        pump(80)
+        v.reopen_closed_tab()
+        pump(200)
+        first_back = v._tabs[v._active].path
+        v.reopen_closed_tab()
+        pump(200)
+        second_back = v._tabs[v._active].path
+        check("連關兩個再連按兩次 Ctrl+Shift+T：先回來的是最後關的（後進先出）",
+              first_back == docs[2] and second_back == docs[3] and v.tab_count() == 4,
+              f"{os.path.basename(first_back or '')} 然後 {os.path.basename(second_back or '')}")
+
+        # 上限 10：關 12 個，只留最新的 10 筆
+        for path in docs[4:]:
+            v.open_path(path, new_tab=True)
+            pump(40)
+        v._closed_tabs.clear()
+        while v.tab_count() > 1:
+            v.close_tab_at(v.tab_count() - 1)
+            pump(30)
+        check(f"堆疊上限 {config.MAX_CLOSED_TABS} 筆：關掉 11 個只留最新的 {config.MAX_CLOSED_TABS} 個，最舊的被丟掉",
+              len(v._closed_tabs) == config.MAX_CLOSED_TABS
+              and v._closed_tabs[-1].path == docs[1]
+              and all(e.path != docs[11] for e in v._closed_tabs),
+              f"{len(v._closed_tabs)} 筆，最新 {os.path.basename(v._closed_tabs[-1].path or '')}")
+        v._closed_tabs.clear()
+
+        # 貼上分頁：取消不記、不儲存後找得回來、存成檔案後記的是路徑
+        v.new_tab()
+        pump(80)
+        QApplication.clipboard().setText("# 貼上的標題" + NL + NL + "貼上的內文 **粗體**" + NL)
+        v.paste_markdown()
+        pump(200)
+        pasted_index = v._active
+        reply["answer"] = _SB.Cancel
+        asked = len(ask_calls)
+        v.close_tab_at(pasted_index)
+        pump(80)
+        check("關貼上分頁按「取消」：分頁留著、堆疊不多一筆（記錄點在詢問之後）",
+              len(ask_calls) == asked + 1 and v.tab_count() == 2 and not v._closed_tabs,
+              f"問了 {len(ask_calls) - asked} 次 tabs={v.tab_count()} 堆疊={len(v._closed_tabs)}")
+        reply["answer"] = _SB.Discard
+        v.close_tab_at(pasted_index)
+        pump(80)
+        v.reopen_closed_tab()
+        pump(300)
+        back = v._tabs[v._active]
+        check("貼上分頁選「不儲存」關掉後 Ctrl+Shift+T 找得回來：仍是貼上分頁、原文一字不差",
+              v.tab_count() == 2 and back.pasted and back.path is None
+              and back.text == "# 貼上的標題" + NL + NL + "貼上的內文 **粗體**" + NL
+              and "貼上的標題" in v.browser.toPlainText(),
+              f"pasted={back.pasted} path={back.path} text={back.text[:20]!r}")
+        reply["answer"] = _SB.Save
+        reply["path"] = os.path.join(work, "saved.md")
+        v.close_tab_at(v._active)
+        pump(120)
+        entry = v._closed_tabs[-1] if v._closed_tabs else None
+        check("貼上分頁選「儲存」再關：堆疊記的是存好的路徑、不再是貼上文字",
+              entry is not None and not entry.pasted and entry.text == ""
+              and os.path.normcase(entry.path or "") == os.path.normcase(reply["path"])
+              and os.path.isfile(reply["path"]),
+              f"{entry}")
+        v._closed_tabs.clear()
+
+        # 拖到別的視窗（take_tab）不是關閉，不記；空白歡迎分頁也不記
+        v.open_path(docs[5], new_tab=True)
+        pump(80)
+        moved = v.take_tab(v._active)
+        pump(80)
+        v.new_tab()
+        pump(80)
+        v.close_tab_at(v._active)
+        pump(80)
+        check("take_tab 拖走的分頁與空白歡迎分頁都不進堆疊",
+              moved is not None and moved.path == docs[5] and not v._closed_tabs,
+              f"堆疊={len(v._closed_tabs)}")
+        moved.browser.deleteLater()
+
+        v.reopen_closed_tab()
+        pump(80)
+        check("堆疊空時 Ctrl+Shift+T 不崩、分頁數不變、狀態列提示沒有可重開的分頁",
+              v.tab_count() == 1 and v.status_label.text() == t("status.noClosedTab"),
+              f"tabs={v.tab_count()} status={v.status_label.text()!r}")
+
+        from PyQt6.QtGui import QShortcut as _QShortcut
+        bound = {s.key().toString() for s in v.findChildren(_QShortcut)}
+        wanted = {"Ctrl+Shift+T"} | {f"Ctrl+{n}" for n in range(1, 10)}
+        check("Ctrl+Shift+T 與 Ctrl+1…9 真的綁在視窗上（上面的檢查直接呼叫方法，綁定漏了也不會紅）",
+              wanted <= bound, str(sorted(wanted - bound)))
+
+        welcome = document.render_welcome()
+        check("歡迎頁的快速鍵表列出 Ctrl+Shift+T 與 Ctrl+1…9",
+              t("welcome.sc.reopenTab") in welcome and t("welcome.scDesc.jumpTab") in welcome)
+        check("錯誤頁的按鍵說明把「Ctrl+W 關閉視窗」改正為關閉分頁（兩種語言）",
+              "關閉分頁" in t("error.keys") and "關閉視窗" not in t("error.keys"))
+        v.close()
+        pump(200)
+    finally:
+        QMessageBox.question = _real_question
+        QFileDialog.getSaveFileName = _real_get_save
+        shutil.rmtree(work, ignore_errors=True)
+        QSettings(config.ORG_NAME, config.APP_NAME).clear()
+
+
+def section_watch(args) -> None:
+    """檔案監看不再安靜失效：三層（檔案事件、目錄事件、輪詢）與消失／回來的三態。
+
+    以前 addPath 的回傳值沒人看（掛失敗沒人知道），檔案被刪、改名走開或磁碟拔掉時
+    分頁停在舊內容、狀態列還顯示原本的修改時間裝作是最新的。比對與重讀集中在
+    viewer._reload_changed_tabs；這裡直接呼叫它（與 _on_poll_timeout）讓時序可控，
+    只留一條真的計時器檢查證明輪詢會自己跑。
+    """
+    import logging
+    import shutil
+
+    from PyQt6.QtCore import QEventLoop, QSettings, QTimer
+    from PyQt6.QtWidgets import QApplication
+
+    from app import document
+    from app.document_tab import DocumentTab
+    from app.language import t
+    from app.viewer import MarkdownViewer
+
+    app = QApplication.instance() or QApplication([])
+
+    def pump(ms=120):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+        for _ in range(3):
+            app.processEvents()
+
+    def write(path, text):
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    NL = "\n"
+    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    work = tempfile.mkdtemp(prefix="mdwatch-")
+    main_path = os.path.join(work, "a.md")
+    side_path = os.path.join(work, "b.md")
+    write(main_path, "# 第一版" + NL + NL + "內容一" + NL)
+    write(side_path, "# 旁邊" + NL + NL + "旁邊一" + NL)
+    v = None
+    try:
+        v = MarkdownViewer(main_path)
+        v.resize(900, 600)
+        v.show()
+        pump(300)
+        check("開檔後三層都在：watcher 掛了檔案與資料夾、輪詢計時器在跑、沒有退化",
+              main_path in v._watcher.files() and work in v._watcher.directories()
+              and v._poll_timer.isActive() and not v._watch_degraded,
+              f"files={len(v._watcher.files())} dirs={len(v._watcher.directories())} "
+              f"poll={v._poll_timer.isActive()} degraded={v._watch_degraded}")
+
+        title_before = v.windowTitle()
+        os.remove(main_path)
+        v._reload_changed_tabs()
+        pump(80)
+        check("檔案被刪：分頁標成消失、內容留著、狀態列改提示「檔案已不存在」、標題不變",
+              v._tab.missing and "第一版" in v.browser.toPlainText()
+              and v.status_label.text() == t("status.fileMissing")
+              and v.windowTitle() == title_before,
+              f"missing={v._tab.missing} status={v.status_label.text()!r}")
+
+        write(main_path, "# 第二版" + NL + NL + "內容二" + NL)
+        v._reload_changed_tabs()
+        pump(200)
+        check("檔案回來：自動重讀到新內容、消失提示清掉",
+              not v._tab.missing and "第二版" in v.browser.toPlainText()
+              and v.status_label.text() != t("status.fileMissing"),
+              f"missing={v._tab.missing} text={v.browser.toPlainText()[:12]!r}")
+
+        stamp = v._tab.file_stamp
+        os.rename(main_path, main_path + ".bak")
+        v._reload_changed_tabs()
+        pump(50)
+        went_missing = v._tab.missing
+        os.rename(main_path + ".bak", main_path)
+        v._reload_changed_tabs()
+        pump(200)
+        check("改名走開又改回來（內容與時戳都沒變）：照樣算回來、重讀並清提示（靠 missing 旗標，不靠 stamp 差異）",
+              went_missing and not v._tab.missing and v._tab.stamp() == stamp
+              and v.status_label.text() != t("status.fileMissing"),
+              f"走開 missing={went_missing} 回來 missing={v._tab.missing} stamp相同={v._tab.stamp() == stamp}")
+
+        v._unwatch_all()
+        write(main_path, "# 第三版" + NL + NL + "內容三" + NL)
+        v._on_poll_timeout()
+        pump(200)
+        check("watcher 被清空（模擬整批掛失敗）：輪詢仍抓到變動並重讀",
+              "第三版" in v.browser.toPlainText() and main_path in v._watcher.files(),
+              f"text={v.browser.toPlainText()[:12]!r} 重掛={main_path in v._watcher.files()}")
+
+        # 真的計時器：把間隔縮短，證明輪詢會自己跑、不靠任何檔案事件
+        v._unwatch_all()
+        v._watcher.blockSignals(True)
+        v._poll_timer.start(150)
+        write(main_path, "# 第四版" + NL + NL + "內容四" + NL)
+        pump(700)
+        v._watcher.blockSignals(False)
+        check("輪詢真的會自己跑：watcher 全清、訊號封住，改檔後 0.7 秒內仍重讀到新內容",
+              "第四版" in v.browser.toPlainText(), v.browser.toPlainText()[:12])
+        v._poll_timer.start(config.WATCH_POLL_MS)
+
+        real_read = document.read_text_file
+
+        def _boom(path):
+            raise document.DocumentError("error.readFailed", path=path, error="模擬")
+
+        document.read_text_file = _boom
+        try:
+            write(main_path, "# 第五版" + NL)
+            v._on_poll_timeout()
+            first = v._reload_timer.isActive()
+            pump(450)
+            v._on_poll_timeout()
+            second = v._reload_timer.isActive()
+        finally:
+            document.read_text_file = real_read
+        check("讀檔失敗的重試有界：同一個版本只排一次 300ms 重試，之後不再排（以前會每 300ms 無限重試、每輪凍結 100ms）",
+              first and not second, f"第一次={first} 第二次={second}")
+        v._on_poll_timeout()
+        pump(200)
+
+        class _Count(logging.Handler):
+            def __init__(self):
+                super().__init__()
+                self.n = 0
+
+            def emit(self, record):
+                self.n += 1
+
+        counter = _Count()
+        logging.getLogger("app.viewer").addHandler(counter)
+        real_add = v._watcher.addPath
+        # 只讓「檔案」掛失敗、資料夾照掛：兩者都失敗的話，實作只看資料夾那條的回傳值
+        # 也能過，抓不到「檔案那條沒看回傳值」的漏洞。
+        v._watcher.addPath = lambda path: False if os.path.isfile(path) else real_add(path)
+        try:
+            v._watch_files()
+            v._watch_files()
+            v._on_poll_timeout()
+            degraded = v._watch_degraded
+            logged = counter.n
+        finally:
+            v._watcher.addPath = real_add
+            logging.getLogger("app.viewer").removeHandler(counter)
+        v._watch_files()
+        check("addPath 回 False：標成退化、連續三輪只記一次 log；恢復後旗標清掉",
+              degraded and logged == 1 and not v._watch_degraded,
+              f"degraded={degraded} 記錄={logged} 恢復後={v._watch_degraded}")
+
+        v.adopt_tab(DocumentTab(main_path))
+        pump(200)
+        v._watch_files()
+        check("同一個路徑開在兩個分頁（跨視窗合併會出現）：只掛一次、不算掛失敗",
+              v.tab_count() == 2 and not v._watch_degraded
+              and sum(1 for f in v._watcher.files() if os.path.normcase(f) == os.path.normcase(main_path)) == 1,
+              f"tabs={v.tab_count()} degraded={v._watch_degraded} files={v._watcher.files()}")
+        v.close_tab_at(1)
+        pump(80)
+
+        v.open_path(side_path, new_tab=True)
+        pump(150)
+        v.activate_tab(0)
+        pump(80)
+        write(side_path, "# 旁邊" + NL + NL + "旁邊二" + NL)
+        v._reload_changed_tabs()
+        pump(80)
+        side_tab = v._tabs[1]
+        unloaded = not side_tab.loaded
+        v.activate_tab(1)
+        pump(200)
+        check("背景分頁的檔案變了：只標成待重讀不當場轉換，切過去才讀到新內容",
+              unloaded and "旁邊二" in v.browser.toPlainText(),
+              f"loaded={not unloaded} text={v.browser.toPlainText()[:10]!r}")
+
+        v.set_auto_reload(False)
+        off = (not v._watcher.files(), not v._watcher.directories(), not v._poll_timer.isActive())
+        v.set_auto_reload(True)
+        check("關掉自動重載：監看清空、輪詢停；重新打開：重掛、輪詢重起",
+              all(off) and v._watcher.files() and v._poll_timer.isActive(),
+              f"關={off} 開 files={len(v._watcher.files())} poll={v._poll_timer.isActive()}")
+
+        v.close()
+        pump(200)
+        check("關窗時後備輪詢計時器停了（和另外四個計時器一致）", not v._poll_timer.isActive())
+        v = None
+
+        # 純還原啟動：分頁集合第一次成形的地方以前沒呼 _watch_files
+        settings = QSettings(config.ORG_NAME, config.APP_NAME)
+        settings.setValue(config.KEY_RESTORE_TABS, True)
+        settings.setValue(config.KEY_OPEN_TABS, [main_path, side_path])
+        settings.setValue(config.KEY_ACTIVE_TAB, 0)
+        settings.sync()
+        restored = MarkdownViewer()
+        restored.resize(900, 600)
+        restored.show()
+        pump(300)
+        check("純還原啟動（命令列沒帶檔案）的分頁也有監看與輪詢（以前這條路徑整批漏掉）",
+              restored.tab_count() == 2 and main_path in restored._watcher.files()
+              and restored._poll_timer.isActive(),
+              f"tabs={restored.tab_count()} files={len(restored._watcher.files())} poll={restored._poll_timer.isActive()}")
+        restored.close()
+        pump(150)
+    finally:
+        if v is not None:
+            v.close()
+            pump(100)
+        shutil.rmtree(work, ignore_errors=True)
+        QSettings(config.ORG_NAME, config.APP_NAME).clear()
+
+
+def section_portable(args) -> None:
+    """可攜版真的可攜：exe 旁有 portable.txt 時設定與紀錄都存在旁邊的 data。
+
+    以前可攜版 zip 跑起來和安裝版寫同一個登錄樹與 %LOCALAPPDATA%，拔掉隨身碟
+    留痕跡、兩邊並用互相蓋工作階段。判定與儲存後端集中在 app/resources.py：
+    portable_root()（環境變數 MDREADER_PORTABLE_ROOT 最優先，其次 frozen 且 exe
+    旁有標記檔）、user_data_dir()、make_settings()（全專案唯一的 QSettings 建構點）。
+    測試用環境變數指到暫存目錄，不碰真的 exe。
+    """
+    import glob
+    import importlib
+    import re as _re
+
+    from PyQt6.QtCore import QByteArray, QCoreApplication, QSettings
+
+    QCoreApplication.instance() or QCoreApplication([])
+    from app import resources
+
+    # --- 靜態：打包腳本與建構點 -------------------------------------------
+    ps1 = open(os.path.join(PROJECT_ROOT, "build.ps1"), encoding="utf-8-sig").read()
+    check("build.ps1：可攜版 zip 步驟會寫出 portable.txt 並用 -Update 加進 zip 的根",
+          'Join-Path $env:TEMP "portable.txt"' in ps1
+          and _re.search(r"Compress-Archive -Path \$marker -DestinationPath \$zip -Update", ps1)
+          is not None)
+    marker_lines = [l for l in ps1.splitlines() if "portable.txt" in l]
+    check("build.ps1：標記檔不寫進 dist\\MarkdownReader-onedir（放進去會被安裝檔一起裝走）",
+          marker_lines and not any("onedir" in l for l in marker_lines),
+          " | ".join(l.strip() for l in marker_lines)[:160])
+    sites = {
+        "main.py": os.path.join(PROJECT_ROOT, "main.py"),
+        "app/viewer.py": os.path.join(PROJECT_ROOT, "app", "viewer.py"),
+        "tools/benchmark_startup.py": os.path.join(PROJECT_ROOT, "tools", "benchmark_startup.py"),
+    }
+    bad_sites = [name for name, path in sites.items()
+                 if "resources.make_settings()" not in open(path, encoding="utf-8").read()]
+    check("三個 QSettings 建構點（main.py、viewer.py、benchmark_startup.py）都走 resources.make_settings()",
+          not bad_sites, str(bad_sites))
+    direct = []
+    for path in glob.glob(os.path.join(PROJECT_ROOT, "app", "*.py")) + list(sites.values()):
+        if "QSettings(config.ORG_NAME, config.APP_NAME)" in open(path, encoding="utf-8").read():
+            direct.append(os.path.relpath(path, PROJECT_ROOT).replace("\\", "/"))
+    check("直接建構 QSettings(ORG_NAME, APP_NAME) 的只剩 app/resources.py（可攜判定一處決定，別處繞不過）",
+          direct == ["app/resources.py"], str(direct))
+
+    # --- 行程內：模式判定與儲存後端 ---------------------------------------
+    saved_env = {k: os.environ.get(k) for k in ("MDREADER_PORTABLE_ROOT", "LOCALAPPDATA")}
+    fake_local = tempfile.mkdtemp(prefix="mdport-local-")
+    os.environ["LOCALAPPDATA"] = fake_local          # 退回時記的 error.log 不要寫進真的目錄
+    os.environ.pop("MDREADER_PORTABLE_ROOT", None)
+    try:
+        importlib.reload(resources)
+        normal = resources.make_settings()
+        check("沒設環境變數、非打包執行＝一般模式：portable_root 是 None、設定走登錄式",
+              resources.portable_root() is None
+              and normal.format() == QSettings.Format.NativeFormat,
+              f"{resources.portable_root()} {normal.format()}")
+        del normal
+
+        root = tempfile.mkdtemp(prefix="mdport-")
+        os.environ["MDREADER_PORTABLE_ROOT"] = root
+        importlib.reload(resources)
+        data_dir = os.path.join(os.path.abspath(root), "data")
+        check("環境變數指到目錄＝可攜模式：user_data_dir 是 <根>\\data 且已建出",
+              resources.portable_root() == os.path.abspath(root)
+              and os.path.normcase(resources.user_data_dir()) == os.path.normcase(data_dir)
+              and os.path.isdir(data_dir),
+              resources.user_data_dir())
+        ini = resources.make_settings()
+        check("可攜模式的設定是 <根>\\data\\settings.ini（IniFormat），不碰登錄檔",
+              ini.format() == QSettings.Format.IniFormat
+              and os.path.normcase(os.path.normpath(ini.fileName()))
+              == os.path.normcase(os.path.join(data_dir, "settings.ini")),
+              f"{ini.format()} {ini.fileName()}")
+        geometry = QByteArray(b"\x01\x00\xff\x7f")
+        tabs = [r"C:\a b\x.md", r"D:\c,d\y.md"]
+        ini.setValue(config.KEY_GEOMETRY, geometry)
+        ini.setValue(config.KEY_OPEN_TABS, tabs)
+        ini.setValue("probe/one", [r"C:\only.md"])
+        ini.setValue("probe/empty", [])
+        ini.sync()
+        del ini
+        back = resources.make_settings()
+        geometry_back = back.value(config.KEY_GEOMETRY)
+        check("ini 往返：視窗幾何讀回仍是 QByteArray 且位元組相等；含空白與逗號的分頁路徑逐字相符；單元素與空清單也還是 list",
+              isinstance(geometry_back, QByteArray) and bytes(geometry_back) == bytes(geometry)
+              and back.value(config.KEY_OPEN_TABS, [], type=list) == tabs
+              and back.value("probe/one", [], type=list) == [r"C:\only.md"]
+              and back.value("probe/empty", [], type=list) == [],
+              f"{type(geometry_back).__name__} {back.value(config.KEY_OPEN_TABS)}")
+        del back
+
+        # 退回：data 的位置被一個檔案佔著，建不出目錄
+        blocked = tempfile.mkdtemp(prefix="mdport-ro-")
+        open(os.path.join(blocked, "data"), "w").close()
+        os.environ["MDREADER_PORTABLE_ROOT"] = blocked
+        importlib.reload(resources)
+        fell_back = resources.make_settings()
+        log_path = os.path.join(fake_local, "MarkdownReader", "error.log")
+        log_text = open(log_path, encoding="utf-8").read() if os.path.isfile(log_path) else ""
+        resources.make_settings()  # 再叫一次：那一行只能記一次
+        log_again = open(log_path, encoding="utf-8").read() if os.path.isfile(log_path) else ""
+        check("可攜目錄寫不進去＝退回一般模式（登錄式）不崩潰，並在一般位置的 error.log 記一行、只記一次",
+              fell_back.format() == QSettings.Format.NativeFormat
+              and "已退回一般模式" in log_text
+              and log_again.count("已退回一般模式") == 1,
+              f"{fell_back.format()} 記錄次數={log_again.count('已退回一般模式')}")
+        del fell_back
+    finally:
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        importlib.reload(resources)
+
+    # --- 子行程：真的主視窗在可攜模式下跑一遍 -----------------------------
+    real = QSettings(config.ORG_NAME, config.APP_NAME)
+    real.clear()
+    real.sync()
+    child_root = tempfile.mkdtemp(prefix="mdport-child-")
+    body = '''
+        from app import resources
+        v = MarkdownViewer(SAMPLE)
+        v.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        v.show(); pump(400)
+        print("ROOT", resources.portable_root())
+        QTimer.singleShot(300, v.close)
+        app.exec()
+        print("CLOSED 1")
+    '''
+    code, out, err = run_child("portable", body, env={"MDREADER_PORTABLE_ROOT": child_root})
+    got = child_values(out)
+    ini_path = os.path.join(child_root, "data", "settings.ini")
+    ini_text = open(ini_path, encoding="utf-8").read() if os.path.isfile(ini_path) else ""
+    real_keys = QSettings(config.ORG_NAME, config.APP_NAME).allKeys()
+    check("子行程帶 MDREADER_PORTABLE_ROOT 開真的主視窗再關掉：幾何寫進 <根>\\data\\settings.ini，登錄檔一個鍵都沒多",
+          code == 0 and got.get("CLOSED") == "1"
+          and os.path.normcase(got.get("ROOT", "")) == os.path.normcase(os.path.abspath(child_root))
+          and "geometry" in ini_text and not real_keys,
+          f"code={code} ini={'有' if ini_text else '無'} 登錄鍵={list(real_keys)[:3]} {err[-200:] if code else ''}")
+
+    # --- import 期是葉節點（乾淨的直譯器，不帶 QApplication 的標頭）------------
+    leaf = subprocess.run(
+        [sys.executable, "-c",
+         "import sys; sys.path.insert(0, sys.argv[1]); import app.resources; "
+         "print('QTCORE', 'PyQt6.QtCore' in sys.modules)", PROJECT_ROOT],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+    check("import app.resources 不會載入 QtCore（main.py 的轉交快路徑與崩潰紀錄路徑都靠它保持輕量）",
+          leaf.returncode == 0 and "QTCORE False" in leaf.stdout,
+          f"code={leaf.returncode} {leaf.stdout.strip()} {leaf.stderr[-160:] if leaf.returncode else ''}")
+
+
 def section_installer(args) -> None:
     """安裝檔的動態檢查：編譯測試變體、靜默安裝到暫存目錄、驗證、靜默反安裝、驗證。
 
@@ -5966,6 +6676,9 @@ SECTIONS = [
     ("視窗與邊緣縮放", section_window),
     ("單一實例", section_single_instance),
     ("關閉穩定度", section_teardown),
+    ("分頁快速鍵", section_tab_shortcuts),
+    ("檔案監看", section_watch),
+    ("可攜版", section_portable),
     ("安裝檔", section_installer),
 ]
 

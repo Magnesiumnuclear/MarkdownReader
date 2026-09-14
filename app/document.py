@@ -580,7 +580,7 @@ def render_error(error: DocumentError, path: str = "") -> str:
 # 歡迎頁的快速鍵列。兩欄都進語言檔：按鍵名稱多半兩種語言相同，
 # 但「Alt + 左方向鍵」在英文是 "Alt + Left"，不能只翻說明那一欄。
 _WELCOME_SHORTCUTS = (
-    "open", "newTab", "paste", "closeTab", "switchTab", "reload", "find",
+    "open", "newTab", "paste", "closeTab", "reopenTab", "switchTab", "jumpTab", "reload", "find",
     "settings", "theme", "pin", "zoom", "back", "maximize", "escape",
 )
 

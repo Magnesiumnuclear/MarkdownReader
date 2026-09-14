@@ -25,8 +25,9 @@ import html
 import re
 import xml.etree.ElementTree as ET
 
+from markdown import util
 from markdown.extensions import Extension
-from markdown.inlinepatterns import SimpleTagInlineProcessor
+from markdown.inlinepatterns import InlineProcessor, SimpleTagInlineProcessor
 from markdown.preprocessors import Preprocessor
 from markdown.treeprocessors import Treeprocessor
 
@@ -45,6 +46,27 @@ _PRE_OPEN_RE = re.compile(r"<pre[^>]*>")
 CHECKBOX_SCHEME = "mdres"
 CHECKBOX_ON = f"{CHECKBOX_SCHEME}:checkbox-on"
 CHECKBOX_OFF = f"{CHECKBOX_SCHEME}:checkbox-off"
+
+# ── 裸網址自動連結（GFM autolink 子集） ──────────────────────────────────────
+# 三個具名群組：url（http/https scheme）、www（www. 起頭）、email（郵件地址）。
+# email lookbehind 限 ASCII 字元集，防止緊貼的中文字被吃進 local-part。
+_AUTOLINK_TRIGGER = re.compile(
+    r"(?<![A-Za-z0-9])(?P<url>https?://)"
+    r"|(?<![A-Za-z0-9])(?P<www>www\.)"
+    r"|(?<![A-Za-z0-9._+\-@])(?P<email>[A-Za-z0-9._+\-]+@[A-Za-z0-9\-]+"
+    r"(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,})",
+    re.IGNORECASE,
+)
+# www. 之後至少一個點（驗網域結構）
+_AUTOLINK_DOMAIN = re.compile(r"^[\w\-]+(?:\.[\w\-]+)+", re.UNICODE)
+# 結尾標點集合（GFM + 全形中文標點）；`* _ ~` 讓強調語法不被吃進 href
+_AUTOLINK_TRAIL = frozenset(".,:;!?*_~。，、；：！？」』》〉")
+# InlineProcessor 佔位符 \x02klzzwxh:NNNN\x03，其節點若為字串則再解 htmlStash
+_KLZZ_RE = re.compile(r"\x02klzzwxh:(\d+)\x03")
+# stashed_nodes 的值格式為 'wzxhzdk:N'（不帶 STX/ETX 分隔符）
+_WZXH_RE = re.compile(r"wzxhzdk:(\d+)")
+_A_OPEN_RE = re.compile(r"<a\b", re.IGNORECASE)
+_A_CLOSE_RE = re.compile(r"</a\b", re.IGNORECASE)
 
 
 def _new_table(table_class: str, cell_class: str) -> tuple[ET.Element, ET.Element]:
@@ -365,6 +387,110 @@ class QtRichTextTreeprocessor(Treeprocessor):
                 heading.insert(0, anchor)
 
 
+class BareUrlInlineProcessor(InlineProcessor):
+    """把裸網址（http/https/www.）與電子郵件轉成 <a href>。
+
+    優先序 85：
+      低於 backtick(190)、link(160)、autolink(120)、automail(110)、html(90)
+      高於 em_strong(60)、em_strong2(50)
+    這樣程式碼、既有連結、角括號連結、行內 HTML 都先收走節點，
+    我們才不會誤動它們；同時我們先把 URL 收成 AtomicString，
+    路徑裡的 * 才不會被 em_strong 後處理成強調標籤。
+
+    不碰程式碼區塊與 Mermaid：fenced code 在前處理階段就進了 htmlStash，
+    樹裡只剩佔位符，inline 階段完全看不到其內容（結構性保證）。
+    """
+
+    ANCESTOR_EXCLUDES = ("a",)  # 不在 Markdown 語法產生的 <a> 裡再包一層
+
+    def __init__(self, md):
+        super().__init__(_AUTOLINK_TRIGGER.pattern, md)
+        self.compiled_re = _AUTOLINK_TRIGGER  # 覆寫以帶入 IGNORECASE 旗標
+
+    def handleMatch(self, m, data):  # noqa: N802
+        start = m.start()
+
+        # 偵測原始 HTML <a>（ANCESTOR_EXCLUDES 只擋 Markdown 語法連結）。
+        # 內文裡的行內 InlineProcessor 佔位符格式為 \x02klzzwxh:NNNN\x03；
+        # 當節點是 str（形如 \x02wzxhzdk:N\x03）時，該字串指向 htmlStash 的一筆原始
+        # HTML 標籤。逐一取出並統計 <a 與 </a> 的數量差，開多於關即在 <a> 內。
+        # stashed_nodes 鍵為字串（如 '0000'），值為 'wzxhzdk:N'（不帶分隔符）
+        try:
+            stashed = self.md.treeprocessors["inline"].stashed_nodes
+        except (KeyError, AttributeError):
+            stashed = {}
+        anchor_depth = 0
+        for km in _KLZZ_RE.finditer(data[:start]):
+            node = stashed.get(km.group(1))
+            if not isinstance(node, str):
+                continue
+            wm = _WZXH_RE.search(node)
+            if wm is None:
+                continue
+            raw = self.md.htmlStash.rawHtmlBlocks[int(wm.group(1))]
+            anchor_depth += len(_A_OPEN_RE.findall(raw)) - len(_A_CLOSE_RE.findall(raw))
+        if anchor_depth > 0:
+            return None, None, None
+
+        # ── 郵件地址 ────────────────────────────────────────────────────────
+        if m.group("email"):
+            email = m.group("email")
+            el = ET.Element("a")
+            el.set("href", "mailto:" + email)
+            el.text = util.AtomicString(email)
+            return el, m.start("email"), m.end("email")
+
+        # ── 消費到空白 / < / 控制字元（STX/ETX 佔位符界）為止 ───────────────
+        n = len(data)
+        end = start
+        while end < n:
+            ch = data[end]
+            if ch.isspace() or ch == "<" or ch < " ":
+                break
+            end += 1
+        candidate = data[start:end]
+
+        # ── www. 分支：驗網域結構 ────────────────────────────────────────────
+        if m.group("www"):
+            rest = candidate[4:]  # 去掉 "www."
+            if not _AUTOLINK_DOMAIN.match("www." + rest):
+                return None, None, None
+        else:
+            # http(s):// 分支：scheme 後必須至少有一個有效字元
+            rest = candidate[len(m.group("url")):]
+            if not rest or not (rest[0].isalnum() or rest[0] == "_"):
+                return None, None, None
+
+        url = self._trim(candidate)
+        if not url:
+            return None, None, None
+
+        href = ("http://" + url) if m.group("www") else url
+        el = ET.Element("a")
+        el.set("href", href)
+        el.text = util.AtomicString(url)
+        # 尾標點留在 data[start+len(url):]，交回文字流
+        return el, start, start + len(url)
+
+    @staticmethod
+    def _trim(url: str) -> str:
+        """逐字剝結尾標點與不配對的右括號（GFM 規則）。"""
+        while url:
+            last = url[-1]
+            if last in _AUTOLINK_TRAIL:
+                url = url[:-1]
+                continue
+            if last == ")" and url.count(")") > url.count("("):
+                url = url[:-1]
+                continue
+            # 全形右括號配對
+            if last == "）" and url.count("）") > url.count("（"):
+                url = url[:-1]
+                continue
+            break
+        return url
+
+
 class QtRichTextExtension(Extension):
     """註冊 QtRichTextTreeprocessor。
 
@@ -377,6 +503,8 @@ class QtRichTextExtension(Extension):
         md.inlinePatterns.register(
             SimpleTagInlineProcessor(r"()~~(.*?)~~", "del"), "strikethrough", 100
         )
+        # 裸網址 / www. / 郵件自動轉連結（優先序 85，說明見 BareUrlInlineProcessor）
+        md.inlinePatterns.register(BareUrlInlineProcessor(md), "bare_url", 85)
         # 要在 fenced_code(25) 之前看到圍欄，見 MermaidPreprocessor 的說明
         md.preprocessors.register(MermaidPreprocessor(md), "mermaid_fence", 27)
         md.treeprocessors.register(

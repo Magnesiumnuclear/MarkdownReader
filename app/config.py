@@ -44,6 +44,9 @@ MAX_FONT_POINT_SIZE = 30
 
 # --- 檔案監看 ---------------------------------------------------------------
 WATCH_DEBOUNCE_MS = 150      # 存檔事件去抖動時間
+# 慢速輪詢：watcher 掛失敗或整個資料夾消失（磁碟拔掉）時的後備，只在自動重載
+# 開啟時跑。十個分頁一輪 os.stat 不到 1ms，3 秒一次感覺不到。
+WATCH_POLL_MS = 3000
 READ_RETRY_COUNT = 3         # 檔案被鎖定時的重試次數
 READ_RETRY_DELAY_S = 0.05    # 每次重試間隔（秒）
 
@@ -201,6 +204,8 @@ KEY_RESTORE_TABS = "behavior/restoreTabs"
 KEY_OPEN_TABS = "session/openTabs"
 KEY_ACTIVE_TAB = "session/activeTab"
 DEFAULT_RESTORE_TABS = False
+# Ctrl+Shift+T 能找回的「最近關閉的分頁」筆數，每個視窗各自一份，視窗關閉即消失。
+MAX_CLOSED_TABS = 10
 
 # --- 單一實例 ---------------------------------------------------------------
 def _login_session_id() -> int:
