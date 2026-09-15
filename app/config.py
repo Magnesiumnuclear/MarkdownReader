@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import os
+
 # --- 應用程式識別 -----------------------------------------------------------
 APP_NAME = "MarkdownReader"          # QSettings 路徑用，不隨語言變
 # 產品名稱刻意不放在這裡：它會隨語言變，來源一律是 language.t("app.displayName")。
@@ -233,7 +235,10 @@ def _login_session_id() -> int:
 # 這個註解以前寫「要含使用者名稱」但名稱其實什麼都沒含，排查多使用者互搶時會被
 # 引到錯的方向——現在說的就是做的。
 IPC_SERVER_BASE = "MarkdownReader.SingleInstance"
-IPC_SERVER_NAME = f"{IPC_SERVER_BASE}.{_login_session_id()}"
+# 環境變數 MDREADER_PIPE_NAME 可整個換掉管道名稱（轉交器讀同一個變數）。給回歸
+# 測試用：測試自己開的本體與轉交器走專屬管道，和你正在用的閱讀器互不相干；
+# 搭配 MDREADER_PORTABLE_ROOT 把設定也隔開，測試就不必再要求「先關掉程式」。
+IPC_SERVER_NAME = os.environ.get("MDREADER_PIPE_NAME") or f"{IPC_SERVER_BASE}.{_login_session_id()}"
 IPC_CONNECT_TIMEOUT_MS = 150     # 連不到就當作沒有既有實例，不要卡住啟動
 IPC_WRITE_TIMEOUT_MS = 1000
 # 送出後等對方關閉連線的確認。只是保險，等不到也不影響正確性

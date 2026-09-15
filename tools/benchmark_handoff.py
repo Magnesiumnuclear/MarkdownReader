@@ -38,6 +38,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import config, language  # noqa: E402
+from app.window_manager import WindowManager  # noqa: E402  只為了 BURST_SECONDS，不要另抄一份數字
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SAMPLE = os.path.join(PROJECT_ROOT, "sample.md")
@@ -155,7 +156,14 @@ def measure_handoff(app: str, forwarder: str, runs: int) -> list[float]:
     else:
         kill_app()
         raise RuntimeError(f"第一個視窗沒起來：{app}")
-    time.sleep(0.4)
+    # 【要等冷啟動的連發窗口過去】本體啟動時會開一個 BURST_SECONDS 的多選連發窗口
+    # （檔案總管多選＝每個檔各叫一次，第一個冷啟動、其餘在窗口內到達的開成背景
+    # 分頁不搶焦點）。這裡量的是「已經開著時再開一個檔」，第二個檔必須在窗口過去
+    # 之後才送，否則會被當成同一批的第二個檔開在背景，標題永遠不會切到 README，
+    # 而且之後每次重送同一路徑都落在連發內、被略過——量到的是背景開檔，不是轉交。
+    # 以前這裡只等 0.4 秒，剛好等於 BURST_SECONDS，從 1.1.0 起就一直量不到。
+    # 窗口是「首檔的工作做完」之後才起算，標題出現時渲染還沒完，所以再加一秒餘裕。
+    time.sleep(WindowManager.BURST_SECONDS + 1.0)
 
     samples = measure_process([forwarder, SECOND], runs + 1)[1:]  # 第一次當暖機
 

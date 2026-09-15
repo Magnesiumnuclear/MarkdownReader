@@ -86,8 +86,17 @@ static void wappend(wchar_t *dest, size_t cap, const wchar_t *src)
 // 第一次呼叫時算好，之後直接回傳。wsprintfW 在 user32 裡，不是 CRT。
 static const wchar_t *pipe_path()
 {
-    static wchar_t path[128] = {0};
+    static wchar_t path[256] = {0};
     if (path[0] == 0) {
+        // 環境變數 MDREADER_PIPE_NAME 可整個換掉名稱（app/config.py 讀同一個變數）：
+        // 回歸測試讓自己開的本體與轉交器走專屬管道，不碰使用者正在用的閱讀器。
+        wchar_t override_name[200] = {0};
+        DWORD got = GetEnvironmentVariableW(L"MDREADER_PIPE_NAME", override_name,
+                                            (DWORD)(sizeof(override_name) / sizeof(override_name[0])));
+        if (got > 0 && got < sizeof(override_name) / sizeof(override_name[0])) {
+            wsprintfW(path, L"\\\\.\\pipe\\%s", override_name);
+            return path;
+        }
         DWORD session = 0;
         ProcessIdToSessionId(GetCurrentProcessId(), &session);
         wsprintfW(path, L"%s.%lu", kPipeBase, session);

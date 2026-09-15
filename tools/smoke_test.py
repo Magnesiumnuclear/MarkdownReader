@@ -53,7 +53,20 @@ import textwrap
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app import config  # noqa: E402
+# 【測試環境隔離】一開跑就把「設定存哪裡」與「單一實例的管道名稱」導到專屬位置：
+#   MDREADER_PORTABLE_ROOT → app/resources.make_settings 回暫存目錄裡的 settings.ini，
+#                            測試寫的每一個設定都落在那裡，真正的登錄檔一個鍵都不碰；
+#   MDREADER_PIPE_NAME     → app/config.IPC_SERVER_NAME 與 C++ 轉交器都改連專屬管道，
+#                            測試自己開的本體不會和你正在用的閱讀器互相轉交。
+# 以前測試直接讀寫真正的 QSettings、佔真正的管道，所以開跑前要擋「還有別的實例
+# 在跑」，開著閱讀器就不能跑測試。兩個變數在 import app.config 之前就要設好——
+# 它在 import 時就把管道名稱算好了。setdefault：完整跑時每個區塊各開一個子行程，
+# 子行程繼承同一組值，不會各自再開一個暫存目錄。
+_ISOLATION_ROOT = os.environ.setdefault(
+    "MDREADER_PORTABLE_ROOT", tempfile.mkdtemp(prefix="mdreader-smoke-"))
+os.environ.setdefault("MDREADER_PIPE_NAME", f"MarkdownReaderSmokeTest.{os.getpid()}")
+
+from app import config, resources  # noqa: E402
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SAMPLE = os.path.join(PROJECT_ROOT, "sample.md")
@@ -168,12 +181,63 @@ def _enter_offscreen() -> None:
 
 
 # --- QSettings 備份與還原 ---------------------------------------------------
+def _registry_snapshot() -> dict:
+    """真登錄檔（HKCU\\Software\\<ORG>\\<APP>）整棵的值，用 winreg 直接讀。
+
+    不能用 QSettings 讀：它的原生後端在行程內有快取，別的行程（測試開的子行程）
+    改了登錄檔，同一個行程裡新建的 QSettings 仍讀到舊值——實測繞過工廠的子行程
+    把幾何寫進去了，QSettings 卻回報「沒變」。winreg 每次都真的去問系統。
+    """
+    import winreg
+
+    out: dict = {}
+
+    def walk(key, prefix: str) -> None:
+        index = 0
+        while True:
+            try:
+                name, data, _kind = winreg.EnumValue(key, index)
+            except OSError:
+                break
+            out[prefix + name] = data
+            index += 1
+        index = 0
+        while True:
+            try:
+                sub = winreg.EnumKey(key, index)
+            except OSError:
+                break
+            with winreg.OpenKey(key, sub) as child:
+                walk(child, prefix + sub + "\\")
+            index += 1
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            f"Software\\{config.ORG_NAME}\\{config.APP_NAME}") as root:
+            walk(root, "")
+    except OSError:
+        pass  # 這台機器沒有這棵樹（從沒跑過程式）：空快照
+    return out
+
+
+def _assert_registry_untouched(before: dict) -> int:
+    """整趟跑完，真正的登錄檔要和開跑前一模一樣；不一樣就印出差異並回 1。"""
+    after = _registry_snapshot()
+    changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+    if not changed:
+        print("[隔離] 真正的登錄檔在測試前後完全相同（測試只寫專屬的 settings.ini）")
+        return 0
+    print(f"[隔離] 測試碰到了真正的登錄檔，改了 {len(changed)} 個鍵：{changed[:5]}")
+    return 1
+
+
 def _settings_handle():
-    from PyQt6.QtCore import QCoreApplication, QSettings
+    """測試專屬的設定存放處（見模組頂部的隔離說明），和程式本身走同一個工廠。"""
+    from PyQt6.QtCore import QCoreApplication
 
     if QCoreApplication.instance() is None:
         QCoreApplication([])
-    return QSettings(config.ORG_NAME, config.APP_NAME)
+    return resources.make_settings()
 
 
 def _expected_title(file_name: str) -> str:
@@ -228,7 +292,7 @@ _CHILD_HEADER = textwrap.dedent(
     from PyQt6.QtGui import QMouseEvent
     from PyQt6 import sip
     app = QApplication([])
-    from app import config
+    from app import config, resources
     from app.viewer import MarkdownViewer
 
     def pump(ms=300):
@@ -237,7 +301,7 @@ _CHILD_HEADER = textwrap.dedent(
             app.processEvents()
 
     def settings():
-        return QSettings(config.ORG_NAME, config.APP_NAME)
+        return resources.make_settings()   # 測試專屬的 ini（見主檔頂部的隔離說明）
 
     SAMPLE = os.path.join(r"{root}", "sample.md")
     README = os.path.join(r"{root}", "README.md")
@@ -304,7 +368,7 @@ def section_rendering(args) -> None:
     from app.language import t
     from app.viewer import MarkdownViewer
 
-    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    _settings_handle().clear()
     tmp = tempfile.mkdtemp()
     main_doc = os.path.join(tmp, "a.md")
     other_doc = os.path.join(tmp, "b.md")
@@ -811,7 +875,7 @@ def section_rendering(args) -> None:
     bar.case_button.setChecked(True)
     bar.word_button.setChecked(False)
     app.processEvents()
-    stored = QSettings(config.ORG_NAME, config.APP_NAME)
+    stored = _settings_handle()
     check("選項變動會寫進 QSettings",
           stored.value(config.KEY_FIND_CASE_SENSITIVE, type=bool) is True
           and stored.value(config.KEY_FIND_WHOLE_WORDS, type=bool) is False,
@@ -1216,14 +1280,14 @@ def section_rendering(args) -> None:
           al_paren2[:200])
 
     al_code = _al("碼 `http://x.com` 尾", "light")
-    check("行內碼裡的網址不變連結（backtick 優先序 190 > bare_url 85）",
+    check("行內碼裡的網址不變連結（<code> 整棵跳過）",
           '<code>http://x.com</code>' in al_code and '<a href' not in al_code,
           al_code[:200])
 
     # 程式碼圍欄裡的網址不變（與去掉 bare_url 的轉換器逐位元組相同）
     _al_code_doc = "```python\nhttp://in-code.com\n```\n"
     _al_ref = _doc_probe._build_converter("light")
-    _al_ref.inlinePatterns.deregister("bare_url")
+    _al_ref.treeprocessors.deregister("bare_url")
     _al_ref.reset()
     _al_with = _al(_al_code_doc, "light")
     _al_without = _al_ref.convert(_al_code_doc)
@@ -1237,7 +1301,7 @@ def section_rendering(args) -> None:
           al_link[:200])
 
     al_angle = _al("<https://example.com>", "light")
-    check("<https://..> 角括號連結不變（autolink 120 > bare_url 85）",
+    check("<https://..> 角括號連結不變（已在 <a> 裡，不再包一層）",
           al_angle.lower().count("<a ") == 1
           and 'href="https://example.com"' in al_angle,
           al_angle[:200])
@@ -1257,15 +1321,17 @@ def section_rendering(args) -> None:
           al_br[:300])
 
     al_span = _al('raw <span data-url="http://x.com">t</span> 後', "light")
-    check("HTML 屬性裡的網址不變（html 90 > bare_url 85）",
+    check("HTML 屬性裡的網址不變（原始 HTML 進了 htmlStash，樹裡只剩佔位符）",
           '<a href="http://x.com"' not in al_span,
           al_span[:200])
 
-    al_star = _al("見 https://x/a*b*c 完", "light")
-    check("URL 路徑內星號不被當強調（bare_url 85 > em_strong 60）",
-          '<a href="https://x/a*b*c">https://x/a*b*c</a>' in al_star
-          and "<em>" not in al_star,
-          al_star[:200])
+    # 第一版（inline 圖樣）連路徑裡的 *e* 都能護住；改成樹走訪後 inline 先跑完，
+    # 星號已經變成強調，只保證底線（真實網址裡常見的那個）不被拆。
+    al_under = _al("見 https://x/a_b_c/d_e 完", "light")
+    check("URL 路徑內的底線不被當強調（整段網址進同一個 <a>）",
+          '<a href="https://x/a_b_c/d_e">https://x/a_b_c/d_e</a>' in al_under
+          and "<em>" not in al_under,
+          al_under[:200])
 
     al_raw_a = _al('raw <a href="http://short">https://long.example/x</a> end', "light")
     check("原始 HTML <a> 內的網址不被二次包（全文恰一個 <a）",
@@ -1296,7 +1362,7 @@ def section_rendering(args) -> None:
         _al_big_src = fh.read()
     _al_conv_with = _doc_probe._build_converter("light")
     _al_conv_without = _doc_probe._build_converter("light")
-    _al_conv_without.inlinePatterns.deregister("bare_url")
+    _al_conv_without.treeprocessors.deregister("bare_url")
     _al_times_w, _al_times_wo = [], []
     for _ in range(3):
         _al_conv_with.reset()
@@ -1325,7 +1391,7 @@ def section_rendering(args) -> None:
 
     viewer.close()
     pump(300)
-    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    _settings_handle().clear()
 
 
 # ===========================================================================
@@ -1403,7 +1469,7 @@ def section_render_cache(args) -> None:
           document.markdown_to_html(doc_a, "dark") == dark_html)
 
     # --- HTML 快取 ---
-    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    _settings_handle().clear()
     target = _write_big_doc(tempfile.mkdtemp(prefix="mdbig-"), "cache_big.md")
     viewer = MarkdownViewer(target)
     viewer.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
@@ -1715,7 +1781,7 @@ def section_render_cache(args) -> None:
           f"含程式碼={document.theme_sensitive(coded_light)}，"
           f"無程式碼={document.theme_sensitive(plain_light)}")
 
-    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    _settings_handle().clear()
 
 
 # ===========================================================================
@@ -1821,7 +1887,7 @@ def section_language(args) -> None:
 
     other = next(code for code in codes if code != base_code)
 
-    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    _settings_handle().clear()
     tmp = tempfile.mkdtemp()
     doc = os.path.join(tmp, "lang.md")
     with open(doc, "w", encoding="utf-8") as handle:
@@ -1899,8 +1965,8 @@ def section_language(args) -> None:
     pump(300)
 
     # 建構期就要是對的語言：驗 set_current 發生在 _build_ui 之前
-    QSettings(config.ORG_NAME, config.APP_NAME).clear()
-    handle = QSettings(config.ORG_NAME, config.APP_NAME)
+    _settings_handle().clear()
+    handle = _settings_handle()
     handle.setValue(config.KEY_LANGUAGE_MODE, other)
     handle.sync()
     fresh = MarkdownViewer(None)
@@ -1920,7 +1986,7 @@ def section_language(args) -> None:
     pump(300)
 
     # 廣播：一個視窗改語言，其他視窗跟著換
-    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    _settings_handle().clear()
     manager = WindowManager()
     first = manager.create_window(doc)
     first.resize(900, 640)
@@ -1950,7 +2016,7 @@ def section_language(args) -> None:
         window.close()
     pump(400)
     language.set_current(base_code)
-    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    _settings_handle().clear()
 
 
 # ===========================================================================
@@ -1979,7 +2045,7 @@ def section_tabs(args) -> None:
     from app.language import t
     from app.viewer import MarkdownViewer
 
-    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    _settings_handle().clear()
     viewer = MarkdownViewer(SAMPLE)
     viewer.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
     viewer.resize(1100, 780)
@@ -2360,7 +2426,7 @@ def section_tabs(args) -> None:
     # 貼上的分頁沒有路徑，工作階段本來就只存有路徑的分頁
     v3.set_restore_tabs(True)
     v3._save_session()
-    saved_paths = QSettings(config.ORG_NAME, config.APP_NAME).value(
+    saved_paths = _settings_handle().value(
         config.KEY_OPEN_TABS, [], type=list)
     check("貼上的分頁不會被寫進工作階段（重開不還原）",
           all(p for p in saved_paths) and len(saved_paths) < v3.tab_count(),
@@ -2583,15 +2649,15 @@ def section_tabs(args) -> None:
         reply["path"] = saved_three
         vq.close()
         pump(300)
-        session_paths = [os.path.abspath(p) for p in QSettings(
-            config.ORG_NAME, config.APP_NAME).value(config.KEY_OPEN_TABS, [], type=list)]
+        session_paths = [os.path.abspath(p) for p in
+                         _settings_handle().value(config.KEY_OPEN_TABS, [], type=list)]
         check("關視窗時把貼上分頁存成檔案：視窗關閉、新檔案的路徑進工作階段（下次會還原）",
               not vq.isVisible() and os.path.isfile(saved_three)
               and os.path.abspath(saved_three) in session_paths
               and os.path.abspath(saved_two) in session_paths,
               f"visible={vq.isVisible()} 工作階段={session_paths}")
         # 還原設定，別讓後面建的視窗把這幾個檔案還原回來
-        _qs = QSettings(config.ORG_NAME, config.APP_NAME)
+        _qs = _settings_handle()
         _qs.setValue(config.KEY_RESTORE_TABS, False)
         _qs.remove(config.KEY_OPEN_TABS)
         _qs.remove(config.KEY_ACTIVE_TAB)
@@ -2932,7 +2998,7 @@ def section_tabs(args) -> None:
     pump(400)
     for folder in (batch_dir, drop_dir):
         shutil.rmtree(folder, ignore_errors=True)
-    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    _settings_handle().clear()
 
 
 # ===========================================================================
@@ -2954,7 +3020,7 @@ def section_session(args) -> None:
     from app.viewer import MarkdownViewer
 
     def settings():
-        return QSettings(config.ORG_NAME, config.APP_NAME)
+        return _settings_handle()
 
     settings().clear()
     tmp = tempfile.mkdtemp()
@@ -3174,7 +3240,7 @@ def section_window(args) -> None:
 
     from app.viewer import _CURSOR_BY_EDGES, MarkdownViewer
 
-    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    _settings_handle().clear()
     viewer = MarkdownViewer(README)
     viewer.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
     viewer.resize(1100, 800)
@@ -3337,7 +3403,7 @@ def section_window(args) -> None:
         window.close()
     pump(400)
 
-    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    _settings_handle().clear()
 
 
 # ===========================================================================
@@ -3398,9 +3464,24 @@ def section_single_instance(args) -> None:
 
     session = ctypes.c_ulong(0)
     ctypes.windll.kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(session))
+    # 測試本身用 MDREADER_PIPE_NAME 覆寫了名稱（見模組頂部的隔離說明），預設算法
+    # 要在沒有那個變數的乾淨子行程裡看
+    clean_env = {k: v for k, v in os.environ.items() if k != "MDREADER_PIPE_NAME"}
+    default_name = subprocess.run(
+        [sys.executable, "-c", "import sys; sys.path.insert(0, sys.argv[1]); "
+         "from app import config; print(config.IPC_SERVER_NAME)", PROJECT_ROOT],
+        capture_output=True, text=True, encoding="utf-8", env=clean_env, timeout=60,
+    ).stdout.strip()
     check("管道名稱帶登入工作階段編號（兩個使用者同時登入不再互搶；以前註解說有、其實沒有）",
-          config.IPC_SERVER_NAME == f"{config.IPC_SERVER_BASE}.{session.value}",
+          default_name == f"{config.IPC_SERVER_BASE}.{session.value}",
+          default_name)
+    check("MDREADER_PIPE_NAME 環境變數會整個換掉管道名稱（測試隔離靠它，轉交器讀同一個變數）",
+          config.IPC_SERVER_NAME == os.environ.get("MDREADER_PIPE_NAME")
+          and config.IPC_SERVER_NAME.startswith("MarkdownReaderSmokeTest."),
           config.IPC_SERVER_NAME)
+    launcher_src_text = open(launcher_src, encoding="utf-8").read() if os.path.isfile(launcher_src) else ""
+    check("C++ 轉交器也讀 MDREADER_PIPE_NAME（兩邊要同時被覆寫，測試的轉交才不會送進使用者的視窗）",
+          'GetEnvironmentVariableW(L"MDREADER_PIPE_NAME"' in launcher_src_text)
 
     # --- build.ps1 不能被 stderr 中斷 ---
     # 為什麼這條在「單一實例」這一節：轉交器只有 build.ps1 的第 5 步會產出並
@@ -3724,8 +3805,8 @@ def section_single_instance(args) -> None:
         _k32.OpenProcess.restype = _ct.c_void_p
         _ntdll = _ct.windll.ntdll
         py313 = sys.executable
-        subprocess.run(["taskkill", "/F", "/IM", "MarkdownReader.exe"],
-                       capture_output=True, check=False)
+        # 不 taskkill /IM：那會連使用者正在用的閱讀器一起砍。專屬管道名稱下不會
+        # 有殘留佔著，本體只認測試這個行程開的那一個。
         app_proc = subprocess.Popen(
             [py313, "main.py", SAMPLE],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -3792,8 +3873,6 @@ def section_single_instance(args) -> None:
                 app_proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 app_proc.kill()
-        subprocess.run(["taskkill", "/F", "/IM", "MarkdownReader.exe"],
-                       capture_output=True, check=False)
 
 
 # ===========================================================================
@@ -3888,7 +3967,7 @@ def section_tab_dnd(args) -> None:
     from app import styles as _styles
     from app.window_manager import WindowManager
 
-    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    _settings_handle().clear()
     tmp = _tempfile.mkdtemp()
     docs = []
     for i in range(3):
@@ -4184,7 +4263,7 @@ def section_tab_dnd(args) -> None:
     others = [w for w in manager.windows() if w is not viewer]
     if not others:
         check("拆分失敗，後續合併測試跳過", False)
-        QSettings(config.ORG_NAME, config.APP_NAME).clear()
+        _settings_handle().clear()
         return
     new_window = others[0]
     check("拆分：新視窗只有拆出去的那個分頁", names(new_window) == ["d1.md"], str(names(new_window)))
@@ -4314,7 +4393,7 @@ def section_tab_dnd(args) -> None:
     # 對抗式審查抓出的回歸（每一項都真的發生過）
     # =====================================================================
     def settings():
-        return QSettings(config.ORG_NAME, config.APP_NAME)
+        return _settings_handle()
 
     settings().clear()
     settings().setValue(config.KEY_RESTORE_TABS, True)
@@ -4410,7 +4489,7 @@ def section_tab_dnd(args) -> None:
             QPointF(end), Qt.MouseButton.LeftButton,
             Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier))
 
-    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    _settings_handle().clear()
     manager3 = WindowManager()
     solo = manager3.create_window(docs[0])
     solo.move(80, 80)
@@ -4426,7 +4505,7 @@ def section_tab_dnd(args) -> None:
     # 建 neighbor 前再清一次工作階段：前段那些延遲關閉的視窗會在上面的
     # pump 期間把 session 寫回登錄檔，neighbor 建構時吃到還原分頁的話，
     # 這條會以「tabs=4」的樣子偽紅（實測 11 輪出現過 1 次）。
-    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    _settings_handle().clear()
     neighbor = manager3.create_window(docs[1])
     pump(400)
     neighbor.move(solo.frameGeometry().right() + 20, 80)
@@ -4541,7 +4620,7 @@ def section_tab_dnd(args) -> None:
             Qt.KeyboardModifier.NoModifier))
         app.processEvents()
 
-    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    _settings_handle().clear()
     manager4 = WindowManager()
     host = manager4.create_window(docs[0])
     host.move(120, 120)
@@ -5087,7 +5166,7 @@ def section_tab_dnd(args) -> None:
     for w in manager4.windows():
         w.close()
     pump(400)
-    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    _settings_handle().clear()
 
 
 # ===========================================================================
@@ -5484,7 +5563,7 @@ def section_mermaid(args) -> None:
     check("對外介面：查無此鍵回傳 None", mermaid.render("no-such-key", "light", 900, font, 1.0) is None)
 
     # --- 與閱讀器整合 ---------------------------------------------------------
-    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    _settings_handle().clear()
     tmp = tempfile.mkdtemp()
     doc_path = os.path.join(tmp, "mermaid.md")
     with open(doc_path, "w", encoding="utf-8") as handle:
@@ -5617,7 +5696,7 @@ def section_mermaid(args) -> None:
     pump(300)
     viewer.close()
     pump(300)
-    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    _settings_handle().clear()
 
     # --- 搜尋找得到圖表裡的字（只重畫螢幕看得到的）---------------------------
     from app import styles as _styles
@@ -5682,7 +5761,7 @@ def section_mermaid(args) -> None:
           mermaid.scene_for(hl_key, font) is mermaid.scene_for(hl_key, font))
 
     # 整合：20 張圖的文件，只有一兩張看得到
-    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    _settings_handle().clear()
     many = os.path.join(tmp, "diagram_search.md")
     with open(many, "w", encoding="utf-8") as handle:
         for i in range(20):
@@ -5821,7 +5900,7 @@ def section_mermaid(args) -> None:
         mermaid.render = real_render
         dsv.close()
         pump(300)
-    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    _settings_handle().clear()
 
     # --- 完整計數：序號的順序、以及捲到圖裡那一筆 ---------------------------
     # 序列圖的參與者標籤上下各畫一排，兩排都會被標色，所以兩排各算一筆；
@@ -5877,7 +5956,7 @@ def section_mermaid(args) -> None:
           f"畫在 {drawn} vs 說在 {[round(h.y, 1) for h in seq_hits]}")
 
     # 捲到圖裡那一筆：用一張遠比視窗高的圖
-    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    _settings_handle().clear()
     tall = os.path.join(tmp, "tall_diagram.md")
     with open(tall, "w", encoding="utf-8") as handle:
         handle.write("# 長圖\n\n```mermaid\ngraph TD\n")
@@ -5938,7 +6017,7 @@ def section_mermaid(args) -> None:
           str([row[2] for row in offsets]))
     tallv.close()
     pump(300)
-    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    _settings_handle().clear()
 
     mermaid.clear_caches()
 
@@ -6142,7 +6221,7 @@ def section_tab_shortcuts(args) -> None:
         QMessageBox.question = _real_question
         QFileDialog.getSaveFileName = _real_get_save
         shutil.rmtree(work, ignore_errors=True)
-        QSettings(config.ORG_NAME, config.APP_NAME).clear()
+        _settings_handle().clear()
 
 
 def section_watch(args) -> None:
@@ -6178,7 +6257,7 @@ def section_watch(args) -> None:
             handle.write(text)
 
     NL = "\n"
-    QSettings(config.ORG_NAME, config.APP_NAME).clear()
+    _settings_handle().clear()
     work = tempfile.mkdtemp(prefix="mdwatch-")
     main_path = os.path.join(work, "a.md")
     side_path = os.path.join(work, "b.md")
@@ -6332,7 +6411,7 @@ def section_watch(args) -> None:
         v = None
 
         # 純還原啟動：分頁集合第一次成形的地方以前沒呼 _watch_files
-        settings = QSettings(config.ORG_NAME, config.APP_NAME)
+        settings = _settings_handle()
         settings.setValue(config.KEY_RESTORE_TABS, True)
         settings.setValue(config.KEY_OPEN_TABS, [main_path, side_path])
         settings.setValue(config.KEY_ACTIVE_TAB, 0)
@@ -6352,7 +6431,7 @@ def section_watch(args) -> None:
             v.close()
             pump(100)
         shutil.rmtree(work, ignore_errors=True)
-        QSettings(config.ORG_NAME, config.APP_NAME).clear()
+        _settings_handle().clear()
 
 
 def section_portable(args) -> None:
@@ -6393,8 +6472,10 @@ def section_portable(args) -> None:
     check("三個 QSettings 建構點（main.py、viewer.py、benchmark_startup.py）都走 resources.make_settings()",
           not bad_sites, str(bad_sites))
     direct = []
+    # 要找的字面拆開拼，免得測試檔自己也被「把直接建構換成工廠」的全域取代改到
+    direct_literal = "QSettings(" + "config.ORG_NAME, config.APP_NAME)"
     for path in glob.glob(os.path.join(PROJECT_ROOT, "app", "*.py")) + list(sites.values()):
-        if "QSettings(config.ORG_NAME, config.APP_NAME)" in open(path, encoding="utf-8").read():
+        if direct_literal in open(path, encoding="utf-8").read():
             direct.append(os.path.relpath(path, PROJECT_ROOT).replace("\\", "/"))
     check("直接建構 QSettings(ORG_NAME, APP_NAME) 的只剩 app/resources.py（可攜判定一處決定，別處繞不過）",
           direct == ["app/resources.py"], str(direct))
@@ -6471,14 +6552,16 @@ def section_portable(args) -> None:
         importlib.reload(resources)
 
     # --- 子行程：真的主視窗在可攜模式下跑一遍 -----------------------------
-    real = QSettings(config.ORG_NAME, config.APP_NAME)
-    real.clear()
-    real.sync()
+    # 真登錄檔是使用者的設定，不清它：winreg 直讀前後快照，事後比對沒有任何值被動。
+    # 視窗尺寸帶 PID：繞過工廠的實作會把幾何寫進真登錄檔，尺寸每次不同才保證寫進去的
+    # 值和既有的不一樣、比對得出來（同樣的 offscreen 視窗寫兩次，第二次看不出差異）。
+    real_registry_before = _registry_snapshot()   # winreg 直讀，見 _registry_snapshot 的說明
     child_root = tempfile.mkdtemp(prefix="mdport-child-")
     body = '''
         from app import resources
         v = MarkdownViewer(SAMPLE)
         v.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        v.resize(640 + os.getpid() % 97, 480 + os.getpid() % 89)
         v.show(); pump(400)
         print("ROOT", resources.portable_root())
         QTimer.singleShot(300, v.close)
@@ -6489,12 +6572,14 @@ def section_portable(args) -> None:
     got = child_values(out)
     ini_path = os.path.join(child_root, "data", "settings.ini")
     ini_text = open(ini_path, encoding="utf-8").read() if os.path.isfile(ini_path) else ""
-    real_keys = QSettings(config.ORG_NAME, config.APP_NAME).allKeys()
-    check("子行程帶 MDREADER_PORTABLE_ROOT 開真的主視窗再關掉：幾何寫進 <根>\\data\\settings.ini，登錄檔一個鍵都沒多",
+    real_registry_after = _registry_snapshot()
+    real_changed = sorted(k for k in set(real_registry_before) | set(real_registry_after)
+                          if real_registry_before.get(k) != real_registry_after.get(k))
+    check("子行程帶 MDREADER_PORTABLE_ROOT 開真的主視窗再關掉：幾何寫進 <根>\\data\\settings.ini，真登錄檔一個值都沒動（winreg 直讀，不經 Qt 的快取）",
           code == 0 and got.get("CLOSED") == "1"
           and os.path.normcase(got.get("ROOT", "")) == os.path.normcase(os.path.abspath(child_root))
-          and "geometry" in ini_text and not real_keys,
-          f"code={code} ini={'有' if ini_text else '無'} 登錄鍵={list(real_keys)[:3]} {err[-200:] if code else ''}")
+          and "geometry" in ini_text and not real_changed,
+          f"code={code} ini={'有' if ini_text else '無'} 真登錄檔被改的鍵={real_changed[:3]} {err[-200:] if code else ''}")
 
     # --- import 期是葉節點（乾淨的直譯器，不帶 QApplication 的標頭）------------
     leaf = subprocess.run(
@@ -6714,40 +6799,12 @@ def _run_sections_in_process(selected, args) -> int:
     return 1 if _FAIL else 0
 
 
-def _running_instance() -> bool:
-    """還有別的閱讀器實例活著嗎？
-
-    為什麼要擋：測試會直接讀寫真正的 QSettings（`HKCU\\Software\\SamHo\\
-    MarkdownReader`），也會佔用單一實例的具名管道。另一個實例同時在跑時，
-    兩邊會互相清設定——症狀是一整片「讀出來是 None」的失敗，看起來像功能壞了，
-    其實只是環境髒了。更糟的是實測會偶發 0xC0000005：乾淨的機器上單跑
-    分頁拖曳區塊 30 次沒有一次崩潰，故意留一個實例在跑則 6 次崩 1 次。
-
-    孤兒是自我延續的：區塊崩潰時它 spawn 的子行程會活下來，繼續污染後面每一輪。
-    所以這道檢查放在最前面，寧可不跑也不要產出一份看不懂的失敗清單。
-    """
-    from PyQt6.QtCore import QCoreApplication
-    from PyQt6.QtNetwork import QLocalSocket
-
-    if QCoreApplication.instance() is None:
-        QCoreApplication([])
-    probe = QLocalSocket()
-    probe.connectToServer(config.IPC_SERVER_NAME)
-    alive = probe.waitForConnected(300)
-    probe.abort()
-    return alive
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description="Markdown 閱讀器功能回歸測試")
     parser.add_argument("--only", default="", help="只跑名稱含這個字串的區塊")
     parser.add_argument("--list", action="store_true", help="列出所有區塊後結束")
     parser.add_argument("--runs", type=int, default=12,
                         help="穩定度測試的重複次數（預設 12）")
-    parser.add_argument(
-        "--ignore-running-instance", action="store_true",
-        help="即使偵測到別的實例在跑也照跑（結果不可信，只在確定無妨時用）",
-    )
     parser.add_argument(
         "--onscreen", action="store_true",
         help="在真實螢幕上開視窗跑（預設走 offscreen 虛擬螢幕，不佔畫面；"
@@ -6758,30 +6815,24 @@ def main() -> int:
     if not args.onscreen:
         _enter_offscreen()
 
-    if not args.ignore_running_instance and _running_instance():
-        print("偵測到另一個 Markdown 閱讀器實例正在執行。")
-        print("測試會讀寫真正的 QSettings 並佔用單一實例的管道，兩邊會打架：")
-        print("  * 一整片「設定讀出來是 None」的失敗")
-        print("  * 偶發 0xC0000005（乾淨機器 30 次不崩，留一個實例 6 次崩 1 次）")
-        print("請先關掉它再跑；崩潰留下的孤兒用這行清：")
-        print('  powershell -Command "Get-CimInstance Win32_Process -Filter '
-              "\"Name='python.exe' OR Name='py.exe'\" | Where-Object "
-              "{ $_.CommandLine -like '*probe*' } | ForEach-Object "
-              '{ Stop-Process -Id $_.ProcessId -Force }"')
-        print("確定無妨的話加 --ignore-running-instance 跳過這道檢查。")
-        return 2
-
     if args.list:
         for name, _ in SECTIONS:
             print(f"  {name}")
         return 0
+
+    # 隔離的證明：整趟跑完，真正的登錄檔（使用者的設定）要和開跑前完全一樣。
+    # 這一條在總結行之後印，紅了代表有測試繞過工廠直接寫了登錄檔。
+    # 一定要在 _enter_offscreen 之後：快照會建 application 物件，先建就搶掉了
+    # offscreen 那顆的位置（Qt 一個行程只能有一個）。
+    _registry_before = _registry_snapshot()
 
     if args.only:
         selected = [(n, f) for n, f in SECTIONS if args.only in n]
         if not selected:
             print(f"沒有符合「{args.only}」的區塊")
             return 1
-        return _run_sections_in_process(selected, args)
+        code = _run_sections_in_process(selected, args)
+        return _assert_registry_untouched(_registry_before) or code
 
     # 【完整跑：每個區塊各開一個子行程】
     # 同一個行程連跑多個區塊時，前面區塊大量建毀視窗（WA_DeleteOnClose、
@@ -6828,7 +6879,8 @@ def main() -> int:
     if total_skip:
         print(f"（另有 {total_skip} 項僅實機，offscreen 模式跳過；"
               f"加 --onscreen 在真螢幕上驗）")
-    return 1 if failed_sections else 0
+    code = 1 if failed_sections else 0
+    return _assert_registry_untouched(_registry_before) or code
 
 
 if __name__ == "__main__":

@@ -25,9 +25,8 @@ import html
 import re
 import xml.etree.ElementTree as ET
 
-from markdown import util
 from markdown.extensions import Extension
-from markdown.inlinepatterns import InlineProcessor, SimpleTagInlineProcessor
+from markdown.inlinepatterns import SimpleTagInlineProcessor
 from markdown.preprocessors import Preprocessor
 from markdown.treeprocessors import Treeprocessor
 
@@ -61,10 +60,9 @@ _AUTOLINK_TRIGGER = re.compile(
 _AUTOLINK_DOMAIN = re.compile(r"^[\w\-]+(?:\.[\w\-]+)+", re.UNICODE)
 # 結尾標點集合（GFM + 全形中文標點）；`* _ ~` 讓強調語法不被吃進 href
 _AUTOLINK_TRAIL = frozenset(".,:;!?*_~。，、；：！？」』》〉")
-# InlineProcessor 佔位符 \x02klzzwxh:NNNN\x03，其節點若為字串則再解 htmlStash
-_KLZZ_RE = re.compile(r"\x02klzzwxh:(\d+)\x03")
-# stashed_nodes 的值格式為 'wzxhzdk:N'（不帶 STX/ETX 分隔符）
-_WZXH_RE = re.compile(r"wzxhzdk:(\d+)")
+# htmlStash 佔位符 \x02wzxhzdk:N\x03：inline 結束後樹裡的原始 HTML 只剩這個，
+# 走訪時拿 N 去 htmlStash 查原文，數 <a 與 </a> 的差追蹤「還在不在原始 <a> 裡」
+_WZXH_RE = re.compile(r"\x02wzxhzdk:(\d+)\x03")
 _A_OPEN_RE = re.compile(r"<a\b", re.IGNORECASE)
 _A_CLOSE_RE = re.compile(r"</a\b", re.IGNORECASE)
 
@@ -387,108 +385,162 @@ class QtRichTextTreeprocessor(Treeprocessor):
                 heading.insert(0, anchor)
 
 
-class BareUrlInlineProcessor(InlineProcessor):
-    """把裸網址（http/https/www.）與電子郵件轉成 <a href>。
+class BareUrlTreeprocessor(Treeprocessor):
+    """把裸網址（http/https/www.）與電子郵件轉成 <a href>——一趟樹走訪，不進 inline 引擎。
 
-    優先序 85：
-      低於 backtick(190)、link(160)、autolink(120)、automail(110)、html(90)
-      高於 em_strong(60)、em_strong2(50)
-    這樣程式碼、既有連結、角括號連結、行內 HTML 都先收走節點，
-    我們才不會誤動它們；同時我們先把 URL 收成 AtomicString，
-    路徑裡的 * 才不會被 em_strong 後處理成強調標籤。
+    第一版是 InlineProcessor。功能對，但成本錯：Python-Markdown 的 inline 引擎對
+    每個文字節點都要把每個已註冊的圖樣各跑一輪，多一個圖樣＝每個節點多一輪函式
+    呼叫與正則搜尋，散文輪廓量到轉換整體 +14%、表格 +14%——正則本身只佔其中的
+    四分之一，其餘是引擎的逐圖樣固定開銷。改成 Treeprocessor 在 inline（20）之後、
+    prettify（10）之前跑一次：整棵樹只走一趟，每個文字節點只搜一次。
 
-    不碰程式碼區塊與 Mermaid：fenced code 在前處理階段就進了 htmlStash，
-    樹裡只剩佔位符，inline 階段完全看不到其內容（結構性保證）。
+    排除規則改用樹結構判斷，比優先序更直白：
+      * 祖先有 <a>（Markdown 連結、角括號連結、郵件連結）→ 不進去。
+      * <code>／<pre>（行內碼、縮排程式碼）→ 不進去。圍欄程式碼與 Mermaid 在前處理
+        階段就進了 htmlStash，樹裡只剩佔位符文字，本來就看不到內容。
+      * 原始 HTML 的 <a href="…">…</a>：inline 階段把兩個標籤各自收進 htmlStash，
+        文字節點裡只剩 \x02wzxhzdk:N\x03 佔位符，中間的網址仍是純文字。走訪時
+        依文件順序遇到佔位符就去 htmlStash 數 <a 與 </a> 的差，開多於關代表還在
+        連結裡，不包。深度在每個區塊元素進入時歸零（和第一版「只看同一段」一致）。
+    網址掃描與收尾規則（結尾標點、括號配對、www. 補 http://、郵件加 mailto:）
+    與第一版相同，集中在 _scan_autolinks。
     """
 
-    ANCESTOR_EXCLUDES = ("a",)  # 不在 Markdown 語法產生的 <a> 裡再包一層
+    # 進到這些元素就整棵跳過
+    SKIP_TAGS = frozenset({"a", "code", "pre", "kbd", "samp", "script", "style", "textarea"})
+    # 進到這些元素時原始 HTML <a> 的深度歸零：第一版只在同一段 inline 文字裡數
+    BLOCK_TAGS = frozenset({
+        "p", "li", "td", "th", "dd", "dt", "h1", "h2", "h3", "h4", "h5", "h6",
+        "blockquote", "div", "summary", "figcaption", "caption",
+    })
 
-    def __init__(self, md):
-        super().__init__(_AUTOLINK_TRIGGER.pattern, md)
-        self.compiled_re = _AUTOLINK_TRIGGER  # 覆寫以帶入 IGNORECASE 旗標
+    def run(self, root: ET.Element) -> ET.Element | None:
+        self._walk(root, {"depth": 0})
+        return None
 
-    def handleMatch(self, m, data):  # noqa: N802
-        start = m.start()
+    # -- 走訪 -----------------------------------------------------------------
+    def _walk(self, el: ET.Element, state: dict) -> None:
+        if el.tag in self.SKIP_TAGS:
+            return
+        if el.tag in self.BLOCK_TAGS:
+            state["depth"] = 0
+        # el.text：新元素插在最前面。剛插進去的 <a> 不再走進去——它的文字就是
+        # 網址，再走一次就會再包一層，直到遞迴上限（不能靠 SKIP_TAGS 有 "a" 才停）。
+        index = 0
+        if el.text:
+            pieces = self._split(el.text, state)
+            if pieces is not None:
+                el.text = pieces[0]
+                for offset, node in enumerate(pieces[1]):
+                    el.insert(offset, node)
+                index = len(pieces[1])
+        # 子元素：先遞迴進去，再處理它的 tail（新元素插在它後面，同樣跳過）
+        while index < len(el):
+            child = el[index]
+            self._walk(child, state)
+            if child.tail:
+                pieces = self._split(child.tail, state)
+                if pieces is not None:
+                    child.tail = pieces[0]
+                    for offset, node in enumerate(pieces[1], start=1):
+                        el.insert(index + offset, node)
+                    index += len(pieces[1])
+            index += 1
 
-        # 偵測原始 HTML <a>（ANCESTOR_EXCLUDES 只擋 Markdown 語法連結）。
-        # 內文裡的行內 InlineProcessor 佔位符格式為 \x02klzzwxh:NNNN\x03；
-        # 當節點是 str（形如 \x02wzxhzdk:N\x03）時，該字串指向 htmlStash 的一筆原始
-        # HTML 標籤。逐一取出並統計 <a 與 </a> 的數量差，開多於關即在 <a> 內。
-        # stashed_nodes 鍵為字串（如 '0000'），值為 'wzxhzdk:N'（不帶分隔符）
-        try:
-            stashed = self.md.treeprocessors["inline"].stashed_nodes
-        except (KeyError, AttributeError):
-            stashed = {}
-        anchor_depth = 0
-        for km in _KLZZ_RE.finditer(data[:start]):
-            node = stashed.get(km.group(1))
-            if not isinstance(node, str):
+    def _split(self, text: str, state: dict):
+        """把一段文字裡的網址切成 <a> 元素。
+
+        回傳 (剩下的前置文字, [新元素…])；沒有任何網址就回 None，呼叫端不必動樹。
+        佔位符與網址依文件順序一起掃，深度才會正確。
+        """
+        if not ("http" in text or "www." in text or "@" in text or "\x02" in text):
+            # 大多數文字節點三個字面都沒有，連正則都不必跑；佔位符要看是為了追深度
+            return None
+        stash = self.md.htmlStash.rawHtmlBlocks
+        nodes: list[ET.Element] = []
+        head = ""
+        pos = 0
+        cursor = 0  # 已經處理到的位置（佔位符深度也照這個順序推進）
+        for match in _AUTOLINK_TRIGGER.finditer(text):
+            start = match.start()
+            if start < pos:
+                continue  # 落在上一個已收下的網址裡
+            # 推進到 start 之前的佔位符，更新原始 HTML <a> 深度
+            for placeholder in _WZXH_RE.finditer(text, cursor, start):
+                raw = stash[int(placeholder.group(1))]
+                state["depth"] += len(_A_OPEN_RE.findall(raw)) - len(_A_CLOSE_RE.findall(raw))
+            cursor = start
+            if state["depth"] > 0:
                 continue
-            wm = _WZXH_RE.search(node)
-            if wm is None:
+            found = _scan_autolink(text, match)
+            if found is None:
                 continue
-            raw = self.md.htmlStash.rawHtmlBlocks[int(wm.group(1))]
-            anchor_depth += len(_A_OPEN_RE.findall(raw)) - len(_A_CLOSE_RE.findall(raw))
-        if anchor_depth > 0:
-            return None, None, None
+            end, href, label = found
+            segment = text[pos:start]
+            if nodes:
+                nodes[-1].tail = segment
+            else:
+                head = segment
+            anchor = ET.Element("a")
+            anchor.set("href", href)
+            anchor.text = label
+            nodes.append(anchor)
+            pos = end
+            cursor = end
+        # 剩下的佔位符也要算進深度，後面的 tail 才會接對
+        for placeholder in _WZXH_RE.finditer(text, cursor):
+            raw = stash[int(placeholder.group(1))]
+            state["depth"] += len(_A_OPEN_RE.findall(raw)) - len(_A_CLOSE_RE.findall(raw))
+        if not nodes:
+            return None
+        nodes[-1].tail = text[pos:]
+        return head, nodes
 
-        # ── 郵件地址 ────────────────────────────────────────────────────────
-        if m.group("email"):
-            email = m.group("email")
-            el = ET.Element("a")
-            el.set("href", "mailto:" + email)
-            el.text = util.AtomicString(email)
-            return el, m.start("email"), m.end("email")
 
-        # ── 消費到空白 / < / 控制字元（STX/ETX 佔位符界）為止 ───────────────
-        n = len(data)
-        end = start
-        while end < n:
-            ch = data[end]
-            if ch.isspace() or ch == "<" or ch < " ":
-                break
-            end += 1
-        candidate = data[start:end]
-
-        # ── www. 分支：驗網域結構 ────────────────────────────────────────────
-        if m.group("www"):
-            rest = candidate[4:]  # 去掉 "www."
-            if not _AUTOLINK_DOMAIN.match("www." + rest):
-                return None, None, None
-        else:
-            # http(s):// 分支：scheme 後必須至少有一個有效字元
-            rest = candidate[len(m.group("url")):]
-            if not rest or not (rest[0].isalnum() or rest[0] == "_"):
-                return None, None, None
-
-        url = self._trim(candidate)
-        if not url:
-            return None, None, None
-
-        href = ("http://" + url) if m.group("www") else url
-        el = ET.Element("a")
-        el.set("href", href)
-        el.text = util.AtomicString(url)
-        # 尾標點留在 data[start+len(url):]，交回文字流
-        return el, start, start + len(url)
-
-    @staticmethod
-    def _trim(url: str) -> str:
-        """逐字剝結尾標點與不配對的右括號（GFM 規則）。"""
-        while url:
-            last = url[-1]
-            if last in _AUTOLINK_TRAIL:
-                url = url[:-1]
-                continue
-            if last == ")" and url.count(")") > url.count("("):
-                url = url[:-1]
-                continue
-            # 全形右括號配對
-            if last == "）" and url.count("）") > url.count("（"):
-                url = url[:-1]
-                continue
+def _scan_autolink(text: str, match) -> tuple[int, str, str] | None:
+    """從觸發點往後收出一個網址／郵件。回傳 (結束位置, href, 顯示文字)，不成立回 None。"""
+    start = match.start()
+    if match.group("email"):
+        email = match.group("email")
+        return match.end("email"), "mailto:" + email, email
+    # 消費到空白、< 或控制字元（佔位符的 STX/ETX 界）為止
+    n = len(text)
+    end = start
+    while end < n:
+        ch = text[end]
+        if ch.isspace() or ch == "<" or ch < " ":
             break
-        return url
+        end += 1
+    candidate = text[start:end]
+    if match.group("www"):
+        if not _AUTOLINK_DOMAIN.match(candidate):
+            return None
+    else:
+        rest = candidate[len(match.group("url")):]
+        if not rest or not (rest[0].isalnum() or rest[0] == "_"):
+            return None
+    url = _trim_autolink(candidate)
+    if not url:
+        return None
+    href = ("http://" + url) if match.group("www") else url
+    return start + len(url), href, url
+
+
+def _trim_autolink(url: str) -> str:
+    """逐字剝結尾標點與不配對的右括號（GFM 規則）。"""
+    while url:
+        last = url[-1]
+        if last in _AUTOLINK_TRAIL:
+            url = url[:-1]
+            continue
+        if last == ")" and url.count(")") > url.count("("):
+            url = url[:-1]
+            continue
+        if last == "）" and url.count("）") > url.count("（"):
+            url = url[:-1]
+            continue
+        break
+    return url
 
 
 class QtRichTextExtension(Extension):
@@ -503,8 +555,8 @@ class QtRichTextExtension(Extension):
         md.inlinePatterns.register(
             SimpleTagInlineProcessor(r"()~~(.*?)~~", "del"), "strikethrough", 100
         )
-        # 裸網址 / www. / 郵件自動轉連結（優先序 85，說明見 BareUrlInlineProcessor）
-        md.inlinePatterns.register(BareUrlInlineProcessor(md), "bare_url", 85)
+        # 裸網址 / www. / 郵件自動轉連結：inline(20) 之後一趟樹走訪，說明見 BareUrlTreeprocessor
+        md.treeprocessors.register(BareUrlTreeprocessor(md), "bare_url", 15)
         # 要在 fenced_code(25) 之前看到圍欄，見 MermaidPreprocessor 的說明
         md.preprocessors.register(MermaidPreprocessor(md), "mermaid_fence", 27)
         md.treeprocessors.register(
