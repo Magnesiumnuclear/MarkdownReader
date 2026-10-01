@@ -151,4 +151,8 @@ README 只放「怎麼用」。設計決策與踩過的坑依主題分冊放在 
 
 ## 授權
 
-[MIT](LICENSE)。打包出來的 `.exe` 內含 PyQt6（GPL v3／商業雙授權），對外散布執行檔時須另外遵守 PyQt6 的授權條款。
+- **原始碼**：[MIT](LICENSE)。
+- **執行檔**（安裝檔、可攜版）：內含 [PyQt6](https://www.riverbankcomputing.com/software/pyqt/)（GPL v3），
+  因此打包後的執行檔整體依 [GPL v3](https://www.gnu.org/licenses/gpl-3.0.html) 散布；
+  對應的完整原始碼就是本 repo（每個 Release 對應同名 tag）。
+- 其他相依：Qt 6（LGPL v3）、Python-Markdown（BSD）、Pygments（BSD）。
