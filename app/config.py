@@ -132,6 +132,7 @@ KEY_FONT_SIZE = "view/fontPointSize"
 KEY_LINE_HEIGHT = "view/lineHeight"
 KEY_CONTENT_WIDTH = "view/contentWidth"
 KEY_ALWAYS_ON_TOP = "window/alwaysOnTop"
+KEY_EXCLUDE_FROM_CAPTURE = "window/excludeFromCapture"   # 錄影／截圖擷取不到視窗
 KEY_STATUS_VISIBLE = "view/statusBarVisible"
 KEY_AUTO_RELOAD = "behavior/autoReload"
 KEY_CONFIRM_LINKS = "behavior/confirmExternalLinks"

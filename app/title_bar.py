@@ -129,6 +129,7 @@ class CustomTitleBar(QWidget):
     settingsRequested = pyqtSignal()
     themeToggleRequested = pyqtSignal()
     pinToggled = pyqtSignal(bool)
+    captureToggled = pyqtSignal(bool)
     minimizeRequested = pyqtSignal()
     maximizeToggleRequested = pyqtSignal()
     closeRequested = pyqtSignal()
@@ -163,6 +164,11 @@ class CustomTitleBar(QWidget):
         self.pin_button = IconButton(
             "pin_off", "titleBar.pin", self, checked_icon="pin_on", size=tool_size
         )
+        # 錄影／截圖／螢幕分享擷取不到這個視窗（Windows 的 SetWindowDisplayAffinity）
+        self.capture_button = IconButton(
+            "capture_visible", "titleBar.capture", self,
+            checked_icon="capture_hidden", size=tool_size,
+        )
         self.minimize_button = IconButton("minimize", "titleBar.minimize", self)
         self.maximize_button = IconButton("maximize", "titleBar.maximize", self)
         self.close_button = IconButton("close", "titleBar.close", self, danger=True)
@@ -180,6 +186,7 @@ class CustomTitleBar(QWidget):
         layout.addWidget(self.settings_button)
         layout.addWidget(self.theme_button)
         layout.addWidget(self.pin_button)
+        layout.addWidget(self.capture_button)
         layout.addSpacing(6)
         layout.addWidget(self.minimize_button)
         layout.addWidget(self.maximize_button)
@@ -191,6 +198,7 @@ class CustomTitleBar(QWidget):
         self.settings_button.clicked.connect(self.settingsRequested)
         self.theme_button.clicked.connect(self.themeToggleRequested)
         self.pin_button.toggled.connect(self.pinToggled)
+        self.capture_button.toggled.connect(self.captureToggled)
         self.minimize_button.clicked.connect(self.minimizeRequested)
         self.maximize_button.clicked.connect(self.maximizeToggleRequested)
         self.close_button.clicked.connect(self.closeRequested)
@@ -205,6 +213,7 @@ class CustomTitleBar(QWidget):
             self.settings_button,
             self.theme_button,
             self.pin_button,
+            self.capture_button,
             self.minimize_button,
             self.maximize_button,
             self.close_button,
@@ -259,6 +268,14 @@ class CustomTitleBar(QWidget):
             self.pin_button.setChecked(pinned)
             self.pin_button.blockSignals(False)
             self.pin_button.refresh_icon()
+
+    def set_capture_excluded(self, excluded: bool) -> None:
+        """同步按鈕狀態但不送出 captureToggled（設定與廣播是 viewer 的事）。"""
+        if self.capture_button.isChecked() != excluded:
+            self.capture_button.blockSignals(True)
+            self.capture_button.setChecked(excluded)
+            self.capture_button.blockSignals(False)
+            self.capture_button.refresh_icon()
 
     def set_back_enabled(self, enabled: bool) -> None:
         self.back_button.setEnabled(enabled)

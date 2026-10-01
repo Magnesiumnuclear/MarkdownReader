@@ -21,6 +21,11 @@ _SWP_NOMOVE = 0x0002
 _SWP_NOSIZE = 0x0001
 _SWP_NOACTIVATE = 0x0010
 
+# SetWindowDisplayAffinity 用的常數
+WDA_NONE = 0x00
+WDA_MONITOR = 0x01               # 舊版 Windows 的退路：擷取畫面裡變成一塊黑
+WDA_EXCLUDEFROMCAPTURE = 0x11    # Windows 10 2004（19041）起：擷取畫面裡完全不存在
+
 # SHChangeNotify 用的常數
 _SHCNE_ASSOCCHANGED = 0x08000000
 _SHCNF_IDLIST = 0x0000
@@ -50,6 +55,11 @@ if IS_WINDOWS:
 
     _user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
     _user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+
+    _user32.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
+    _user32.SetWindowDisplayAffinity.restype = wintypes.BOOL
+    _user32.GetWindowDisplayAffinity.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    _user32.GetWindowDisplayAffinity.restype = wintypes.BOOL
 
     _shell32.SetCurrentProcessExplicitAppUserModelID.argtypes = [wintypes.LPCWSTR]
     _shell32.SetCurrentProcessExplicitAppUserModelID.restype = ctypes.HRESULT
@@ -189,6 +199,43 @@ def set_topmost(window_id: int, enabled: bool) -> bool:
         return is_topmost(window_id) == bool(enabled)
     except Exception:
         return False
+
+
+def get_display_affinity(window_id: int) -> int:
+    """視窗目前的擷取親和性（WDA_*）；查不到回 -1。"""
+    if not IS_WINDOWS or not window_id:
+        return -1
+    try:
+        value = wintypes.DWORD(0)
+        if not _user32.GetWindowDisplayAffinity(wintypes.HWND(int(window_id)), ctypes.byref(value)):
+            return -1
+        return int(value.value)
+    except Exception:
+        return -1
+
+
+def set_capture_excluded(window_id: int, excluded: bool) -> int:
+    """讓錄影、截圖、螢幕分享擷取不到這個視窗（或恢復）。回傳實際生效的 WDA_* 值，失敗回 -1。
+
+    排除時先試 WDA_EXCLUDEFROMCAPTURE（擷取畫面裡視窗完全不存在，看得到後面的
+    東西），舊版 Windows 不認得就退回 WDA_MONITOR（擷取畫面裡是一塊黑）。回傳值
+    一律回頭讀實際狀態，不信 API 的 BOOL——呼叫端靠它決定按鈕要不要亮、狀態列
+    要怎麼說，不能讓 UI 說謊。
+
+    只對頂層視窗有效；Qt 的子元件沒有自己的原生視窗，跟著頂層一起被排除。
+    原生視窗被重建（setWindowFlag）後設定會掉，呼叫端要重套。
+    """
+    if not IS_WINDOWS or not window_id:
+        return -1
+    try:
+        handle = wintypes.HWND(int(window_id))
+        wanted = (WDA_EXCLUDEFROMCAPTURE, WDA_MONITOR) if excluded else (WDA_NONE,)
+        for value in wanted:
+            if _user32.SetWindowDisplayAffinity(handle, value):
+                break
+        return get_display_affinity(window_id)
+    except Exception:
+        return -1
 
 
 def is_topmost(window_id: int) -> bool:

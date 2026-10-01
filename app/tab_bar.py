@@ -46,7 +46,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from . import config, icons, styles
+from . import config, icons, styles, win32
 from .language import t
 from .title_bar import IconButton
 
@@ -455,6 +455,8 @@ class TabBar(QFrame):
         self.setObjectName("tabBar")
         self.setFixedHeight(config.TAB_HEIGHT + 1)
         self._theme = config.DEFAULT_THEME
+        # 所在視窗開了錄影擷取排除（viewer 設定）：拖曳幽靈建出來時一起藏
+        self.exclude_from_capture = False
         self._buttons: list[TabButton] = []
         self._drag_button: TabButton | None = None
         # 按下的那一刻它排在第幾格。即時重排會一直改變它「現在」的位置，
@@ -609,6 +611,10 @@ class TabBar(QFrame):
                 self._ghost = DragGhost(
                     button.grab(), self._theme, button.grab_offset()
                 )
+                # 幽靈是自己的頂層視窗，帶著分頁的縮圖與檔名；視窗開了擷取排除，
+                # 它也要一起藏，不然一拖分頁就在錄影裡露出來。
+                if self.exclude_from_capture:
+                    win32.set_capture_excluded(int(self._ghost.winId()), True)
             intent = "none"
             if self.drop_intent_probe is not None:
                 intent = self.drop_intent_probe(global_pos, outside_band)

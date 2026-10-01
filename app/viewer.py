@@ -340,6 +340,11 @@ class MarkdownViewer(QWidget):
         self._always_on_top = self._settings.value(
             config.KEY_ALWAYS_ON_TOP, False, type=bool
         )
+        # 錄影／截圖擷取不到這個程式的視窗。和釘選不同，這是「所有視窗一起」的
+        # 開關：只藏一個視窗的話，錄影裡照樣看得到另一個視窗的內容，等於沒藏。
+        self._exclude_capture = self._settings.value(
+            config.KEY_EXCLUDE_FROM_CAPTURE, False, type=bool
+        )
         self._status_visible = self._settings.value(
             config.KEY_STATUS_VISIBLE, True, type=bool
         )
@@ -422,6 +427,8 @@ class MarkdownViewer(QWidget):
         self.apply_theme(self._theme, render=False)
         self._restore_window_state()
         self.title_bar.set_pinned(self._always_on_top)
+        self.title_bar.set_capture_excluded(self._exclude_capture)
+        self.tab_bar.exclude_from_capture = self._exclude_capture
         self.status_bar.setVisible(self._status_visible)
         self._sync_settings_panel()
 
@@ -1227,6 +1234,7 @@ class MarkdownViewer(QWidget):
         self.title_bar.settingsRequested.connect(self.toggle_settings)
         self.title_bar.themeToggleRequested.connect(self.toggle_theme)
         self.title_bar.pinToggled.connect(self.set_always_on_top)
+        self.title_bar.captureToggled.connect(self.set_exclude_from_capture)
         self.title_bar.minimizeRequested.connect(self.showMinimized)
         self.title_bar.maximizeToggleRequested.connect(self.toggle_maximized)
         # 標題列的 X 是「視窗」控制鈕，一律關整個視窗（開著的分頁由
@@ -2270,6 +2278,48 @@ class MarkdownViewer(QWidget):
     def toggle_always_on_top(self) -> None:
         self.set_always_on_top(not self._always_on_top)
 
+    # -- 錄影擷取排除 --------------------------------------------------------
+    def set_exclude_from_capture(self, enabled: bool) -> None:
+        """標題列的攝影機鈕：讓錄影、截圖、螢幕分享擷取不到本程式的所有視窗。
+
+        先套到自己身上、讀回實際結果再決定：開啟卻沒生效（平台不支援）時按鈕彈回
+        未勾選、設定不寫，不讓 UI 說謊——使用者正要開始錄影，以為藏起來了其實沒有，
+        這比「按了沒反應」糟得多。生效之後才寫設定並推到其他視窗。
+        """
+        enabled = bool(enabled)
+        result = self._apply_capture_exclusion(enabled)
+        if enabled and result not in (win32.WDA_EXCLUDEFROMCAPTURE, win32.WDA_MONITOR):
+            self._exclude_capture = False
+            self.title_bar.set_capture_excluded(False)
+            self.tab_bar.exclude_from_capture = False
+            self._set_status(t("status.captureFailed"))
+            return
+        self._exclude_capture = enabled
+        self._settings.setValue(config.KEY_EXCLUDE_FROM_CAPTURE, enabled)
+        self.title_bar.set_capture_excluded(enabled)
+        self.tab_bar.exclude_from_capture = enabled
+        if not enabled:
+            self._set_status(t("status.captureVisible"))
+        elif result == win32.WDA_MONITOR:
+            self._set_status(t("status.captureBlackout"))
+        else:
+            self._set_status(t("status.captureHidden"))
+        if self._manager is not None:
+            for window in self._manager.windows():
+                if window is not self:
+                    window.adopt_capture_exclusion(enabled)
+
+    def adopt_capture_exclusion(self, enabled: bool) -> None:
+        """別的視窗切了擷取排除，這裡跟著套。不寫設定、不再廣播（同 adopt_language_mode）。"""
+        self._exclude_capture = bool(enabled)
+        self.title_bar.set_capture_excluded(self._exclude_capture)
+        self.tab_bar.exclude_from_capture = self._exclude_capture
+        self._apply_capture_exclusion(self._exclude_capture)
+
+    def _apply_capture_exclusion(self, enabled: bool) -> int:
+        """把擷取親和性套到這個視窗的原生視窗上，回傳實際生效的 WDA_* 值（失敗 -1）。"""
+        return win32.set_capture_excluded(int(self.winId()), enabled)
+
     def show_find(self) -> None:
         if self.settings_panel.isVisible():
             self.settings_panel.deactivate()
@@ -2366,6 +2416,11 @@ class MarkdownViewer(QWidget):
         if self._always_on_top and not win32.set_topmost(int(self.winId()), True):
             # 後備方案會呼叫 show()，不能在 showEvent 裡直接跑
             QTimer.singleShot(0, self._apply_always_on_top)
+        # 擷取排除同理：要有原生視窗才套得上。啟動、拆分出來的新視窗都走這裡，
+        # 所以新視窗一出現就已經藏好，不會在錄影裡閃一幀。釘選退回 Qt 旗標時
+        # setWindowFlag 會重建原生視窗（設定跟著掉），重建後的 show() 也走這裡重套。
+        if self._exclude_capture:
+            self._apply_capture_exclusion(True)
         self._resizer.refresh_targets()
         # 所有捲軸都要讓開，包含設定面板裡的
         self._resizer.set_drag_controls(self.findChildren(QScrollBar))

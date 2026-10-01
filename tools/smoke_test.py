@@ -6025,6 +6025,197 @@ def section_mermaid(args) -> None:
 # ===========================================================================
 # 區塊：安裝檔
 # ===========================================================================
+def section_capture_exclusion(args) -> None:
+    """標題列的攝影機鈕：錄影、截圖、螢幕分享擷取不到本程式的視窗。
+
+    底層是 Windows 的 SetWindowDisplayAffinity。win32 那層拿一個真的原生視窗測
+    （CreateWindowExW 一個隱藏的 STATIC，offscreen 下也有真 HWND）；viewer 那層
+    offscreen 沒有真 HWND，把 win32.set_capture_excluded 換成替身，記下呼叫並
+    回傳指定結果，驗按鈕、設定、狀態列、廣播、重建後重套、拖曳幽靈。實機的整條
+    路徑由最後一條 onscreen_only 讀回原生狀態。
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    from PyQt6.QtCore import QEventLoop, QPoint, QTimer
+    from PyQt6.QtWidgets import QApplication
+
+    from app import win32
+    from app.language import t
+    from app.window_manager import WindowManager
+
+    app = QApplication.instance() or QApplication([])
+
+    def pump(ms=150):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+        for _ in range(3):
+            app.processEvents()
+
+    # --- win32 層：真的原生視窗 -------------------------------------------
+    u32 = ctypes.windll.user32
+    u32.CreateWindowExW.restype = wintypes.HWND
+    u32.CreateWindowExW.argtypes = [
+        wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+    u32.DestroyWindow.argtypes = [wintypes.HWND]
+    hwnd = u32.CreateWindowExW(0, "STATIC", "capture-probe", 0x00C00000,
+                               0, 0, 120, 80, None, None, None, None)
+    try:
+        on = win32.set_capture_excluded(int(hwnd), True)
+        read_on = win32.get_display_affinity(int(hwnd))
+        off = win32.set_capture_excluded(int(hwnd), False)
+        check("win32：排除時用 WDA_EXCLUDEFROMCAPTURE、回傳讀回的實際值；恢復時讀回 WDA_NONE",
+              on == read_on == win32.WDA_EXCLUDEFROMCAPTURE and off == win32.WDA_NONE,
+              f"on={on:#x} read={read_on:#x} off={off:#x}")
+    finally:
+        u32.DestroyWindow(hwnd)
+    check("win32：無效的視窗代碼回 -1（呼叫端靠它判定失敗，不讓按鈕亮著說謊）",
+          win32.set_capture_excluded(0, True) == -1
+          and win32.set_capture_excluded(0x7FFFFFF0, True) == -1)
+
+    # --- viewer 層：替身 -----------------------------------------------------
+    real_set = win32.set_capture_excluded
+    calls: list = []
+    reply = {"value": win32.WDA_EXCLUDEFROMCAPTURE}
+
+    def fake(window_id, excluded):
+        calls.append((int(window_id), bool(excluded)))
+        if not excluded:
+            return win32.WDA_NONE
+        return reply["value"]
+
+    win32.set_capture_excluded = fake
+    settings = _settings_handle()
+    settings.remove(config.KEY_EXCLUDE_FROM_CAPTURE)
+    mgr = WindowManager()
+    windows = []
+    try:
+        a = mgr.create_window(SAMPLE)
+        windows.append(a)
+        pump(300)
+        bar = a.title_bar
+        layout = bar.layout()
+        order = [layout.itemAt(i).widget() for i in range(layout.count())]
+        check("標題列有攝影機鈕：可勾選、緊接在釘選鈕後面、預設未勾",
+              bar.capture_button.isCheckable() and not bar.capture_button.isChecked()
+              and order.index(bar.capture_button) == order.index(bar.pin_button) + 1,
+              str(order.index(bar.capture_button)))
+        b = mgr.create_window(README)
+        windows.append(b)
+        pump(300)
+        calls.clear()
+        bar.capture_button.click()
+        pump(100)
+        hwnds = {int(a.winId()), int(b.winId())}
+        check("按下攝影機鈕：所有視窗都套上排除、按鈕都亮、設定寫入、狀態列說明",
+              {c for c in calls if c[1]} == {(h, True) for h in hwnds}
+              and a.title_bar.capture_button.isChecked() and b.title_bar.capture_button.isChecked()
+              and settings.value(config.KEY_EXCLUDE_FROM_CAPTURE, False, type=bool)
+              and a.status_label.text() == t("status.captureHidden"),
+              f"calls={calls} status={a.status_label.text()!r}")
+        check("拖曳幽靈的旗標跟著同步（兩個視窗的分頁列）",
+              a.tab_bar.exclude_from_capture and b.tab_bar.exclude_from_capture)
+
+        calls.clear()
+        c = mgr.create_window(SAMPLE)
+        windows.append(c)
+        pump(300)
+        check("開著排除時新開的視窗：一出現就套上（showEvent），按鈕也是亮的",
+              (int(c.winId()), True) in calls and c.title_bar.capture_button.isChecked(),
+              str(calls))
+
+        # 拖曳幽靈：走真的拖曳手勢建出幽靈
+        calls.clear()
+        tb = c.tab_bar
+        tb._on_drag_started(tb._buttons[0])
+        far = tb.mapToGlobal(QPoint(10, tb.height() + 200))
+        tb._on_drag_moved(far)
+        pump(50)
+        ghost = tb._ghost
+        ghost_hit = ghost is not None and (int(ghost.winId()), True) in calls
+        tb.cancel_active_drag()
+        pump(50)
+        check("拖曳分頁時的幽靈（自己的頂層視窗，帶縮圖與檔名）也一起排除",
+              ghost_hit, str(calls))
+
+        # 釘選的後備路徑會重建原生視窗：擷取設定要重套
+        real_topmost = win32.set_topmost
+        win32.set_topmost = lambda *_a, **_k: False
+        try:
+            calls.clear()
+            c.set_always_on_top(True)
+            pump(200)
+            reapplied = (int(c.winId()), True) in calls
+            c.set_always_on_top(False)
+            pump(200)
+        finally:
+            win32.set_topmost = real_topmost
+        check("釘選退回 Qt 旗標（會重建原生視窗）之後，擷取排除重新套上",
+              reapplied, str(calls))
+
+        calls.clear()
+        b.title_bar.capture_button.click()
+        pump(100)
+        check("在另一個視窗按掉：所有視窗恢復、按鈕都熄、設定寫回 False、狀態列說明",
+              {c2 for c2 in calls} >= {(int(w.winId()), False) for w in (a, b, c)}
+              and not any(w.title_bar.capture_button.isChecked() for w in (a, b, c))
+              and not settings.value(config.KEY_EXCLUDE_FROM_CAPTURE, True, type=bool)
+              and b.status_label.text() == t("status.captureVisible"),
+              f"calls={calls} status={b.status_label.text()!r}")
+
+        reply["value"] = win32.WDA_MONITOR
+        a.title_bar.capture_button.click()
+        pump(100)
+        check("舊版 Windows 只能變黑（WDA_MONITOR）：仍算開啟，狀態列講清楚只是變黑",
+              a.title_bar.capture_button.isChecked()
+              and a.status_label.text() == t("status.captureBlackout"),
+              a.status_label.text())
+        a.title_bar.capture_button.click()
+        pump(100)
+
+        reply["value"] = -1
+        calls.clear()
+        a.title_bar.capture_button.click()
+        pump(100)
+        check("系統不支援（讀回失敗）：按鈕彈回未勾、設定不寫、不推給別的視窗、狀態列說無法",
+              not a.title_bar.capture_button.isChecked()
+              and not settings.value(config.KEY_EXCLUDE_FROM_CAPTURE, False, type=bool)
+              and not b.title_bar.capture_button.isChecked()
+              and all(cid == int(a.winId()) for cid, _ in calls)
+              and a.status_label.text() == t("status.captureFailed"),
+              f"calls={calls} status={a.status_label.text()!r}")
+    finally:
+        win32.set_capture_excluded = real_set
+        for w in windows:
+            try:
+                w.close()
+            except RuntimeError:
+                pass
+        pump(200)
+        settings.remove(config.KEY_EXCLUDE_FROM_CAPTURE)
+
+    # --- 實機：真的原生視窗讀回 -------------------------------------------
+    if onscreen_only("攝影機鈕在真視窗上讀回 WDA_EXCLUDEFROMCAPTURE"):
+        mgr2 = WindowManager()
+        w = mgr2.create_window(SAMPLE)
+        pump(400)
+        w.title_bar.capture_button.click()
+        pump(150)
+        got = win32.get_display_affinity(int(w.winId()))
+        w.title_bar.capture_button.click()
+        pump(150)
+        back = win32.get_display_affinity(int(w.winId()))
+        check("攝影機鈕在真視窗上讀回 WDA_EXCLUDEFROMCAPTURE，按掉讀回 WDA_NONE",
+              got == win32.WDA_EXCLUDEFROMCAPTURE and back == win32.WDA_NONE,
+              f"{got:#x} → {back:#x}")
+        w.close()
+        pump(200)
+        _settings_handle().remove(config.KEY_EXCLUDE_FROM_CAPTURE)
+
+
 def section_tab_shortcuts(args) -> None:
     """Ctrl+Shift+T 重開剛關掉的分頁、Ctrl+1…9 跳分頁——瀏覽器使用者的肌肉記憶。
 
@@ -6761,6 +6952,7 @@ SECTIONS = [
     ("視窗與邊緣縮放", section_window),
     ("單一實例", section_single_instance),
     ("關閉穩定度", section_teardown),
+    ("錄影擷取排除", section_capture_exclusion),
     ("分頁快速鍵", section_tab_shortcuts),
     ("檔案監看", section_watch),
     ("可攜版", section_portable),
