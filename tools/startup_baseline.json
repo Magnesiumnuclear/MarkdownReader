@@ -1,6 +1,6 @@
 {
-  "recorded": "2026-08-24 23:33:19",
-  "note": "基準線與機器相關，換機器請重新以 --update-baseline 建立。",
+  "recorded": "2026-10-01（取當天多輪的各項最小值）",
+  "note": "基準線與機器相關，換機器請重新以 --update-baseline 建立。2026-10-01 這份是手動彙整：當天同時有其他工作階段在跑測試、Blender 在算圖，單一輪 --update-baseline 會量到負載而不是程式（同一份程式三輪合計 691／786 ms，安靜時 595 ms）。判定用最小值、干擾只會讓時間變長，所以取當天各完整輪次的最小值。",
   "environment": {
     "python": "3.13.7",
     "qt": "6.11.0",
@@ -10,53 +10,46 @@
   "tolerance": 0.15,
   "metrics": {
     "onefile_window": {
-      "median": 1322.1,
-      "min": 1287.4,
-      "max": 1413.5,
-      "stdev": 39.3,
-      "runs": 8
+      "median": 1263.0,
+      "min": 1182.0,
+      "runs": 8,
+      "source": "21:32 完整輪"
     },
     "onedir_window": {
-      "median": 710.4,
-      "min": 610.2,
-      "max": 793.1,
-      "stdev": 74.0,
-      "runs": 8
+      "median": 788.0,
+      "min": 633.0,
+      "runs": 8,
+      "source": "21:32 完整輪"
     },
     "source_import": {
-      "median": 73.2,
-      "min": 70.5,
-      "max": 75.5,
-      "stdev": 1.7,
-      "runs": 8
+      "median": 91.0,
+      "min": 89.0,
+      "runs": 8,
+      "source": "21:21 交錯對照第 2 輪"
     },
     "source_qapp": {
-      "median": 18.9,
-      "min": 17.8,
-      "max": 21.0,
-      "stdev": 1.0,
-      "runs": 8
+      "median": 19.0,
+      "min": 17.0,
+      "runs": 8,
+      "source": "21:21 交錯對照第 1 輪"
     },
     "source_ctor": {
-      "median": 415.2,
-      "min": 330.6,
-      "max": 505.5,
-      "stdev": 84.6,
-      "runs": 8
+      "median": 449.0,
+      "min": 323.0,
+      "runs": 8,
+      "source": "21:21 交錯對照第 1 輪"
     },
     "source_show": {
-      "median": 166.3,
-      "min": 160.8,
-      "max": 172.2,
-      "stdev": 3.6,
-      "runs": 8
+      "median": 163.0,
+      "min": 155.0,
+      "runs": 8,
+      "source": "21:21 交錯對照第 2 輪"
     },
     "source_total": {
-      "median": 672.3,
-      "min": 587.4,
-      "max": 764.4,
-      "stdev": 82.5,
-      "runs": 8
+      "median": 748.0,
+      "min": 595.0,
+      "runs": 8,
+      "source": "21:21 交錯對照第 1 輪"
     }
   }
 }

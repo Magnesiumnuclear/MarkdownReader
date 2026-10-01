@@ -174,6 +174,44 @@ def measure_handoff(app: str, forwarder: str, runs: int) -> list[float]:
     return samples
 
 
+def _cold_once(command: list[str]) -> float:
+    """冷啟動一次：從行程建立到視窗出現的毫秒數。"""
+    kill_app()
+    time.sleep(0.2)
+    started = time.perf_counter()
+    subprocess.Popen(command, creationflags=DETACHED)
+    while time.perf_counter() - started < LAUNCH_TIMEOUT_S:
+        if find_window(language.t("app.displayName")):
+            return (time.perf_counter() - started) * 1000
+        time.sleep(0.005)
+    kill_app()
+    raise RuntimeError(f"{LAUNCH_TIMEOUT_S} 秒內沒有視窗：{command}")
+
+
+def measure_cold_paired(direct: list[str], forwarded: list[str], runs: int):
+    """直接啟動與經過轉交器的冷啟動，交錯量。
+
+    【為什麼要交錯】以前是「直接」連量 8 次、再「經過轉交器」連量 8 次。冷啟動
+    單次就有 ±150 ms 的抖動，兩段之間機器狀態一變（別的程式開始編譯、git fetch、
+    Blender 在算圖），就會變成一段整體比另一段慢，看起來像轉交器多花了 100 多
+    毫秒——2026-10 實際發生過：同一份程式連量三次，差距是 +126、-96、-56 ms。
+    改成每一輪兩種各量一次、輪流先後，背景負載對兩邊一樣，再看「同一輪內的成對差」。
+    實測轉交器本身（按下到本體行程出現）多花的時間中位數是 0 ms。
+    """
+    direct_ms, forwarded_ms = [], []
+    for index in range(runs + 1):  # 第 0 輪暖機
+        order = ((direct, direct_ms), (forwarded, forwarded_ms))
+        if index % 2:
+            order = order[::-1]
+        for command, bucket in order:
+            elapsed = _cold_once(command)
+            if index > 0:
+                bucket.append(elapsed)
+            time.sleep(0.25)
+    kill_app()
+    return direct_ms, forwarded_ms
+
+
 def measure_cold(command: list[str], runs: int) -> list[float]:
     """量冷啟動：從行程建立到視窗出現。"""
     samples = []
@@ -242,10 +280,17 @@ def main() -> int:
         measure_handoff(ONEFILE_APP, ONEFILE_LAUNCHER, args.runs))
 
     print("量測冷啟動…", flush=True)
-    results["冷啟動：資料夾版 · 直接"] = summarise(
-        measure_cold([ONEDIR_APP, SAMPLE], args.runs))
-    results["冷啟動：資料夾版 · 經過轉交器"] = summarise(
-        measure_cold([ONEDIR_LAUNCHER, SAMPLE], args.runs))
+    cold_direct, cold_forwarded = measure_cold_paired(
+        [ONEDIR_APP, SAMPLE], [ONEDIR_LAUNCHER, SAMPLE], args.runs)
+    results["冷啟動：資料夾版 · 直接"] = summarise(cold_direct)
+    results["冷啟動：資料夾版 · 經過轉交器"] = summarise(cold_forwarded)
+    paired = [f - d for d, f in zip(cold_direct, cold_forwarded)]
+    results["冷啟動：轉交器多花（同輪成對差）"] = {
+        "median": round(statistics.median(paired), 1),
+        "min": round(min(paired), 1),
+        "max": round(max(paired), 1),
+        "runs": len(paired),
+    }
 
     if args.json:
         print(json.dumps(results, ensure_ascii=False, indent=2))
@@ -264,6 +309,9 @@ def main() -> int:
     for name, data in results.items():
         if name.startswith("轉交"):
             print(f"  {name.ljust(width)} {max(0.0, data['min'] - floor):>7.0f} ms")
+    pair = results["冷啟動：轉交器多花（同輪成對差）"]
+    print(f"\n冷啟動經過轉交器比直接多花（交錯量、同輪成對差）：中位 {pair['median']:+.0f} ms"
+          f"（範圍 {pair['min']:+.0f} ~ {pair['max']:+.0f}；範圍寬代表背景有負載）")
     return 0
 
 
